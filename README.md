@@ -257,6 +257,7 @@ pnpm build
 
 - [待支持的平台列表](https://airtable.com/shrLSJMnTC2BlmP29)
 - [如何开发一个适配器](docs/adapter-spec.md)
+- [头条协议 Spike 与草稿验收边界](docs/toutiao-protocol-spike.md)
 - [API 文档](API.md)
 
 ## 使用场景
