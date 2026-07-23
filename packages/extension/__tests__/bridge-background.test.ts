@@ -7,7 +7,10 @@ import {
   validateBridgeMessageSender,
   validateGetAccountsV2Payload,
   validateInspectPublicationPayload,
+  validateLegacyMutationMessageSender,
 } from '../src/background/bridge-v2'
+
+const EXTENSION_ID = 'a'.repeat(32)
 
 function sender(
   overrides: Partial<chrome.runtime.MessageSender> = {},
@@ -66,6 +69,72 @@ describe('Bridge v2 background sender boundary', () => {
     }),
   ])('rejects a non-canonical, sub-frame, or tabless sender', (candidate) => {
     expect(validateBridgeMessageSender(candidate)).toEqual({
+      success: false,
+      code: 'SENDER_NOT_ALLOWED',
+    })
+  })
+})
+
+describe('Legacy mutation background sender boundary', () => {
+  it('accepts the canonical VibeMarket content-script sender', () => {
+    expect(
+      validateLegacyMutationMessageSender(sender(), EXTENSION_ID),
+    ).toMatchObject({
+      success: true,
+      data: {
+        channel: 'bridge',
+        origin: 'http://localhost',
+        tabId: 42,
+      },
+    })
+  })
+
+  it('accepts a page owned by this extension', () => {
+    expect(
+      validateLegacyMutationMessageSender(
+        {
+          id: EXTENSION_ID,
+          origin: `chrome-extension://${EXTENSION_ID}`,
+          url: `chrome-extension://${EXTENSION_ID}/src/popup/index.html`,
+          frameId: 0,
+        },
+        EXTENSION_ID,
+      ),
+    ).toEqual({
+      success: true,
+      data: {
+        channel: 'extension',
+        origin: `chrome-extension://${EXTENSION_ID}`,
+        url: `chrome-extension://${EXTENSION_ID}/src/popup/index.html`,
+      },
+    })
+  })
+
+  it.each([
+    sender({
+      origin: 'https://attacker.example',
+      url: 'https://attacker.example/article',
+      tab: {
+        id: 42,
+        url: 'https://attacker.example/article',
+      } as chrome.tabs.Tab,
+    }),
+    {
+      id: 'b'.repeat(32),
+      origin: `chrome-extension://${'b'.repeat(32)}`,
+      url: `chrome-extension://${'b'.repeat(32)}/popup.html`,
+      frameId: 0,
+    },
+    {
+      id: EXTENSION_ID,
+      origin: `chrome-extension://${EXTENSION_ID}`,
+      url: `chrome-extension://${EXTENSION_ID}/popup.html`,
+      frameId: 1,
+    },
+  ])('rejects an arbitrary web page or another extension', (candidate) => {
+    expect(
+      validateLegacyMutationMessageSender(candidate, EXTENSION_ID),
+    ).toEqual({
       success: false,
       code: 'SENDER_NOT_ALLOWED',
     })

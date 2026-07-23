@@ -30,6 +30,7 @@ import {
   SohuAdapter,
   WoshipmAdapter,
   ZhihuAdapter,
+  ToutiaoAdapter,
   JuejinAdapter,
   CSDNAdapter,
   WeiboAdapter,
@@ -45,15 +46,16 @@ import {
   ZipDownloadAdapter,
   EastmoneyAdapter,
 } from '@wechatsync/core'
+import {
+  mergeAdapterClasses,
+  type AdapterConstructor,
+} from './adapter-classes'
 
 // 私有适配器 - private/ 目录通过 git submodule 管理
 const privateModules = import.meta.glob<Record<string, unknown>>(
   '@wechatsync/core/adapters/platforms/private/*.ts',
   { eager: true }
 )
-
-// 适配器构造函数类型
-type AdapterConstructor = new (...args: unknown[]) => PlatformAdapter
 
 // 从 glob 结果中提取适配器类
 function getPrivateAdapters(): AdapterConstructor[] {
@@ -78,8 +80,9 @@ function getPrivateAdapters(): AdapterConstructor[] {
 }
 
 // 所有适配器类列表
-const ADAPTER_CLASSES: AdapterConstructor[] = [
+const PUBLIC_ADAPTER_CLASSES: AdapterConstructor[] = [
   ZhihuAdapter,
+  ToutiaoAdapter,
   JuejinAdapter,
   WeiboAdapter,
   BilibiliAdapter,
@@ -98,8 +101,13 @@ const ADAPTER_CLASSES: AdapterConstructor[] = [
   CnblogsAdapter,
   ZipDownloadAdapter,
   EastmoneyAdapter,
-  ...getPrivateAdapters(),
 ]
+
+const ADAPTER_CLASSES = mergeAdapterClasses(
+  PUBLIC_ADAPTER_CLASSES,
+  getPrivateAdapters(),
+  new Set(['toutiao']),
+)
 
 // 适配器注册条目 (类型安全)
 interface AdapterEntry {
@@ -317,7 +325,11 @@ export async function checkAllPlatformsAuth(
               AUTH_CHECK_TIMEOUT,
               `认证检查超时（${AUTH_CHECK_TIMEOUT / 1000}秒）`
             )
-            logger.debug(` ${meta.id} auth result:`, auth)
+            logger.debug(` ${meta.id} auth result:`, {
+              isAuthenticated: auth.isAuthenticated,
+              hasStableUserId: Boolean(auth.userId),
+              hasAvatar: Boolean(auth.avatar),
+            })
 
             // 追踪认证检查
             trackAuthCheck(meta.id, auth.isAuthenticated).catch(() => {})

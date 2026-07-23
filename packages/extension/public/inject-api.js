@@ -21,7 +21,7 @@
     eventCb[msg.eventID] = function(err, res) {
       cb(err, res);
     };
-    window.postMessage(JSON.stringify(msg), '*');
+    window.postMessage(JSON.stringify(msg), location.origin);
   }
 
   function createBridgeRequestId() {
@@ -154,6 +154,14 @@
           });
         }
         delete bridgeEventCb[evt.data.requestId];
+        return;
+      }
+
+      if (
+        evt.source !== window ||
+        evt.origin !== location.origin ||
+        typeof evt.data !== 'string'
+      ) {
         return;
       }
 

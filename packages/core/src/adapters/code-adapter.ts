@@ -46,6 +46,8 @@ export interface ImageProcessOptions {
   skipPatterns?: string[]
   /** 进度回调 */
   onProgress?: (current: number, total: number) => void
+  /** 任一图片上传失败时立即终止，不保留原始远程地址继续发布 */
+  failOnError?: boolean
 }
 
 /**
@@ -230,7 +232,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
     uploadFn: (src: string) => Promise<ImageUploadResult>,
     options?: ImageProcessOptions
   ): Promise<string> {
-    const { skipPatterns = [], onProgress } = options || {}
+    const { skipPatterns = [], onProgress, failOnError = false } = options || {}
 
     // 提取所有图片（HTML + Markdown）
     const matches: { full: string; src: string; alt?: string; type: 'html' | 'markdown' }[] = []
@@ -265,7 +267,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
       if (!src.startsWith('data:')) {
         const shouldSkip = skipPatterns.some(pattern => src.includes(pattern))
         if (shouldSkip) {
-          logger.debug(`Skipping matched pattern: ${src}`)
+          logger.debug('Skipping image matched by configured pattern')
           continue
         }
       }
@@ -278,7 +280,9 @@ export abstract class CodeAdapter implements PlatformAdapter {
         let uploadResult = uploadedMap.get(src)
 
         if (!uploadResult) {
-          logger.debug(`Uploading image ${processed}/${matches.length}: ${src.startsWith('data:') ? 'data URI' : src}`)
+          logger.debug(
+            `Uploading image ${processed}/${matches.length}: ${src.startsWith('data:') ? 'data URI' : 'remote URL'}`
+          )
           // uploadFn 应该能处理 URL 和 data URI（通过 fetch）
           uploadResult = await uploadFn(src)
           uploadedMap.set(src, uploadResult)
@@ -303,9 +307,14 @@ export abstract class CodeAdapter implements PlatformAdapter {
         // 替换原内容
         result = result.replace(full, replacement)
 
-        logger.debug(`Image uploaded: ${uploadResult.url}`)
+        logger.debug('Image uploaded')
       } catch (error) {
-        logger.error(`Failed to upload image: ${src}`, error)
+        logger.error('Failed to upload image', {
+          errorType: error instanceof Error ? error.name : 'unknown',
+        })
+        if (failOnError) {
+          throw error
+        }
         // 继续处理其他图片
       }
 

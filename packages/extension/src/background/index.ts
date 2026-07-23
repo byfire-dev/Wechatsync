@@ -34,8 +34,10 @@ import {
   validateBridgeMessageSender,
   validateGetAccountsV2Payload,
   validateInspectPublicationPayload,
+  validateLegacyMutationMessageSender,
 } from './bridge-v2'
 import { dispatchLegacyMagicCall } from '../bridge/legacy-magic-call'
+import { isLegacyMutationRuntimeMessage } from '../bridge/legacy-origin-policy'
 
 const logger = createLogger('Background')
 
@@ -169,6 +171,16 @@ chrome.runtime.onMessage.addListener((message: MessageAction, sender, sendRespon
 })
 
 async function handleMessage(message: MessageAction, sender?: chrome.runtime.MessageSender) {
+  if (isLegacyMutationRuntimeMessage(message)) {
+    const verifiedSender = validateLegacyMutationMessageSender(
+      sender || {},
+      chrome.runtime.id,
+    )
+    if (!verifiedSender.success) {
+      return { error: verifiedSender.code }
+    }
+  }
+
   switch (message.type) {
     case 'GET_PLATFORMS': {
       await initAdapters()

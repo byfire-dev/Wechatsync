@@ -60,6 +60,13 @@ export interface VerifiedBridgeMessageSender {
   url: string
 }
 
+export interface VerifiedLegacyMutationMessageSender {
+  channel: 'bridge' | 'extension'
+  origin: string
+  tabId?: number
+  url: string
+}
+
 /**
  * Minimal shape returned by checkAllPlatformsAuth. Keeping this boundary typed
  * as unknown prevents legacy adapter fields from crossing Bridge v2 by accident.
@@ -136,6 +143,72 @@ export function validateBridgeMessageSender(
     data: {
       origin: BRIDGE_ORIGIN,
       tabId: tabId as number,
+      url: sender.url,
+    },
+  }
+}
+
+function isOwnExtensionPageUrl(
+  value: unknown,
+  extensionId: string,
+): value is string {
+  if (typeof value !== 'string') return false
+
+  try {
+    const parsed = new URL(value)
+    return (
+      parsed.protocol === 'chrome-extension:' &&
+      parsed.hostname === extensionId &&
+      parsed.port === '' &&
+      parsed.username === '' &&
+      parsed.password === ''
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Legacy writes may come from the canonical VibeMarket page through a content
+ * script or from one of this extension's own UI pages. Any other web sender is
+ * rejected before the background executes a state-changing operation.
+ */
+export function validateLegacyMutationMessageSender(
+  sender: chrome.runtime.MessageSender,
+  extensionId: string,
+): BackgroundBridgeValidationResult<VerifiedLegacyMutationMessageSender> {
+  const verifiedBridgeSender = validateBridgeMessageSender(sender)
+  if (verifiedBridgeSender.success) {
+    return {
+      success: true,
+      data: {
+        channel: 'bridge',
+        ...verifiedBridgeSender.data,
+      },
+    }
+  }
+
+  const extensionOrigin = `chrome-extension://${extensionId}`
+  if (
+    !/^[a-p]{32}$/.test(extensionId) ||
+    sender.id !== extensionId ||
+    (sender.frameId !== undefined && sender.frameId !== 0) ||
+    (sender.origin !== undefined && sender.origin !== extensionOrigin) ||
+    !isOwnExtensionPageUrl(sender.url, extensionId) ||
+    (sender.tab?.url !== undefined &&
+      !isOwnExtensionPageUrl(sender.tab.url, extensionId))
+  ) {
+    return { success: false, code: 'SENDER_NOT_ALLOWED' }
+  }
+
+  return {
+    success: true,
+    data: {
+      channel: 'extension',
+      origin: extensionOrigin,
+      ...(Number.isInteger(sender.tab?.id) && (sender.tab?.id as number) >= 0
+        ? { tabId: sender.tab?.id }
+        : {}),
       url: sender.url,
     },
   }

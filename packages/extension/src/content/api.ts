@@ -23,7 +23,11 @@ import {
   BRIDGE_NAMESPACE,
   createBridgeErrorResponse,
   createBridgeSuccessResponse,
+  isLegacyMutationMethod,
+  LEGACY_API_ORIGIN_NOT_ALLOWED,
+  parseLegacyPageActionEvent,
   parseBridgeRequestEvent,
+  validateLegacyMutationPageEvent,
   type BridgeErrorResponse,
   type BridgeRequest,
   type BridgeResponse,
@@ -33,13 +37,6 @@ import { LEGACY_MAGIC_CALL_METHOD_NOT_ALLOWED } from '../bridge/legacy-magic-cal
 import { toLegacyEditResponse } from '../bridge/sync-result'
 
 const logger = createLogger('Wechatsync')
-
-// 敏感 API 白名单（仅 updateDriver 和 startInspect 需要检查）
-const SENSITIVE_API_WHITELIST = [
-  'https://www.wechatsync.com',
-  'https://developer.wechatsync.com',
-  'http://localhost:8080',
-];
 
 const BRIDGE_CAPABILITIES = [
   'account_identity',
@@ -76,9 +73,12 @@ let currentAccounts: AccountStatus[] = [];
 /**
  * 发送消息到页面
  */
-function sendToWindow(msg: Record<string, unknown>) {
+function sendToWindow(
+  msg: Record<string, unknown>,
+  targetOrigin = window.location.origin
+) {
   msg.callReturn = true;
-  window.postMessage(JSON.stringify(msg), '*');
+  window.postMessage(JSON.stringify(msg), targetOrigin);
 }
 
 /**
@@ -88,7 +88,7 @@ function sendTaskUpdate(task: Record<string, unknown>) {
   window.postMessage(JSON.stringify({
     method: 'taskUpdate',
     task,
-  }), '*');
+  }), window.location.origin);
 }
 
 /**
@@ -98,7 +98,7 @@ function sendConsoleLog(args: unknown) {
   window.postMessage(JSON.stringify({
     method: 'consoleLog',
     args,
-  }), '*');
+  }), window.location.origin);
 }
 
 function postBridgeResponse(response: BridgeResponse, targetOrigin: string) {
@@ -293,10 +293,28 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
  * 监听来自页面的消息
  */
 window.addEventListener('message', async (evt) => {
-  try {
-    const action = JSON.parse(evt.data);
-    if (!action.method) return;
+  const action = parseLegacyPageActionEvent(evt, window)
+  if (!action) return
 
+  if (isLegacyMutationMethod(action.method)) {
+    const validation = validateLegacyMutationPageEvent(
+      evt,
+      window,
+      window.top === window
+    )
+    if (!validation.success) {
+      sendToWindow(
+        {
+          eventID: action.eventID,
+          result: { error: LEGACY_API_ORIGIN_NOT_ALLOWED },
+        },
+        window.location.origin
+      )
+      return
+    }
+  }
+
+  try {
     // getAccounts - 获取已登录平台（任何页面可调用）
     if (action.method === 'getAccounts') {
       chrome.runtime.sendMessage({ type: 'CHECK_ALL_AUTH' }, (resp) => {
@@ -313,7 +331,7 @@ window.addEventListener('message', async (evt) => {
       });
     }
 
-    // addTask - 添加同步任务（任何页面可调用）
+    // addTask - 添加同步任务（仅允许构建时配置的 VibeMarket origin）
     if (action.method === 'addTask') {
       const { task } = action;
       const { post, accounts } = task;
@@ -366,7 +384,7 @@ window.addEventListener('message', async (evt) => {
       });
     }
 
-    // magicCall - 魔术调用（任何页面可调用）
+    // magicCall - 魔术调用（仅允许构建时配置的 VibeMarket origin）
     if (action.method === 'magicCall') {
       const { methodName, data } = action;
 
@@ -393,26 +411,22 @@ window.addEventListener('message', async (evt) => {
       }
     }
 
-    // ============ 敏感 API（仅白名单域名可调用）============
+    // updateDriver - 更新驱动
+    if (action.method === 'updateDriver') {
+      // v2 版本不再支持动态更新驱动，返回成功但不做任何事
+      logger.warn('updateDriver is deprecated in v2');
+      sendToWindow({ eventID: action.eventID, result: { success: true, deprecated: true } });
+    }
 
-    if (SENSITIVE_API_WHITELIST.indexOf(evt.origin) > -1) {
-      // updateDriver - 更新驱动
-      if (action.method === 'updateDriver') {
-        // v2 版本不再支持动态更新驱动，返回成功但不做任何事
-        logger.warn('updateDriver is deprecated in v2');
-        sendToWindow({ eventID: action.eventID, result: { success: true, deprecated: true } });
-      }
-
-      // startInspect - 开始检查
-      if (action.method === 'startInspect') {
-        // v2 版本不再支持 inspect 模式，返回成功但不做任何事
-        logger.warn('startInspect is deprecated in v2');
-        sendToWindow({ eventID: action.eventID, result: { success: true, deprecated: true } });
-      }
+    // startInspect - 开始检查
+    if (action.method === 'startInspect') {
+      // v2 版本不再支持 inspect 模式，返回成功但不做任何事
+      logger.warn('startInspect is deprecated in v2');
+      sendToWindow({ eventID: action.eventID, result: { success: true, deprecated: true } });
     }
 
   } catch (e) {
-    // 忽略非 JSON 消息
+    logger.error('Error handling legacy page action:', e)
   }
 });
 

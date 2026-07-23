@@ -49,6 +49,7 @@ vi.mock('@wechatsync/core', () => {
       getPreprocessConfigs: vi.fn(),
     },
     ZhihuAdapter: DummyAdapter,
+    ToutiaoAdapter: DummyAdapter,
     JuejinAdapter: DummyAdapter,
     WeiboAdapter: DummyAdapter,
     BilibiliAdapter: DummyAdapter,
@@ -100,6 +101,21 @@ describe('adapter auth cache', () => {
 
     const storage = await chrome.storage.local.get('authCache')
     expect(storage.authCache.zhihu).toMatchObject(completeAuthResult)
+  })
+
+  it('does not write the stable account ID or avatar URL to debug logs', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    try {
+      await checkAllPlatformsAuth(true)
+
+      const serializedLogs = JSON.stringify(consoleLog.mock.calls)
+      expect(serializedLogs).not.toContain(completeAuthResult.userId)
+      expect(serializedLogs).not.toContain(completeAuthResult.avatar)
+      expect(serializedLogs).toContain('hasStableUserId')
+    } finally {
+      consoleLog.mockRestore()
+    }
   })
 
   it('returns the stable account ID and avatar from a valid cache hit', async () => {

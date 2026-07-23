@@ -63,6 +63,8 @@ Service Worker **可用** 的 API：
 | `JSON` | JSON 处理 |
 | `RegExp` | 正则表达式 |
 
+极少数必须依赖页面主世界登录态的固定平台请求，应通过 `RuntimeInterface.tabs.executeScript(...)` 的运行时封装执行；扩展实现会固定使用 `world: 'MAIN'`。执行函数仍须校验标签页 origin 和固定 endpoint，不要建设可由网页传入任意 URL、headers 或 token 的通用转发桥。
+
 ## 2. 架构设计
 
 ### 2.1 适配器继承关系
@@ -283,14 +285,18 @@ import { createLogger } from '../../lib/logger'
 const logger = createLogger('PlatformName')
 
 // 调试信息（生产环境不输出）
-logger.debug('Processing image:', imageUrl)
+logger.debug('Processing image')
 
 // 警告信息
 logger.warn('Rate limited, retrying...')
 
 // 错误信息
-logger.error('Upload failed:', error)
+logger.error('Upload failed', {
+  errorType: error instanceof Error ? error.name : 'unknown',
+})
 ```
+
+日志不得包含 Cookie、token、原始平台响应、文章正文，或带查询参数的完整图片 URL。
 
 ## 4. 类型定义
 
@@ -367,7 +373,7 @@ import {
 } from '@wechatsync/core'
 
 // 添加到适配器列表
-const ADAPTER_CLASSES = [
+const PUBLIC_ADAPTER_CLASSES = [
   // ...existing adapters
   NewPlatformAdapter,
 ] as const
