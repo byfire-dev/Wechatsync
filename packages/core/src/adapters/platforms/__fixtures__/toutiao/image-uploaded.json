@@ -1,0 +1,9 @@
+{
+  "code": 0,
+  "data": {
+    "image_url": "https://example.com/toutiao-image.png",
+    "image_uri": "tos-cn-i-example/sanitized-image",
+    "image_width": 1200,
+    "image_height": 628
+  }
+}
