@@ -788,8 +788,8 @@ describe('Zhihu exact-ID publication inspector', () => {
   )
 
   it.each([
+    [410, 'ZHIHU_HTTP_410'],
     [429, 'ZHIHU_RATE_LIMITED'],
-    [403, 'ZHIHU_HTTP_403'],
     [500, 'ZHIHU_HTTP_500'],
   ])('maps HTTP %s to an explicit fetch error', async (status, errorCode) => {
     const fetch = vi.fn().mockResolvedValue(htmlResponse(status, PUBLIC_URL))
@@ -800,6 +800,77 @@ describe('Zhihu exact-ID publication inspector', () => {
 
     expect(result[0]).toMatchObject({ outcome: 'FETCH_ERROR', errorCode })
     expect(fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries an anonymous 403 with the bound account and preserves the evidence source', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+      .mockResolvedValueOnce(htmlResponse(200, PUBLIC_URL, publishedHtml))
+    const result = await inspectZhihuPublication(
+      createRequest(),
+      createDependencies(fetch),
+    )
+
+    expect(result[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PLATFORM_DETAIL',
+      platformPostId: POST_ID,
+      canonicalUrl: PUBLIC_URL,
+      publishedAt: PUBLISHED_AT,
+    })
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      PUBLIC_URL,
+      expect.objectContaining({ credentials: 'omit' }),
+    )
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      PUBLIC_URL,
+      expect.objectContaining({ credentials: 'include' }),
+    )
+  })
+
+  it('requires the authenticated fallback to prove the complete published state', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+      .mockResolvedValueOnce(
+        htmlResponse(
+          200,
+          PUBLIC_URL,
+          publishedHtmlFor({ isVisible: false }),
+        ),
+      )
+    const result = await inspectZhihuPublication(
+      createRequest(),
+      createDependencies(fetch),
+    )
+
+    expect(result[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      source: 'PLATFORM_DETAIL',
+      errorCode: 'ZHIHU_PUBLICATION_STATE_UNVERIFIED',
+      platformPostId: POST_ID,
+    })
+    expect(result[0]).not.toHaveProperty('canonicalUrl')
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('reports when Zhihu also denies the authenticated fallback', async () => {
+    const fetch = vi.fn().mockResolvedValue(htmlResponse(403, PUBLIC_URL))
+    const result = await inspectZhihuPublication(
+      createRequest(),
+      createDependencies(fetch),
+    )
+
+    expect(result[0]).toMatchObject({
+      outcome: 'FETCH_ERROR',
+      source: 'PLATFORM_DETAIL',
+      errorCode: 'ZHIHU_AUTHENTICATED_HTTP_403',
+      platformPostId: POST_ID,
+    })
+    expect(fetch).toHaveBeenCalledTimes(2)
   })
 
   it('maps a login redirect explicitly', async () => {

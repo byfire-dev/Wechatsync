@@ -36,9 +36,12 @@ interface PageContent {
   responseUrl: string
 }
 
+type PublishedPageSource = 'PUBLIC_PAGE' | 'PLATFORM_DETAIL'
+
 type PageProbe =
   | { kind: 'FOUND'; page: PageContent }
   | { kind: 'NOT_FOUND' }
+  | { kind: 'ACCESS_DENIED'; observation: PublicationObservation }
   | { kind: 'OBSERVATION'; observation: PublicationObservation }
 
 interface DraftContent {
@@ -499,16 +502,17 @@ function contentTypeIsJson(response: Response): boolean {
 async function fetchPage(
   request: PublicationInspectRequest,
   postId: string,
-  source: PublicationObservationSource,
+  source: PublishedPageSource,
   url: string,
   dependencies: ZhihuInspectionDependencies,
   observedAt: string,
+  credentials: 'omit' | 'include',
 ): Promise<PageProbe> {
   let response: Response
   try {
     response = await dependencies.fetch(url, {
       method: 'GET',
-      credentials: 'omit',
+      credentials,
       redirect: 'follow',
       cache: 'no-store',
       headers: {
@@ -558,13 +562,19 @@ async function fetchPage(
 
   if (response.status === 403) {
     return {
-      kind: 'OBSERVATION',
+      kind: 'ACCESS_DENIED',
       observation: createObservation(request, observedAt, {
         outcome: 'FETCH_ERROR',
         source,
         platformPostId: postId,
-        errorCode: 'ZHIHU_HTTP_403',
-        errorMessage: 'Zhihu denied the inspection request.',
+        errorCode:
+          credentials === 'include'
+            ? 'ZHIHU_AUTHENTICATED_HTTP_403'
+            : 'ZHIHU_HTTP_403',
+        errorMessage:
+          credentials === 'include'
+            ? 'Zhihu denied the authenticated inspection request.'
+            : 'Zhihu denied the anonymous inspection request.',
       }),
     }
   }
@@ -615,6 +625,88 @@ async function fetchPage(
       }),
     }
   }
+}
+
+/**
+ * Convert a fetched Zhihu article page into one strict publication
+ * observation. A valid soft-not-found page returns null so the caller can
+ * continue with the authenticated draft-detail probe.
+ *
+ * PLATFORM_DETAIL means the same canonical article page was fetched with the
+ * bound account after Zhihu rejected the anonymous request. It still must
+ * prove the exact post ID, canonical URL, published state, visibility,
+ * timestamp, and author ID before it can become PUBLISHED.
+ */
+function inspectPublishedPage(
+  request: PublicationInspectRequest,
+  postId: string,
+  publicUrl: string,
+  page: PageContent,
+  source: PublishedPageSource,
+  observedAt: string,
+): PublicationObservation | null {
+  if (!responseUrlMatches(page.responseUrl, postId, 'PUBLISHED')) {
+    return createObservation(request, observedAt, {
+      outcome: 'PARSE_ERROR',
+      source,
+      platformPostId: postId,
+      errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
+      errorMessage:
+        'The public page did not prove the expected Zhihu article identity.',
+    })
+  }
+
+  const hasNotFoundTitle =
+    extractDocumentTitle(page.html) === ZHIHU_SOFT_NOT_FOUND_TITLE
+  if (hasNotFoundTitle) {
+    if (!isStrictSoftNotFoundPage(page.html)) {
+      return createObservation(request, observedAt, {
+        outcome: 'PARSE_ERROR',
+        source,
+        platformPostId: postId,
+        errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
+        errorMessage:
+          'The public page had contradictory not-found markers.',
+      })
+    }
+    return null
+  }
+
+  if (!hasExpectedIdentity(page.html, postId, 'PUBLISHED')) {
+    return createObservation(request, observedAt, {
+      outcome: 'PARSE_ERROR',
+      source,
+      platformPostId: postId,
+      errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
+      errorMessage:
+        'The public page did not prove the expected Zhihu article identity.',
+    })
+  }
+
+  const decision = decideZhihuPublishedEvidence(
+    parseZhihuPublishedArticleEvidence(page.html, postId),
+    request.externalAccountId,
+  )
+  if (decision.outcome !== 'PUBLISHED') {
+    return createObservation(request, observedAt, {
+      outcome: decision.outcome,
+      source,
+      platformPostId: postId,
+      errorCode: decision.errorCode,
+      errorMessage: decision.errorMessage,
+    })
+  }
+
+  return createObservation(request, observedAt, {
+    outcome: 'PUBLISHED',
+    source,
+    platformPostId: postId,
+    canonicalUrl: publicUrl,
+    title: decision.evidence.title,
+    publishedAt: decision.evidence.publishedAt,
+    bodyText: decision.evidence.bodyText,
+    ...(decision.evidence.bodyTruncated ? { bodyTruncated: true } : {}),
+  })
 }
 
 async function fetchDraft(
@@ -906,93 +998,47 @@ export async function inspectZhihuPublication(
   }
 
   const publicUrl = `${ZHIHU_PUBLIC_ORIGIN}/p/${postId}`
-  const publicProbe = await fetchPage(
+  let publishedPageSource: PublishedPageSource = 'PUBLIC_PAGE'
+  let publicProbe = await fetchPage(
     request,
     postId,
-    'PUBLIC_PAGE',
+    publishedPageSource,
     publicUrl,
     dependencies,
     observedAt,
+    'omit',
   )
 
-  if (publicProbe.kind === 'OBSERVATION') {
+  if (publicProbe.kind === 'ACCESS_DENIED') {
+    publishedPageSource = 'PLATFORM_DETAIL'
+    publicProbe = await fetchPage(
+      request,
+      postId,
+      publishedPageSource,
+      publicUrl,
+      dependencies,
+      observedAt,
+      'include',
+    )
+  }
+
+  if (
+    publicProbe.kind === 'ACCESS_DENIED' ||
+    publicProbe.kind === 'OBSERVATION'
+  ) {
     return [publicProbe.observation]
   }
 
   if (publicProbe.kind === 'FOUND') {
-    if (
-      !responseUrlMatches(publicProbe.page.responseUrl, postId, 'PUBLISHED')
-    ) {
-      return [
-        createObservation(request, observedAt, {
-          outcome: 'PARSE_ERROR',
-          source: 'PUBLIC_PAGE',
-          platformPostId: postId,
-          errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
-          errorMessage:
-            'The public page did not prove the expected Zhihu article identity.',
-        }),
-      ]
-    }
-
-    const hasNotFoundTitle =
-      extractDocumentTitle(publicProbe.page.html) === ZHIHU_SOFT_NOT_FOUND_TITLE
-    if (hasNotFoundTitle) {
-      if (!isStrictSoftNotFoundPage(publicProbe.page.html)) {
-        return [
-          createObservation(request, observedAt, {
-            outcome: 'PARSE_ERROR',
-            source: 'PUBLIC_PAGE',
-            platformPostId: postId,
-            errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
-            errorMessage:
-              'The public page had contradictory not-found markers.',
-          }),
-        ]
-      }
-    } else {
-      if (!hasExpectedIdentity(publicProbe.page.html, postId, 'PUBLISHED')) {
-        return [
-          createObservation(request, observedAt, {
-            outcome: 'PARSE_ERROR',
-            source: 'PUBLIC_PAGE',
-            platformPostId: postId,
-            errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
-            errorMessage:
-              'The public page did not prove the expected Zhihu article identity.',
-          }),
-        ]
-      }
-
-      const decision = decideZhihuPublishedEvidence(
-        parseZhihuPublishedArticleEvidence(publicProbe.page.html, postId),
-        request.externalAccountId,
-      )
-      if (decision.outcome !== 'PUBLISHED') {
-        return [
-          createObservation(request, observedAt, {
-            outcome: decision.outcome,
-            source: 'PUBLIC_PAGE',
-            platformPostId: postId,
-            errorCode: decision.errorCode,
-            errorMessage: decision.errorMessage,
-          }),
-        ]
-      }
-
-      return [
-        createObservation(request, observedAt, {
-          outcome: 'PUBLISHED',
-          source: 'PUBLIC_PAGE',
-          platformPostId: postId,
-          canonicalUrl: publicUrl,
-          title: decision.evidence.title,
-          publishedAt: decision.evidence.publishedAt,
-          bodyText: decision.evidence.bodyText,
-          ...(decision.evidence.bodyTruncated ? { bodyTruncated: true } : {}),
-        }),
-      ]
-    }
+    const observation = inspectPublishedPage(
+      request,
+      postId,
+      publicUrl,
+      publicProbe.page,
+      publishedPageSource,
+      observedAt,
+    )
+    if (observation) return [observation]
   }
 
   const draftProbe = await fetchDraft(request, postId, dependencies, observedAt)
