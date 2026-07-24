@@ -4,7 +4,6 @@ import {
   PublicationObservationSchema,
   PublicationPlatformSchema,
   SyncerAccountV2Schema,
-  ZHIHU_ARTICLE_SUCCESS_OUTCOMES,
   type PublicationInspectRequest,
   type PublicationObservation,
   type PublicationPlatform,
@@ -22,14 +21,28 @@ const BRIDGE_ORIGIN = DEFAULT_BRIDGE_ALLOWED_ORIGINS[0]
 const ACCOUNT_CAPABILITIES = {
   toutiao: ['account_identity'],
   zhihu: ['account_identity', 'publication_inspect', 'public_url'],
-  sohu: ['account_identity'],
+  sohu: ['account_identity', 'publication_inspect', 'public_url'],
   weixin: ['account_identity'],
 } as const satisfies Record<
   PublicationPlatform,
   readonly SyncerAccountV2['capabilities'][number][]
 >
 const INSPECTION_TIMEOUT_MS = 12_000
-const ACTIVE_INSPECTION_PLATFORMS = new Set<PublicationPlatform>(['zhihu'])
+const ACTIVE_INSPECTION_PLATFORMS = new Set<PublicationPlatform>([
+  'zhihu',
+  'sohu',
+])
+const EXACT_ARTICLE_LIFECYCLE_OUTCOMES = new Set<
+  PublicationObservation['outcome']
+>([
+  'DRAFT_PRESENT',
+  'PENDING_REVIEW',
+  'REJECTED',
+  'SCHEDULED',
+  'PUBLISHED',
+  'NOT_FOUND',
+  'DELETED',
+])
 const GET_ACCOUNTS_KEYS = new Set(['platforms', 'forceRefresh'])
 const INSPECT_KEYS = new Set([
   'requestId',
@@ -396,18 +409,75 @@ export function createUnsupportedPublicationObservation(
 
 type PublicationInspectorAdapter = Pick<PlatformAdapter, 'inspectPublication'>
 
-function resolveZhihuRequestPostId(
+interface PublicationIdentityPolicy {
+  platform: PublicationPlatform
+  validateDraftIdentity(
+    request: PublicationInspectRequest,
+    identity: NonNullable<ReturnType<typeof parsePublicationUrl>>,
+  ): boolean
+  validatePublishedIdentity(
+    request: PublicationInspectRequest,
+    observation: PublicationObservation,
+    expectedPostId: string,
+    identity: NonNullable<ReturnType<typeof parsePublicationUrl>>,
+  ): boolean
+}
+
+const PUBLICATION_IDENTITY_POLICIES: Partial<
+  Record<PublicationPlatform, PublicationIdentityPolicy>
+> = {
+  zhihu: {
+    platform: 'zhihu',
+    validateDraftIdentity: () => true,
+    validatePublishedIdentity: (
+      _request,
+      observation,
+      expectedPostId,
+      identity,
+    ) =>
+      identity.postId === expectedPostId &&
+      identity.postId === observation.platformPostId,
+  },
+  sohu: {
+    platform: 'sohu',
+    validateDraftIdentity: (request, identity) =>
+      !identity.accountId || identity.accountId === request.externalAccountId,
+    validatePublishedIdentity: (
+      request,
+      observation,
+      expectedPostId,
+      identity,
+    ) => {
+      const expectedCanonicalUrl = `https://www.sohu.com/a/${expectedPostId}_${request.externalAccountId}`
+      return (
+        observation.source === 'PUBLIC_PAGE' &&
+        Boolean(observation.publishedAt) &&
+        identity.postId === expectedPostId &&
+        identity.postId === observation.platformPostId &&
+        identity.accountId === request.externalAccountId &&
+        identity.canonicalUrl === expectedCanonicalUrl
+      )
+    },
+  },
+}
+
+function resolveRequestPostId(
   request: PublicationInspectRequest,
+  policy: PublicationIdentityPolicy,
 ): string | null {
   const explicitPostId = request.draft.platformPostId
   let draftUrlPostId: string | undefined
 
   if (request.draft.draftUrl) {
-    const parsedDraftUrl = parsePublicationUrl('zhihu', request.draft.draftUrl)
+    const parsedDraftUrl = parsePublicationUrl(
+      policy.platform,
+      request.draft.draftUrl,
+    )
     if (
       !parsedDraftUrl ||
       parsedDraftUrl.surface !== 'DRAFT' ||
-      !parsedDraftUrl.postId
+      !parsedDraftUrl.postId ||
+      !policy.validateDraftIdentity(request, parsedDraftUrl)
     ) {
       return null
     }
@@ -454,6 +524,11 @@ function normalizeAdapterObservations(
 
   const seenKeys = new Set<string>()
   const observations: PublicationObservation[] = []
+  const identityPolicy = PUBLICATION_IDENTITY_POLICIES[request.platform]
+  const expectedPostId = identityPolicy
+    ? resolveRequestPostId(request, identityPolicy)
+    : null
+
   for (const candidate of value) {
     const parsed = PublicationObservationSchema.safeParse(candidate)
     if (
@@ -466,13 +541,10 @@ function normalizeAdapterObservations(
     }
 
     let normalized = parsed.data
-    const expectedZhihuPostId =
-      request.platform === 'zhihu' ? resolveZhihuRequestPostId(request) : null
     if (
-      request.platform === 'zhihu' &&
-      ZHIHU_ARTICLE_SUCCESS_OUTCOMES.includes(normalized.outcome) &&
-      (!expectedZhihuPostId ||
-        normalized.platformPostId !== expectedZhihuPostId)
+      identityPolicy &&
+      EXACT_ARTICLE_LIFECYCLE_OUTCOMES.has(normalized.outcome) &&
+      (!expectedPostId || normalized.platformPostId !== expectedPostId)
     ) {
       return null
     }
@@ -490,11 +562,15 @@ function normalizeAdapterObservations(
         return null
       }
       if (
-        request.platform === 'zhihu' &&
-        ZHIHU_ARTICLE_SUCCESS_OUTCOMES.includes(normalized.outcome) &&
-        (!expectedZhihuPostId ||
-          canonical.postId !== expectedZhihuPostId ||
-          canonical.postId !== normalized.platformPostId)
+        identityPolicy &&
+        EXACT_ARTICLE_LIFECYCLE_OUTCOMES.has(normalized.outcome) &&
+        (!expectedPostId ||
+          !identityPolicy.validatePublishedIdentity(
+            request,
+            normalized,
+            expectedPostId,
+            canonical,
+          ))
       ) {
         return null
       }
@@ -502,6 +578,14 @@ function normalizeAdapterObservations(
         ...normalized,
         canonicalUrl: canonical.canonicalUrl,
       }
+    }
+
+    if (
+      identityPolicy &&
+      normalized.outcome === 'PUBLISHED' &&
+      (!expectedPostId || !normalized.canonicalUrl || !normalized.publishedAt)
+    ) {
+      return null
     }
 
     seenKeys.add(normalized.observationKey)

@@ -4,6 +4,11 @@
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
 import type { PreprocessConfig, PublishOptions } from '../types'
+import type {
+  PublicationInspectRequest,
+  PublicationObservation,
+} from '../../publication-inspection/types'
+import { inspectSohuPublication } from '../../publication-inspection/sohu'
 import { createLogger } from '../../lib/logger'
 
 const logger = createLogger('Sohu')
@@ -24,6 +29,19 @@ function generateDeviceId(): string {
     result += chars[Math.floor(Math.random() * chars.length)]
   }
   return result
+}
+
+function normalizeSafePositiveIntegerId(value: unknown): string | null {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? String(value) : null
+  }
+
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+    return null
+  }
+
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? value : null
 }
 
 export class SohuAdapter extends CodeAdapter {
@@ -73,22 +91,30 @@ export class SohuAdapter extends CodeAdapter {
         code: number
         data?: {
           data?: Array<{
-            accounts: SohuAccountInfo[]
+            accounts: Array<{
+              id: string | number
+              nickName: string
+              avatar: string
+            }>
           }>
         }
       }
 
       logger.debug('checkAuth response:', res)
 
-      if (res.code !== 2000000 || !res.data?.data?.[0]?.accounts?.length) {
+      if (res.code !== 2000000 || !Array.isArray(res.data?.data)) {
         return { isAuthenticated: false }
       }
 
       // 收集所有子账号
       const allAccounts: SohuAccountInfo[] = []
       for (const group of res.data.data) {
-        if (group.accounts) {
-          allAccounts.push(...group.accounts)
+        if (Array.isArray(group.accounts)) {
+          for (const account of group.accounts) {
+            const accountId = normalizeSafePositiveIntegerId(account.id)
+            if (!accountId) continue
+            allAccounts.push({ ...account, id: accountId })
+          }
         }
       }
 
@@ -119,6 +145,22 @@ export class SohuAdapter extends CodeAdapter {
       logger.debug('checkAuth: not logged in -', error)
       return { isAuthenticated: false, error: (error as Error).message }
     }
+  }
+
+  async inspectPublication(
+    request: PublicationInspectRequest,
+  ): Promise<PublicationObservation[]> {
+    return this.withHeaderRules(this.HEADER_RULES, () =>
+      inspectSohuPublication(request, {
+        checkAuth: () => this.checkAuth(),
+        fetch: (url, options) => this.runtime.fetch(url, options),
+        detailHeaders: () => ({
+          'x-requested-with': 'XMLHttpRequest',
+          'dv-id': this.deviceId,
+          'sp-cm': this.spCm,
+        }),
+      }),
+    )
   }
 
   /**
@@ -223,8 +265,11 @@ export class SohuAdapter extends CodeAdapter {
         throw new Error(res.msg || '保存失败')
       }
 
-      const postId = res.data
-      const draftUrl = `https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?spm=smmp.articlelist.0.0&contentStatus=2&id=${postId}`
+      const postId = normalizeSafePositiveIntegerId(res.data)
+      if (!postId) {
+        throw new Error('保存失败: 响应中的文章 ID 无效')
+      }
+      const draftUrl = `https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?spm=smmp.articlelist.0.0&contentStatus=2&id=${postId}&accountId=${this.accountInfo!.id}`
 
       return this.createResult(true, {
         postId: String(postId),

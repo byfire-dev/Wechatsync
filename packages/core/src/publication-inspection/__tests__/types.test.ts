@@ -160,4 +160,44 @@ describe('publication inspection contracts', () => {
       }).success,
     ).toBe(true)
   })
+
+  it('requires a post ID for successful Sohu lifecycle observations', () => {
+    const result = PublicationObservationSchema.safeParse({
+      observationKey: 'observation-sohu-draft',
+      platform: 'sohu',
+      externalAccountId: '120219780',
+      outcome: 'DRAFT_PRESENT',
+      source: 'PLATFORM_DETAIL',
+      observedAt: '2026-07-24T16:40:00+08:00',
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  it('requires post ID, canonical URL, and publication time for published Sohu observations', () => {
+    const base = {
+      observationKey: 'observation-sohu-published',
+      platform: 'sohu' as const,
+      externalAccountId: '120219780',
+      outcome: 'PUBLISHED' as const,
+      source: 'PUBLIC_PAGE' as const,
+      platformPostId: '1054312481',
+      observedAt: '2026-07-24T16:41:00+08:00',
+    }
+
+    expect(PublicationObservationSchema.safeParse(base).success).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        canonicalUrl: 'https://www.sohu.com/a/1054312481_120219780',
+      }).success,
+    ).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        canonicalUrl: 'https://www.sohu.com/a/1054312481_120219780',
+        publishedAt: '2026-07-24T16:40:14+08:00',
+      }).success,
+    ).toBe(true)
+  })
 })
