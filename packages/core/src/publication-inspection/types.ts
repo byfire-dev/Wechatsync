@@ -94,6 +94,9 @@ export const ZHIHU_ARTICLE_SUCCESS_OUTCOMES: readonly PublicationObservationOutc
     'DELETED',
   ]
 
+export const SOHU_ARTICLE_SUCCESS_OUTCOMES: readonly PublicationObservationOutcome[] =
+  ZHIHU_ARTICLE_SUCCESS_OUTCOMES
+
 export const PublicationObservationSourceSchema = z.enum([
   'DRAFT_DETAIL',
   'DRAFT_LIST',
@@ -154,38 +157,40 @@ export const PublicationObservationSchema = z
       })
     }
 
-    if (
-      value.platform === 'zhihu' &&
-      ZHIHU_ARTICLE_SUCCESS_OUTCOMES.includes(value.outcome) &&
-      !value.platformPostId
-    ) {
+    const requiresArticlePostId =
+      (value.platform === 'zhihu' &&
+        ZHIHU_ARTICLE_SUCCESS_OUTCOMES.includes(value.outcome)) ||
+      (value.platform === 'sohu' &&
+        SOHU_ARTICLE_SUCCESS_OUTCOMES.includes(value.outcome))
+
+    if (requiresArticlePostId && !value.platformPostId) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'successful Zhihu observations require platformPostId',
+        message: 'successful article observations require platformPostId',
         path: ['platformPostId'],
       })
     }
 
     if (
-      value.platform === 'zhihu' &&
+      (value.platform === 'zhihu' || value.platform === 'sohu') &&
       value.outcome === 'PUBLISHED' &&
       !value.canonicalUrl
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'published Zhihu observations require canonicalUrl',
+        message: 'published article observations require canonicalUrl',
         path: ['canonicalUrl'],
       })
     }
 
     if (
-      value.platform === 'zhihu' &&
+      (value.platform === 'zhihu' || value.platform === 'sohu') &&
       value.outcome === 'PUBLISHED' &&
       !value.publishedAt
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'published Zhihu observations require publishedAt',
+        message: 'published article observations require publishedAt',
         path: ['publishedAt'],
       })
     }

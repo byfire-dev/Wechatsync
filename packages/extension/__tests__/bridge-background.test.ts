@@ -235,6 +235,13 @@ describe('Bridge v2 account projection', () => {
         username: 'No stable ID',
       },
       {
+        id: 'sohu',
+        name: 'Sohu',
+        isAuthenticated: true,
+        username: 'Sohu Creator',
+        userId: '120000001',
+      },
+      {
         id: 'weixin',
         name: 'WeChat',
         isAuthenticated: true,
@@ -263,6 +270,12 @@ describe('Bridge v2 account projection', () => {
         platform: 'zhihu',
         externalAccountId: 'account-zhihu',
         displayName: 'Zhihu Creator',
+        capabilities: ['account_identity', 'publication_inspect', 'public_url'],
+      },
+      {
+        platform: 'sohu',
+        externalAccountId: '120000001',
+        displayName: 'Sohu Creator',
         capabilities: ['account_identity', 'publication_inspect', 'public_url'],
       },
       {
@@ -339,8 +352,8 @@ describe('Bridge v2 unsupported inspection prototype', () => {
     const request = validateInspectPublicationPayload(
       {
         ...inspectPayload,
-        platform: 'sohu',
-        externalAccountId: 'account-sohu',
+        platform: 'weixin',
+        externalAccountId: 'account-weixin',
       },
       'inspect-001',
     )
@@ -355,7 +368,7 @@ describe('Bridge v2 unsupported inspection prototype', () => {
     expect(inspectPublication).not.toHaveBeenCalled()
     expect(observations).toHaveLength(1)
     expect(observations[0]).toMatchObject({
-      platform: 'sohu',
+      platform: 'weixin',
       outcome: 'UNSUPPORTED',
     })
   })
@@ -514,6 +527,233 @@ describe('Bridge v2 inspection execution boundary', () => {
     expect(timedOut[0]).toMatchObject({
       outcome: 'FETCH_ERROR',
       errorCode: 'PUBLICATION_INSPECTION_TIMEOUT',
+    })
+  })
+})
+
+describe('Bridge v2 Sohu inspection identity boundary', () => {
+  const request = {
+    ...inspectPayload,
+    platform: 'sohu' as const,
+    externalAccountId: '120000001',
+    draft: {
+      platformPostId: '1000000001',
+      draftedAt: inspectPayload.draft.draftedAt,
+    },
+  }
+  const canonicalUrl = 'https://www.sohu.com/a/1000000001_120000001'
+
+  it('executes the Sohu inspector and accepts an exact published identity', async () => {
+    const inspectPublication = vi.fn().mockResolvedValue([
+      {
+        observationKey: 'sohu:1000000001:published',
+        platform: 'sohu',
+        externalAccountId: '120000001',
+        outcome: 'PUBLISHED',
+        source: 'PUBLIC_PAGE',
+        platformPostId: '1000000001',
+        canonicalUrl: `${canonicalUrl}?spm=tracking`,
+        publishedAt: '2026-07-21T11:55:00.000Z',
+        observedAt: '2026-07-21T12:00:00.000Z',
+      },
+    ])
+
+    const observations = await runPublicationInspection(request, {
+      inspectPublication,
+    })
+
+    expect(inspectPublication).toHaveBeenCalledWith(request)
+    expect(observations).toEqual([
+      expect.objectContaining({
+        outcome: 'PUBLISHED',
+        platformPostId: '1000000001',
+        canonicalUrl,
+      }),
+    ])
+  })
+
+  it('resolves the exact post ID from a verified Sohu draft URL', async () => {
+    const urlOnlyRequest = {
+      ...request,
+      draft: {
+        draftUrl:
+          'https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?id=1000000001&accountId=120000001',
+        draftedAt: inspectPayload.draft.draftedAt,
+      },
+    }
+
+    const observations = await runPublicationInspection(urlOnlyRequest, {
+      inspectPublication: async () => [
+        {
+          observationKey: 'sohu:1000000001:draft',
+          platform: 'sohu',
+          externalAccountId: '120000001',
+          outcome: 'DRAFT_PRESENT',
+          source: 'DRAFT_DETAIL',
+          platformPostId: '1000000001',
+          observedAt: '2026-07-21T12:00:00.000Z',
+        },
+      ],
+    })
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      platformPostId: '1000000001',
+    })
+  })
+
+  it.each([
+    [
+      'a conflicting draft post ID',
+      'https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?id=1000000002&accountId=120000001',
+    ],
+    [
+      'a draft URL bound to another account',
+      'https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?id=1000000001&accountId=120000002',
+    ],
+  ])(
+    'rejects Sohu lifecycle output when the request has %s',
+    async (_name, draftUrl) => {
+      const observations = await runPublicationInspection(
+        {
+          ...request,
+          draft: {
+            ...request.draft,
+            draftUrl,
+          },
+        },
+        {
+          inspectPublication: async () => [
+            {
+              observationKey: 'sohu:1000000001:draft-invalid-request',
+              platform: 'sohu',
+              externalAccountId: '120000001',
+              outcome: 'DRAFT_PRESENT',
+              source: 'DRAFT_DETAIL',
+              platformPostId: '1000000001',
+              observedAt: '2026-07-21T12:00:00.000Z',
+            },
+          ],
+        },
+      )
+
+      expect(observations[0]).toMatchObject({
+        outcome: 'PARSE_ERROR',
+        errorCode: 'INVALID_INSPECTION_RESULT',
+      })
+    },
+  )
+
+  it.each([
+    [
+      'another observed post ID',
+      {
+        platformPostId: '1000000002',
+        canonicalUrl: 'https://www.sohu.com/a/1000000002_120000001',
+      },
+    ],
+    [
+      'another canonical post ID',
+      {
+        platformPostId: '1000000001',
+        canonicalUrl: 'https://www.sohu.com/a/1000000002_120000001',
+      },
+    ],
+    [
+      'another canonical account ID',
+      {
+        platformPostId: '1000000001',
+        canonicalUrl: 'https://www.sohu.com/a/1000000001_120000002',
+      },
+    ],
+    [
+      'no canonical URL',
+      {
+        platformPostId: '1000000001',
+        canonicalUrl: undefined,
+      },
+    ],
+    [
+      'no publication time',
+      {
+        platformPostId: '1000000001',
+        canonicalUrl,
+        publishedAt: undefined,
+      },
+    ],
+    [
+      'a non-public evidence source',
+      {
+        source: 'PLATFORM_DETAIL',
+        platformPostId: '1000000001',
+        canonicalUrl,
+      },
+    ],
+  ])('rejects a published Sohu result with %s', async (_name, overrides) => {
+    const observations = await runPublicationInspection(request, {
+      inspectPublication: async () =>
+        [
+          {
+            observationKey: 'sohu:1000000001:published-invalid',
+            platform: 'sohu',
+            externalAccountId: '120000001',
+            outcome: 'PUBLISHED',
+            source: 'PUBLIC_PAGE',
+            publishedAt: '2026-07-21T11:55:00.000Z',
+            observedAt: '2026-07-21T12:00:00.000Z',
+            ...overrides,
+          },
+        ] as never,
+    })
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'PARSE_ERROR',
+      errorCode: 'INVALID_INSPECTION_RESULT',
+    })
+  })
+
+  it.each([
+    'DRAFT_PRESENT',
+    'PENDING_REVIEW',
+    'REJECTED',
+    'SCHEDULED',
+    'NOT_FOUND',
+    'DELETED',
+  ] as const)('binds %s to the exact requested post ID', async (outcome) => {
+    const exact = await runPublicationInspection(request, {
+      inspectPublication: async () => [
+        {
+          observationKey: `sohu:1000000001:${outcome}`,
+          platform: 'sohu',
+          externalAccountId: '120000001',
+          outcome,
+          source: 'PLATFORM_DETAIL',
+          platformPostId: '1000000001',
+          observedAt: '2026-07-21T12:00:00.000Z',
+        },
+      ],
+    })
+    expect(exact[0]).toMatchObject({
+      outcome,
+      platformPostId: '1000000001',
+    })
+
+    const mismatched = await runPublicationInspection(request, {
+      inspectPublication: async () => [
+        {
+          observationKey: `sohu:1000000002:${outcome}`,
+          platform: 'sohu',
+          externalAccountId: '120000001',
+          outcome,
+          source: 'PLATFORM_DETAIL',
+          platformPostId: '1000000002',
+          observedAt: '2026-07-21T12:00:00.000Z',
+        },
+      ],
+    })
+    expect(mismatched[0]).toMatchObject({
+      outcome: 'PARSE_ERROR',
+      errorCode: 'INVALID_INSPECTION_RESULT',
     })
   })
 })

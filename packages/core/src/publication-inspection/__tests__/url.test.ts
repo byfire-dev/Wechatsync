@@ -37,12 +37,30 @@ describe('parsePublicationUrl', () => {
     ).toBeNull()
   })
 
-  it('does not infer identities for paused platforms', () => {
+  it('rejects a valid-looking Sohu identity hosted on the wrong domain', () => {
     expect(
       parsePublicationUrl(
         'sohu',
-        'https://www.sohu.com/a/1000000001_120000001',
+        'https://attacker.example/a/1000000001_120000001',
       ),
+    ).toBeNull()
+  })
+
+  it('does not infer Sohu identities from ambiguous or malformed locators', () => {
+    expect(
+      parsePublicationUrl(
+        'sohu',
+        'https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?id=1&id=2',
+      ),
+    ).toEqual({ platform: 'sohu', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl('sohu', 'https://www.sohu.com/a/abc_120000001'),
+    ).toEqual({ platform: 'sohu', surface: 'UNKNOWN' })
+  })
+
+  it('keeps paused platforms outside identity inference', () => {
+    expect(
+      parsePublicationUrl('weixin', 'https://mp.weixin.qq.com/s/example'),
     ).toBeNull()
   })
 

@@ -17,5 +17,26 @@
       "postId": "2000000000000000001",
       "canonicalUrl": "https://zhuanlan.zhihu.com/p/2000000000000000001"
     }
+  },
+  {
+    "name": "sohu article draft",
+    "platform": "sohu",
+    "href": "https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?spm=tracking&contentStatus=2&id=1054312481&accountId=120219780",
+    "expected": {
+      "surface": "DRAFT",
+      "postId": "1054312481",
+      "accountId": "120219780"
+    }
+  },
+  {
+    "name": "sohu published article",
+    "platform": "sohu",
+    "href": "https://www.sohu.com/a/1054312481_120219780?spm=tracking",
+    "expected": {
+      "surface": "PUBLISHED",
+      "postId": "1054312481",
+      "accountId": "120219780",
+      "canonicalUrl": "https://www.sohu.com/a/1054312481_120219780"
+    }
   }
 ]
