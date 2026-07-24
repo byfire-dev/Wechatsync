@@ -114,6 +114,36 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     )
   })
 
+  it('falls back to authenticated platform evidence after an anonymous 403', async () => {
+    const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
+      if (url === 'https://www.zhihu.com/api/v4/me') {
+        return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
+      }
+      if (url === PUBLIC_URL) {
+        return options?.credentials === 'include'
+          ? htmlResponse(url, publishedHtml)
+          : htmlResponse(url, '', 403)
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    const observations = await inspectWith(fetchMock)
+
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PLATFORM_DETAIL',
+      platformPostId: POST_ID,
+      canonicalUrl: PUBLIC_URL,
+      title: 'A trusted publication sample',
+    })
+    expect(
+      fetchMock.mock.calls
+        .filter(([url]) => url === PUBLIC_URL)
+        .map(([, options]) => options?.credentials),
+    ).toEqual(['omit', 'include'])
+  })
+
   it('does not classify an owner-only page as publicly published', async () => {
     const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
       if (url === 'https://www.zhihu.com/api/v4/me') {
@@ -136,5 +166,34 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
       PUBLIC_URL,
       expect.objectContaining({ credentials: 'omit' }),
     )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      PUBLIC_URL,
+      expect.objectContaining({ credentials: 'include' }),
+    )
+  })
+
+  it('returns a platform-detail fetch error when both public probes are forbidden', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === 'https://www.zhihu.com/api/v4/me') {
+        return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
+      }
+      if (url === PUBLIC_URL) return htmlResponse(url, '', 403)
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    const observations = await inspectWith(fetchMock)
+
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({
+      outcome: 'FETCH_ERROR',
+      source: 'PLATFORM_DETAIL',
+      platformPostId: POST_ID,
+      errorCode: 'ZHIHU_AUTHENTICATED_HTTP_403',
+    })
+    expect(
+      fetchMock.mock.calls
+        .filter(([url]) => url === PUBLIC_URL)
+        .map(([, options]) => options?.credentials),
+    ).toEqual(['omit', 'include'])
   })
 })
