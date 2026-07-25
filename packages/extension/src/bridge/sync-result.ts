@@ -1,12 +1,18 @@
-import { sanitizeSyncResultForBoundary } from '@wechatsync/core/publication-inspection'
+import {
+  normalizeWeixinAppMsgId,
+  sanitizeSyncResultForBoundary,
+} from '@wechatsync/core/publication-inspection'
 
 export interface LegacyEditResponse {
   draftLink?: string
   postId?: string
 }
 
-function boundedPostId(value: unknown): string | undefined {
+function boundedPostId(value: unknown, platform: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
+  if (platform === 'weixin') {
+    return normalizeWeixinAppMsgId(value) ?? undefined
+  }
   const normalized = value.trim()
   return normalized.length > 0 &&
     normalized.length <= 500 &&
@@ -37,7 +43,7 @@ export function toLegacyEditResponse(
       : typeof sanitized.url === 'string'
         ? sanitized.url
         : undefined
-  const postId = boundedPostId(sanitized.postId)
+  const postId = boundedPostId(sanitized.postId, sanitized.platform)
 
   return {
     ...(draftLink ? { draftLink } : {}),

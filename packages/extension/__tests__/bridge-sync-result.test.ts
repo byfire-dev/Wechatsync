@@ -16,6 +16,23 @@ describe('toLegacyEditResponse', () => {
     expect(JSON.stringify(result)).not.toContain('secret')
   })
 
+  it('keeps only a canonical WeChat post ID within the shared 128-digit boundary', () => {
+    expect(
+      toLegacyEditResponse({
+        platform: 'weixin',
+        success: true,
+        postId: '0009001',
+      }),
+    ).toEqual({ postId: '9001' })
+    expect(
+      toLegacyEditResponse({
+        platform: 'weixin',
+        success: true,
+        postId: '1'.repeat(129),
+      }),
+    ).toEqual({})
+  })
+
   it('sanitizes another platform URL and preserves its post ID', () => {
     expect(
       toLegacyEditResponse({

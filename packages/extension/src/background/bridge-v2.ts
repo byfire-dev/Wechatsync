@@ -1,9 +1,15 @@
 import {
+  OpenPublicationDraftRequestSchema,
+  OpenPublicationDraftResultSchema,
   parsePublicationUrl,
   PublicationInspectRequestSchema,
   PublicationObservationSchema,
   PublicationPlatformSchema,
+  normalizeWeixinAppMsgId,
+  resolveWeixinAppMsgId,
   SyncerAccountV2Schema,
+  type OpenPublicationDraftRequest,
+  type OpenPublicationDraftResult,
   type PublicationInspectRequest,
   type PublicationObservation,
   type PublicationPlatform,
@@ -22,7 +28,12 @@ const ACCOUNT_CAPABILITIES = {
   toutiao: ['account_identity'],
   zhihu: ['account_identity', 'publication_inspect', 'public_url'],
   sohu: ['account_identity', 'publication_inspect', 'public_url'],
-  weixin: ['account_identity'],
+  weixin: [
+    'account_identity',
+    'draft_open',
+    'publication_inspect',
+    'public_url',
+  ],
 } as const satisfies Record<
   PublicationPlatform,
   readonly SyncerAccountV2['capabilities'][number][]
@@ -31,7 +42,9 @@ const INSPECTION_TIMEOUT_MS = 12_000
 const ACTIVE_INSPECTION_PLATFORMS = new Set<PublicationPlatform>([
   'zhihu',
   'sohu',
+  'weixin',
 ])
+const ACTIVE_DRAFT_OPEN_PLATFORMS = new Set<PublicationPlatform>(['weixin'])
 const EXACT_ARTICLE_LIFECYCLE_OUTCOMES = new Set<
   PublicationObservation['outcome']
 >([
@@ -57,6 +70,12 @@ const INSPECT_ARTICLE_HINT_KEYS = new Set([
   'title',
   'publishedAfter',
   'publishedBefore',
+])
+const OPEN_PUBLICATION_DRAFT_KEYS = new Set([
+  'requestId',
+  'platform',
+  'externalAccountId',
+  'platformPostId',
 ])
 
 export type BackgroundBridgeFailureCode =
@@ -311,6 +330,32 @@ export function validateInspectPublicationPayload(
   return { success: true, data: parsed.data }
 }
 
+/** Revalidates an authenticated draft-open request at the background boundary. */
+export function validateOpenPublicationDraftPayload(
+  payload: unknown,
+  envelopeRequestId: string,
+): BackgroundBridgeValidationResult<OpenPublicationDraftRequest> {
+  if (
+    !isRecord(payload) ||
+    !hasOnlyKeys(payload, OPEN_PUBLICATION_DRAFT_KEYS)
+  ) {
+    return { success: false, code: 'INVALID_PAYLOAD' }
+  }
+
+  const parsed = OpenPublicationDraftRequestSchema.safeParse(payload)
+  const normalizedEnvelopeRequestId =
+    normalizeBridgeRequestId(envelopeRequestId)
+  if (
+    !parsed.success ||
+    normalizedEnvelopeRequestId === null ||
+    parsed.data.requestId !== normalizedEnvelopeRequestId
+  ) {
+    return { success: false, code: 'INVALID_PAYLOAD' }
+  }
+
+  return { success: true, data: parsed.data }
+}
+
 function safeHttpUrl(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
 
@@ -387,6 +432,20 @@ export function buildSyncerAccountsV2(
   return accounts
 }
 
+function resolveWeixinFailurePostId(
+  request: PublicationInspectRequest,
+): string | null {
+  if (request.platform !== 'weixin') return null
+
+  const resolved = resolveWeixinAppMsgId(
+    request.draft.platformPostId,
+    request.draft.draftUrl,
+  )
+  return resolved.success
+    ? resolved.appMsgId
+    : normalizeWeixinAppMsgId(request.draft.platformPostId)
+}
+
 /**
  * Paused platforms remain callable at the protocol level but explicitly return
  * UNSUPPORTED. This avoids misclassifying absence as NOT_FOUND.
@@ -395,12 +454,14 @@ export function createUnsupportedPublicationObservation(
   request: PublicationInspectRequest,
   observedAt = new Date().toISOString(),
 ): PublicationObservation {
+  const weixinAppMsgId = resolveWeixinFailurePostId(request)
   return PublicationObservationSchema.parse({
     observationKey: `bridge-v2:${request.requestId}:${request.platform}:unsupported`,
     platform: request.platform,
     externalAccountId: request.externalAccountId,
     outcome: 'UNSUPPORTED',
-    source: 'PLATFORM_DETAIL',
+    source: request.platform === 'weixin' ? 'DRAFT_DETAIL' : 'PLATFORM_DETAIL',
+    ...(weixinAppMsgId ? { platformPostId: weixinAppMsgId } : {}),
     observedAt,
     errorCode: 'PUBLICATION_INSPECTION_NOT_IMPLEMENTED',
     errorMessage: `Publication inspection is not implemented for ${request.platform} in Phase 0.`,
@@ -408,9 +469,18 @@ export function createUnsupportedPublicationObservation(
 }
 
 type PublicationInspectorAdapter = Pick<PlatformAdapter, 'inspectPublication'>
+type PublicationDraftOpenerAdapter = Pick<
+  PlatformAdapter,
+  'checkAuth' | 'openPublicationDraft'
+>
 
 interface PublicationIdentityPolicy {
   platform: PublicationPlatform
+  resolveRequestPostId?(request: PublicationInspectRequest): string | null
+  requiresExactPostIdForAllOutcomes?: boolean
+  allowedArticleLifecycleOutcomes?: ReadonlySet<
+    PublicationObservation['outcome']
+  >
   validateDraftIdentity(
     request: PublicationInspectRequest,
     identity: NonNullable<ReturnType<typeof parsePublicationUrl>>,
@@ -459,12 +529,48 @@ const PUBLICATION_IDENTITY_POLICIES: Partial<
       )
     },
   },
+  weixin: {
+    platform: 'weixin',
+    requiresExactPostIdForAllOutcomes: true,
+    resolveRequestPostId: (request) => {
+      const resolved = resolveWeixinAppMsgId(
+        request.draft.platformPostId,
+        request.draft.draftUrl,
+      )
+      return resolved.success ? resolved.appMsgId : null
+    },
+    allowedArticleLifecycleOutcomes: new Set(['DRAFT_PRESENT', 'PUBLISHED']),
+    validateDraftIdentity: () => true,
+    // The public URL's mid is a different identifier. The adapter preserves
+    // the requested appMsgId after an exact published-list match.
+    validatePublishedIdentity: (
+      _request,
+      observation,
+      expectedPostId,
+      identity,
+    ) =>
+      observation.source === 'PUBLIC_PAGE' &&
+      Boolean(observation.publishedAt) &&
+      typeof observation.title === 'string' &&
+      observation.title.trim().length > 0 &&
+      typeof observation.bodyText === 'string' &&
+      observation.bodyText.trim().length > 0 &&
+      typeof observation.bodyTruncated === 'boolean' &&
+      observation.errorCode === undefined &&
+      observation.errorMessage === undefined &&
+      observation.platformPostId === expectedPostId &&
+      identity.canonicalUrl === observation.canonicalUrl,
+  },
 }
 
 function resolveRequestPostId(
   request: PublicationInspectRequest,
   policy: PublicationIdentityPolicy,
 ): string | null {
+  if (policy.resolveRequestPostId) {
+    return policy.resolveRequestPostId(request)
+  }
+
   const explicitPostId = request.draft.platformPostId
   let draftUrlPostId: string | undefined
 
@@ -498,12 +604,14 @@ function createInspectionFailure(
   errorMessage: string,
   observedAt = new Date().toISOString(),
 ): PublicationObservation {
+  const weixinAppMsgId = resolveWeixinFailurePostId(request)
   return PublicationObservationSchema.parse({
     observationKey: `bridge-v2:${request.requestId}:${request.platform}:${errorCode.toLowerCase()}`,
     platform: request.platform,
     externalAccountId: request.externalAccountId,
     outcome,
-    source: 'PLATFORM_DETAIL',
+    source: request.platform === 'weixin' ? 'DRAFT_DETAIL' : 'PLATFORM_DETAIL',
+    ...(weixinAppMsgId ? { platformPostId: weixinAppMsgId } : {}),
     observedAt,
     errorCode,
     errorMessage,
@@ -542,9 +650,19 @@ function normalizeAdapterObservations(
 
     let normalized = parsed.data
     if (
+      identityPolicy?.requiresExactPostIdForAllOutcomes &&
+      (!expectedPostId || normalized.platformPostId !== expectedPostId)
+    ) {
+      return null
+    }
+    if (
       identityPolicy &&
       EXACT_ARTICLE_LIFECYCLE_OUTCOMES.has(normalized.outcome) &&
-      (!expectedPostId || normalized.platformPostId !== expectedPostId)
+      (identityPolicy.allowedArticleLifecycleOutcomes?.has(
+        normalized.outcome,
+      ) === false ||
+        !expectedPostId ||
+        normalized.platformPostId !== expectedPostId)
     ) {
       return null
     }
@@ -595,23 +713,118 @@ function normalizeAdapterObservations(
   return observations
 }
 
-function withInspectionTimeout<T>(promise: Promise<T>, timeoutMs: number) {
+function withInspectionDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+) {
+  const controller = new AbortController()
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error('PUBLICATION_INSPECTION_TIMEOUT')),
-      timeoutMs,
-    )
-    promise.then(
-      (value) => {
-        clearTimeout(timer)
-        resolve(value)
-      },
-      (error) => {
-        clearTimeout(timer)
-        reject(error)
-      },
-    )
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      // Abort first so every nested adapter fetch is cancelled before the
+      // bridge publishes its timeout result.
+      controller.abort()
+      reject(new Error('PUBLICATION_INSPECTION_TIMEOUT'))
+    }, timeoutMs)
+
+    Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (value) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve(value)
+        },
+        (error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          reject(error)
+        },
+      )
   })
+}
+
+const SAFE_DRAFT_OPEN_FAILURES = new Set([
+  'ACCOUNT_AUTH_CHECK_FAILED',
+  'ACCOUNT_ID_MISSING',
+  'ACCOUNT_MISMATCH',
+  'INVALID_DRAFT_POST_ID',
+  'INVALID_DRAFT_OPEN_RESULT',
+  'LOGIN_REQUIRED',
+  'PUBLICATION_DRAFT_OPEN_NOT_SUPPORTED',
+  'PUBLICATION_DRAFT_OPEN_FAILED',
+])
+
+function draftOpenFailure(code: string): Error {
+  return new Error(code)
+}
+
+/**
+ * Re-authenticate and bind the active account before allowing an adapter to
+ * open a token-bearing editor URL. URLs and adapter exception details never
+ * cross this boundary.
+ */
+export async function runOpenPublicationDraft(
+  request: OpenPublicationDraftRequest,
+  adapter: PublicationDraftOpenerAdapter | null,
+  timeoutMs = INSPECTION_TIMEOUT_MS,
+): Promise<OpenPublicationDraftResult> {
+  if (
+    !ACTIVE_DRAFT_OPEN_PLATFORMS.has(request.platform) ||
+    !adapter?.openPublicationDraft
+  ) {
+    throw draftOpenFailure('PUBLICATION_DRAFT_OPEN_NOT_SUPPORTED')
+  }
+
+  try {
+    return await withInspectionDeadline(async (signal) => {
+      let auth
+      try {
+        auth = await adapter.checkAuth({ signal })
+      } catch {
+        throw draftOpenFailure('ACCOUNT_AUTH_CHECK_FAILED')
+      }
+
+      if (!auth.isAuthenticated) {
+        throw draftOpenFailure('LOGIN_REQUIRED')
+      }
+      if (!auth.userId) {
+        throw draftOpenFailure('ACCOUNT_ID_MISSING')
+      }
+      if (auth.userId !== request.externalAccountId) {
+        throw draftOpenFailure('ACCOUNT_MISMATCH')
+      }
+
+      let value: unknown
+      try {
+        value = await adapter.openPublicationDraft!(request, { signal })
+      } catch (error) {
+        const code = error instanceof Error ? error.message : ''
+        throw draftOpenFailure(
+          SAFE_DRAFT_OPEN_FAILURES.has(code)
+            ? code
+            : 'PUBLICATION_DRAFT_OPEN_FAILED',
+        )
+      }
+
+      const parsed = OpenPublicationDraftResultSchema.safeParse(value)
+      if (!parsed.success) {
+        throw draftOpenFailure('INVALID_DRAFT_OPEN_RESULT')
+      }
+      return parsed.data
+    }, timeoutMs)
+  } catch (error) {
+    const code = error instanceof Error ? error.message : ''
+    throw draftOpenFailure(
+      SAFE_DRAFT_OPEN_FAILURES.has(code)
+        ? code
+        : 'PUBLICATION_DRAFT_OPEN_FAILED',
+    )
+  }
 }
 
 /**
@@ -631,8 +844,8 @@ export async function runPublicationInspection(
   }
 
   try {
-    const value = await withInspectionTimeout(
-      adapter.inspectPublication(request),
+    const value = await withInspectionDeadline(
+      (signal) => adapter.inspectPublication!(request, { signal }),
       timeoutMs,
     )
     const observations = normalizeAdapterObservations(request, value)

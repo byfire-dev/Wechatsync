@@ -3,7 +3,27 @@
  */
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
-import type { PublishOptions } from '../types'
+import type { AdapterOperationContext, PublishOptions } from '../types'
+import type {
+  OpenPublicationDraftRequest,
+  OpenPublicationDraftResult,
+  PublicationInspectRequest,
+  PublicationObservation,
+} from '../../publication-inspection/types'
+import { PublicationObservationSchema } from '../../publication-inspection/types'
+import {
+  buildWeixinPublishedListRequest,
+  buildWeixinTempUrlRequest,
+  normalizeWeixinAppMsgId,
+  parseWeixinDraftHtml,
+  parseWeixinPublishedListPayload,
+  parseWeixinPublicArticleHtml,
+  parseWeixinTempUrlPayload,
+  resolveWeixinAppMsgId,
+  resolveWeixinTempUrl,
+  WEIXIN_PUBLISHED_LIST_MAX_PAGES,
+  WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
+} from '../../publication-inspection/weixin'
 import { createLogger } from '../../lib/logger'
 import juice from 'juice'
 
@@ -17,6 +37,11 @@ interface WeixinMeta {
   svrTime: number
   avatar: string
 }
+
+type WeixinPublishedLookup =
+  | { kind: 'PUBLISHED'; observation: PublicationObservation }
+  | { kind: 'REVIEW_REQUIRED'; observation: PublicationObservation }
+  | { kind: 'FALLBACK_TO_DRAFT' }
 
 // 微信公众号的默认 CSS 样式
 const WEIXIN_CSS = `
@@ -68,22 +93,28 @@ export class WeixinAdapter extends CodeAdapter {
     {
       urlFilter: '*://mp.weixin.qq.com/cgi-bin/*',
       headers: {
-        'Origin': 'https://mp.weixin.qq.com',
-        'Referer': 'https://mp.weixin.qq.com/',
+        Origin: 'https://mp.weixin.qq.com',
+        Referer: 'https://mp.weixin.qq.com/',
       },
       resourceTypes: ['xmlhttprequest'],
     },
   ]
 
-  async checkAuth(): Promise<AuthResult> {
+  async checkAuth(context?: AdapterOperationContext): Promise<AuthResult> {
+    const signal = context?.signal
+    signal?.throwIfAborted()
+    // Never retain an earlier token when a refresh fails or the user signs out.
+    this.weixinMeta = null
     try {
-      const response = await this.runtime.fetch(
-        'https://mp.weixin.qq.com/',
-        {
-          method: 'GET',
-          credentials: 'include',
-        }
-      )
+      const response = await this.runtime.fetch('https://mp.weixin.qq.com/', {
+        method: 'GET',
+        credentials: 'include',
+        signal,
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
 
       const html = await response.text()
 
@@ -99,8 +130,14 @@ export class WeixinAdapter extends CodeAdapter {
       const timeMatch = html.match(/time:\s*["'](\d+)["']/)
       const headImgMatch = html.match(/head_img:\s*['"]([^'"]+)['"]/)
 
-      const avatarMatch = html.match(/class="weui-desktop-account__thumb"[^>]*src="([^"]+)"/)
-      let avatar = avatarMatch ? avatarMatch[1] : (headImgMatch ? headImgMatch[1] : '')
+      const avatarMatch = html.match(
+        /class="weui-desktop-account__thumb"[^>]*src="([^"]+)"/,
+      )
+      let avatar = avatarMatch
+        ? avatarMatch[1]
+        : headImgMatch
+          ? headImgMatch[1]
+          : ''
       if (avatar.startsWith('http://')) {
         avatar = avatar.replace('http://', 'https://')
       }
@@ -127,12 +164,516 @@ export class WeixinAdapter extends CodeAdapter {
         avatar: this.weixinMeta.avatar,
       }
     } catch (error) {
+      signal?.throwIfAborted()
       logger.debug('checkAuth: not logged in -', error)
       return { isAuthenticated: false, error: (error as Error).message }
     }
   }
 
-  async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {
+  private async inspectPublishedRecords(
+    request: PublicationInspectRequest,
+    appMsgId: string,
+    token: string,
+    signal?: AbortSignal,
+  ): Promise<WeixinPublishedLookup> {
+    signal?.throwIfAborted()
+    for (let page = 0; page < WEIXIN_PUBLISHED_LIST_MAX_PAGES; page += 1) {
+      const begin = page * WEIXIN_PUBLISHED_LIST_PAGE_SIZE
+      let listResponse: Response
+      try {
+        listResponse = await this.runtime.fetch(
+          buildWeixinPublishedListRequest(
+            token,
+            begin,
+            WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
+          ),
+          {
+            method: 'GET',
+            credentials: 'include',
+            redirect: 'error',
+            signal,
+            headers: {
+              Accept: 'application/json, text/javascript, */*; q=0.01',
+              'X-Requested-With': 'XMLHttpRequest',
+            },
+          },
+        )
+      } catch {
+        signal?.throwIfAborted()
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          'WEIXIN_PUBLISHED_LIST_FETCH_ERROR',
+          'The WeChat published-list request failed.',
+        )
+      }
+
+      if (!listResponse.ok) {
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          'WEIXIN_PUBLISHED_LIST_FETCH_ERROR',
+          'The WeChat published-list request failed.',
+        )
+      }
+
+      let listPayload: unknown
+      try {
+        listPayload = await listResponse.json()
+      } catch {
+        signal?.throwIfAborted()
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
+          'The WeChat published-list response could not be parsed.',
+        )
+      }
+
+      const lookup = parseWeixinPublishedListPayload(
+        listPayload,
+        appMsgId,
+        begin,
+        WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
+      )
+      if (!lookup.success) {
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          lookup.errorCode === 'WEIXIN_PUBLISHED_LIST_API_ERROR'
+            ? 'WEIXIN_PUBLISHED_LIST_FETCH_ERROR'
+            : 'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
+          lookup.errorCode === 'WEIXIN_PUBLISHED_LIST_API_ERROR'
+            ? 'The WeChat published-list request failed.'
+            : 'The WeChat published-list response could not be parsed.',
+        )
+      }
+      if (lookup.match === 'REVIEW_REQUIRED') {
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          'WEIXIN_PUBLISHED_EVIDENCE_INCOMPLETE',
+          'The WeChat published record matched this draft but did not contain complete publication evidence.',
+        )
+      }
+      if (lookup.match === 'NOT_FOUND') {
+        if (!lookup.hasMore) return { kind: 'FALLBACK_TO_DRAFT' }
+        continue
+      }
+
+      let publicResponse: Response
+      try {
+        publicResponse = await this.runtime.fetch(lookup.canonicalUrl, {
+          method: 'GET',
+          credentials: 'omit',
+          redirect: 'follow',
+          signal,
+        })
+      } catch {
+        signal?.throwIfAborted()
+        return {
+          kind: 'REVIEW_REQUIRED',
+          observation: this.createInspectionError(
+            request,
+            'REVIEW_REQUIRED',
+            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
+            'The matched WeChat public article could not be verified.',
+            appMsgId,
+            'PUBLIC_PAGE',
+          ),
+        }
+      }
+
+      if (!publicResponse.ok) {
+        return {
+          kind: 'REVIEW_REQUIRED',
+          observation: this.createInspectionError(
+            request,
+            'REVIEW_REQUIRED',
+            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
+            'The matched WeChat public article could not be verified.',
+            appMsgId,
+            'PUBLIC_PAGE',
+          ),
+        }
+      }
+
+      let publicHtml: string
+      try {
+        publicHtml = await publicResponse.text()
+      } catch {
+        signal?.throwIfAborted()
+        return {
+          kind: 'REVIEW_REQUIRED',
+          observation: this.createInspectionError(
+            request,
+            'REVIEW_REQUIRED',
+            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
+            'The matched WeChat public article could not be verified.',
+            appMsgId,
+            'PUBLIC_PAGE',
+          ),
+        }
+      }
+
+      const article = parseWeixinPublicArticleHtml(publicHtml)
+      if (!article.success) {
+        return {
+          kind: 'REVIEW_REQUIRED',
+          observation: this.createInspectionError(
+            request,
+            'REVIEW_REQUIRED',
+            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
+            'The matched WeChat public article could not be verified.',
+            appMsgId,
+            'PUBLIC_PAGE',
+          ),
+        }
+      }
+
+      return {
+        kind: 'PUBLISHED',
+        observation: PublicationObservationSchema.parse({
+          observationKey: `weixin:${request.requestId}:public-page`,
+          platform: 'weixin',
+          externalAccountId: request.externalAccountId,
+          outcome: 'PUBLISHED',
+          source: 'PUBLIC_PAGE',
+          platformPostId: appMsgId,
+          canonicalUrl: lookup.canonicalUrl,
+          title: article.title,
+          publishedAt: lookup.publishedAt,
+          bodyText: article.bodyText,
+          bodyTruncated: article.bodyTruncated,
+          observedAt: new Date().toISOString(),
+        }),
+      }
+    }
+
+    return this.createPublishedListReview(
+      request,
+      appMsgId,
+      'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+      'The WeChat published-list scan reached its page limit before all records were checked.',
+    )
+  }
+
+  async inspectPublication(
+    request: PublicationInspectRequest,
+    context?: AdapterOperationContext,
+  ): Promise<PublicationObservation[]> {
+    const signal = context?.signal
+    signal?.throwIfAborted()
+    if (request.platform !== 'weixin') {
+      return [
+        this.createInspectionError(
+          request,
+          'UNSUPPORTED',
+          'WEIXIN_PLATFORM_REQUIRED',
+          'This inspector only supports WeChat Official Accounts.',
+        ),
+      ]
+    }
+
+    // Resolve the stable identity before touching the authenticated session.
+    const resolvedId = resolveWeixinAppMsgId(
+      request.draft.platformPostId,
+      request.draft.draftUrl,
+    )
+    if (!resolvedId.success) {
+      const explicitAppMsgId = normalizeWeixinAppMsgId(
+        request.draft.platformPostId,
+      )
+      return [
+        this.createInspectionError(
+          request,
+          resolvedId.outcome,
+          resolvedId.errorCode,
+          resolvedId.errorMessage,
+          explicitAppMsgId ?? undefined,
+        ),
+      ]
+    }
+    const appMsgId = resolvedId.appMsgId
+
+    // Always refresh the session. Inspection must never reuse the token left by
+    // publish(), a prior auth check, or an earlier inspection.
+    const auth = await this.checkAuth(context)
+    if (!auth.isAuthenticated) {
+      return [
+        this.createInspectionError(
+          request,
+          auth.error ? 'FETCH_ERROR' : 'LOGIN_REQUIRED',
+          auth.error ? 'WEIXIN_AUTH_FETCH_ERROR' : 'WEIXIN_LOGIN_REQUIRED',
+          auth.error
+            ? 'The WeChat authentication check failed.'
+            : 'Log in to WeChat Official Accounts before inspecting this draft.',
+          appMsgId,
+        ),
+      ]
+    }
+
+    if (!auth.userId || !this.weixinMeta?.token) {
+      return [
+        this.createInspectionError(
+          request,
+          'PARSE_ERROR',
+          'WEIXIN_AUTH_RESPONSE_INVALID',
+          'The WeChat authentication response is missing stable account data.',
+          appMsgId,
+        ),
+      ]
+    }
+
+    if (auth.userId !== request.externalAccountId) {
+      return [
+        this.createInspectionError(
+          request,
+          'ACCOUNT_MISMATCH',
+          'WEIXIN_ACCOUNT_MISMATCH',
+          'The active WeChat account does not match the bound account.',
+          appMsgId,
+        ),
+      ]
+    }
+
+    const token = this.weixinMeta.token
+
+    try {
+      return await this.withHeaderRules(this.HEADER_RULES, async () => {
+        const publishedLookup = await this.inspectPublishedRecords(
+          request,
+          appMsgId,
+          token,
+          signal,
+        )
+        if (publishedLookup.kind !== 'FALLBACK_TO_DRAFT') {
+          return [publishedLookup.observation]
+        }
+
+        let detailResponse: Response
+        try {
+          detailResponse = await this.runtime.fetch(
+            buildWeixinTempUrlRequest(appMsgId, token),
+            {
+              method: 'GET',
+              credentials: 'include',
+              redirect: 'error',
+              signal,
+            },
+          )
+        } catch {
+          signal?.throwIfAborted()
+          return [
+            this.createInspectionError(
+              request,
+              'FETCH_ERROR',
+              'WEIXIN_DRAFT_DETAIL_FETCH_ERROR',
+              'The WeChat draft-detail request failed.',
+              appMsgId,
+            ),
+          ]
+        }
+
+        if (!detailResponse.ok) {
+          return [
+            this.createInspectionError(
+              request,
+              'FETCH_ERROR',
+              'WEIXIN_DRAFT_DETAIL_HTTP_ERROR',
+              `The WeChat draft-detail request returned HTTP ${detailResponse.status}.`,
+              appMsgId,
+            ),
+          ]
+        }
+
+        let detailPayload: unknown
+        try {
+          detailPayload = await detailResponse.json()
+        } catch {
+          signal?.throwIfAborted()
+          return [
+            this.createInspectionError(
+              request,
+              'PARSE_ERROR',
+              'WEIXIN_DRAFT_DETAIL_JSON_INVALID',
+              'The WeChat draft-detail response is not valid JSON.',
+              appMsgId,
+            ),
+          ]
+        }
+
+        const parsedPayload = parseWeixinTempUrlPayload(detailPayload)
+        if (!parsedPayload.success) {
+          return [
+            this.createInspectionError(
+              request,
+              parsedPayload.outcome,
+              parsedPayload.errorCode,
+              parsedPayload.errorMessage,
+              appMsgId,
+            ),
+          ]
+        }
+
+        const resolvedTempUrl = resolveWeixinTempUrl(parsedPayload.tempUrl)
+        if (!resolvedTempUrl.success) {
+          return [
+            this.createInspectionError(
+              request,
+              'PARSE_ERROR',
+              resolvedTempUrl.errorCode,
+              'The WeChat draft-detail response returned a temporary URL with an unsupported shape.',
+              appMsgId,
+            ),
+          ]
+        }
+
+        let pageResponse: Response
+        try {
+          pageResponse = await this.runtime.fetch(resolvedTempUrl.url, {
+            method: 'GET',
+            credentials: 'include',
+            redirect: 'error',
+            signal,
+          })
+        } catch {
+          signal?.throwIfAborted()
+          return [
+            this.createInspectionError(
+              request,
+              'FETCH_ERROR',
+              'WEIXIN_TEMP_PAGE_FETCH_ERROR',
+              'The WeChat temporary page request failed.',
+              appMsgId,
+            ),
+          ]
+        }
+
+        if (!pageResponse.ok) {
+          return [
+            this.createInspectionError(
+              request,
+              'FETCH_ERROR',
+              'WEIXIN_TEMP_PAGE_HTTP_ERROR',
+              `The WeChat temporary page returned HTTP ${pageResponse.status}.`,
+              appMsgId,
+            ),
+          ]
+        }
+
+        let pageHtml: string
+        try {
+          pageHtml = await pageResponse.text()
+        } catch {
+          signal?.throwIfAborted()
+          return [
+            this.createInspectionError(
+              request,
+              'FETCH_ERROR',
+              'WEIXIN_TEMP_PAGE_READ_ERROR',
+              'The WeChat temporary page could not be read.',
+              appMsgId,
+            ),
+          ]
+        }
+
+        const parsedPage = parseWeixinDraftHtml(pageHtml)
+        if (!parsedPage.success) {
+          return [
+            this.createInspectionError(
+              request,
+              'REVIEW_REQUIRED',
+              'WEIXIN_DRAFT_STATE_REVIEW_REQUIRED',
+              'The WeChat draft preview is no longer readable; confirm its publication state manually.',
+              appMsgId,
+            ),
+          ]
+        }
+
+        return [
+          PublicationObservationSchema.parse({
+            observationKey: `weixin:${request.requestId}:draft-detail`,
+            platform: 'weixin',
+            externalAccountId: request.externalAccountId,
+            outcome: 'DRAFT_PRESENT',
+            source: 'DRAFT_DETAIL',
+            platformPostId: appMsgId,
+            title: parsedPage.title,
+            bodyText: parsedPage.bodyText,
+            bodyTruncated: parsedPage.bodyTruncated,
+            observedAt: new Date().toISOString(),
+          }),
+        ]
+      })
+    } catch {
+      signal?.throwIfAborted()
+      return [
+        this.createInspectionError(
+          request,
+          'FETCH_ERROR',
+          'WEIXIN_INSPECTION_RUNTIME_ERROR',
+          'The WeChat draft inspection could not complete.',
+          appMsgId,
+        ),
+      ]
+    }
+  }
+
+  private createInspectionError(
+    request: PublicationInspectRequest,
+    outcome:
+      | 'ACCOUNT_MISMATCH'
+      | 'LOGIN_REQUIRED'
+      | 'UNSUPPORTED'
+      | 'FETCH_ERROR'
+      | 'PARSE_ERROR'
+      | 'REVIEW_REQUIRED',
+    errorCode: string,
+    errorMessage: string,
+    platformPostId?: string,
+    source: PublicationObservation['source'] = 'DRAFT_DETAIL',
+  ): PublicationObservation {
+    const observationSource =
+      source === 'DRAFT_DETAIL'
+        ? 'draft-detail'
+        : source.toLowerCase().replace(/_/g, '-')
+    return PublicationObservationSchema.parse({
+      observationKey: `weixin:${request.requestId}:${observationSource}`,
+      platform: 'weixin',
+      externalAccountId: request.externalAccountId,
+      outcome,
+      source,
+      ...(platformPostId ? { platformPostId } : {}),
+      observedAt: new Date().toISOString(),
+      errorCode,
+      errorMessage,
+    })
+  }
+
+  private createPublishedListReview(
+    request: PublicationInspectRequest,
+    appMsgId: string,
+    errorCode: string,
+    errorMessage: string,
+  ): WeixinPublishedLookup {
+    return {
+      kind: 'REVIEW_REQUIRED',
+      observation: this.createInspectionError(
+        request,
+        'REVIEW_REQUIRED',
+        errorCode,
+        errorMessage,
+        appMsgId,
+        'PUBLISHED_LIST',
+      ),
+    }
+  }
+
+  async publish(
+    article: Article,
+    options?: PublishOptions,
+  ): Promise<SyncResult> {
     return this.withHeaderRules(this.HEADER_RULES, async () => {
       logger.info('Starting publish...')
 
@@ -144,12 +685,15 @@ export class WeixinAdapter extends CodeAdapter {
       }
 
       // 微信到微信：使用原始 HTML，跳过所有处理
-      let content = (article.source?.platform === 'weixin' && (article as any).rawHtml)
-        ? (article as any).rawHtml
-        : (article.html || '')
+      let content =
+        article.source?.platform === 'weixin' && (article as any).rawHtml
+          ? (article as any).rawHtml
+          : article.html || ''
 
       if (article.source?.platform === 'weixin') {
-        logger.info('Source is WeChat, using raw HTML, skipping content processing')
+        logger.info(
+          'Source is WeChat, using raw HTML, skipping content processing',
+        )
       } else {
         content = this.processLatex(content)
         content = this.stripExternalLinks(content)
@@ -159,7 +703,7 @@ export class WeixinAdapter extends CodeAdapter {
           {
             skipPatterns: ['mmbiz.qpic.cn', 'mmbiz.qlogo.cn'],
             onProgress: options?.onImageProgress,
-          }
+          },
         )
         content = this.processContent(content)
       }
@@ -240,32 +784,96 @@ export class WeixinAdapter extends CodeAdapter {
             'Content-Type': 'application/x-www-form-urlencoded',
           },
           body: formData,
-        }
+        },
       )
 
-      const res = await response.json() as {
-        appMsgId?: string
+      const res = (await response.json()) as {
+        appMsgId?: string | number
         ret?: number
         base_resp?: { ret: number; err_msg?: string }
       }
 
       logger.debug(' Save response:', res)
 
-      if (!res.appMsgId) {
+      const appMsgId = normalizeWeixinAppMsgId(res.appMsgId)
+      const responseCode = res.ret ?? res.base_resp?.ret
+      if (
+        !appMsgId &&
+        typeof res.appMsgId === 'undefined' &&
+        typeof responseCode === 'number' &&
+        responseCode !== 0
+      ) {
         const errMsg = this.formatError(res)
         throw new Error(errMsg)
       }
 
-      const draftUrl = `https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=${res.appMsgId}&token=${this.weixinMeta!.token}&lang=zh_CN`
+      if (!appMsgId) {
+        throw new Error('保存失败: 响应中的 appMsgId 无效')
+      }
+      const draftUrl = `https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit&action=edit&type=77&appmsgid=${appMsgId}&token=${this.weixinMeta!.token}&lang=zh_CN`
 
       return this.createResult(true, {
-        postId: res.appMsgId,
+        postId: appMsgId,
         postUrl: draftUrl,
         draftOnly: options?.draftOnly ?? true,
       })
-    }).catch((error) => this.createResult(false, {
-      error: (error as Error).message,
-    }))
+    }).catch((error) =>
+      this.createResult(false, {
+        error: (error as Error).message,
+      }),
+    )
+  }
+
+  async openPublicationDraft(
+    request: OpenPublicationDraftRequest,
+    context?: AdapterOperationContext,
+  ): Promise<OpenPublicationDraftResult> {
+    context?.signal?.throwIfAborted()
+    if (
+      request.platform !== 'weixin' ||
+      !this.weixinMeta ||
+      this.weixinMeta.userName !== request.externalAccountId
+    ) {
+      throw new Error('ACCOUNT_MISMATCH')
+    }
+
+    const appMsgId = normalizeWeixinAppMsgId(request.platformPostId)
+    if (!appMsgId || appMsgId !== request.platformPostId) {
+      throw new Error('INVALID_DRAFT_POST_ID')
+    }
+    if (!this.runtime.tabs) {
+      throw new Error('PUBLICATION_DRAFT_OPEN_NOT_SUPPORTED')
+    }
+
+    const draftUrl = new URL('/cgi-bin/appmsg', 'https://mp.weixin.qq.com')
+    draftUrl.search = new URLSearchParams({
+      t: 'media/appmsg_edit',
+      action: 'edit',
+      type: '77',
+      appmsgid: appMsgId,
+      token: this.weixinMeta.token,
+      lang: 'zh_CN',
+    }).toString()
+
+    try {
+      context?.signal?.throwIfAborted()
+      const createdTab = await this.runtime.tabs.create(draftUrl.href, true)
+      if (context?.signal?.aborted) {
+        try {
+          await this.runtime.tabs.remove?.(createdTab.id)
+        } catch {
+          // The operation was already cancelled. Do not expose a Chrome
+          // exception that may contain the token-bearing target URL.
+        }
+      }
+      context?.signal?.throwIfAborted()
+    } catch {
+      context?.signal?.throwIfAborted()
+      // A Chrome error may embed the target URL. Never let it cross the bridge.
+      throw new Error('PUBLICATION_DRAFT_OPEN_FAILED')
+    }
+
+    return { opened: true }
   }
 
   protected async uploadImageByUrl(src: string): Promise<ImageUploadResult> {
@@ -299,10 +907,10 @@ export class WeixinAdapter extends CodeAdapter {
         method: 'POST',
         credentials: 'include',
         body: formData,
-      }
+      },
     )
 
-    const res = await response.json() as {
+    const res = (await response.json()) as {
       cdn_url?: string
       content?: string
       base_resp?: { err_msg: string; ret: number }
@@ -359,21 +967,25 @@ export class WeixinAdapter extends CodeAdapter {
       /<a\s+[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi,
       (match, href, text) => {
         // 保留微信域名的链接
-        if (href && (
-          href.includes('mp.weixin.qq.com') ||
-          href.includes('weixin.qq.com') ||
-          href.startsWith('#') ||  // 锚点链接
-          href.startsWith('javascript:')  // JS 链接
-        )) {
+        if (
+          href &&
+          (href.includes('mp.weixin.qq.com') ||
+            href.includes('weixin.qq.com') ||
+            href.startsWith('#') || // 锚点链接
+            href.startsWith('javascript:')) // JS 链接
+        ) {
           return match
         }
         // 外部链接只保留文字
         return text
-      }
+      },
     )
   }
 
-  private formatError(res: { ret?: number; base_resp?: { ret: number } }): string {
+  private formatError(res: {
+    ret?: number
+    base_resp?: { ret: number }
+  }): string {
     const ret = res.ret ?? res.base_resp?.ret
 
     const errorMap: Record<number, string> = {

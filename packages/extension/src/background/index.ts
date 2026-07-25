@@ -30,10 +30,12 @@ import { checkForUpdates, isUpdateDismissed } from '../lib/version-check'
 import { fetchRemoteConfig, fetchConfigIfNeeded } from '../lib/remote-config'
 import {
   buildSyncerAccountsV2,
+  runOpenPublicationDraft,
   runPublicationInspection,
   validateBridgeMessageSender,
   validateGetAccountsV2Payload,
   validateInspectPublicationPayload,
+  validateOpenPublicationDraftPayload,
   validateLegacyMutationMessageSender,
 } from './bridge-v2'
 import { dispatchLegacyMagicCall } from '../bridge/legacy-magic-call'
@@ -136,6 +138,11 @@ type MessageAction =
   | { type: 'CHECK_ALL_AUTH'; payload?: { forceRefresh?: boolean } }
   | { type: 'BRIDGE_GET_ACCOUNTS_V2'; requestId: string; payload: unknown }
   | { type: 'BRIDGE_INSPECT_PUBLICATION'; requestId: string; payload: unknown }
+  | {
+      type: 'BRIDGE_OPEN_PUBLICATION_DRAFT'
+      requestId: string
+      payload: unknown
+    }
   | { type: 'CHECK_AUTH'; payload: { platformId: string } }
   | { type: 'SYNC_ARTICLE'; payload: { article: any; platforms: string[]; allSelectedPlatforms?: string[]; skipHistory?: boolean; source?: string; syncId?: string } }
   | { type: 'OPEN_SYNC_PAGE'; path?: string }
@@ -263,6 +270,26 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
           validatedPayload.data,
           adapter,
         ),
+      }
+    }
+
+    case 'BRIDGE_OPEN_PUBLICATION_DRAFT': {
+      const verifiedSender = validateBridgeMessageSender(sender || {})
+      if (!verifiedSender.success) {
+        return { error: verifiedSender.code }
+      }
+
+      const validatedPayload = validateOpenPublicationDraftPayload(
+        message.payload,
+        message.requestId
+      )
+      if (!validatedPayload.success) {
+        return { error: validatedPayload.code }
+      }
+
+      const adapter = await getAdapter(validatedPayload.data.platform)
+      return {
+        draftOpenResult: await runOpenPublicationDraft(validatedPayload.data, adapter),
       }
     }
 

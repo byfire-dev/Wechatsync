@@ -38,5 +38,34 @@
       "accountId": "120219780",
       "canonicalUrl": "https://www.sohu.com/a/1054312481_120219780"
     }
+  },
+  {
+    "name": "weixin article draft",
+    "platform": "weixin",
+    "href": "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media%2Fappmsg_edit&action=edit&type=77&appmsgid=900000001&token=REDACTED&lang=zh_CN",
+    "expected": {
+      "surface": "DRAFT",
+      "postId": "900000001"
+    }
+  },
+  {
+    "name": "weixin published article",
+    "platform": "weixin",
+    "href": "https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=900000001&idx=1&sn=0123456789abcdef0123456789abcdef&utm_source=test",
+    "expected": {
+      "surface": "PUBLISHED",
+      "postId": "900000001",
+      "accountId": "MzA0000000000==",
+      "canonicalUrl": "https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=900000001&idx=1&sn=0123456789abcdef0123456789abcdef"
+    }
+  },
+  {
+    "name": "weixin short public link",
+    "platform": "weixin",
+    "href": "https://mp.weixin.qq.com/s/AbCdEf_123-xyz?scene=1",
+    "expected": {
+      "surface": "PUBLISHED",
+      "canonicalUrl": "https://mp.weixin.qq.com/s/AbCdEf_123-xyz"
+    }
   }
 ]

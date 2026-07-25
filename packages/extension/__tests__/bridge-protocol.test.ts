@@ -46,6 +46,12 @@ const inspectPayload = {
   },
   limit: 20,
 }
+const openDraftPayload = {
+  requestId: 'open-weixin-001',
+  platform: 'weixin',
+  externalAccountId: 'gh_account',
+  platformPostId: '9001',
+}
 
 describe('Bridge v2 origin policy', () => {
   it('only allows exact http://localhost by default', () => {
@@ -80,7 +86,7 @@ describe('Bridge v2 origin policy', () => {
 })
 
 describe('Bridge v2 request parsing', () => {
-  it('accepts the three allowlisted methods with validated payloads', () => {
+  it('accepts the four allowlisted methods with validated payloads', () => {
     const bridgeInfo = parseBridgeRequestEvent(requestEvent(), topWindow)
     expect(bridgeInfo.success).toBe(true)
 
@@ -121,6 +127,27 @@ describe('Bridge v2 request parsing', () => {
     expect(inspect).toMatchObject({
       success: true,
       data: { method: 'inspectPublication', payload: inspectPayload },
+    })
+
+    const openDraft = parseBridgeRequestEvent(
+      requestEvent({
+        data: {
+          namespace: BRIDGE_NAMESPACE,
+          apiVersion: BRIDGE_API_VERSION,
+          direction: BRIDGE_DIRECTIONS.request,
+          requestId: openDraftPayload.requestId,
+          method: 'openPublicationDraft',
+          payload: openDraftPayload,
+        },
+      }),
+      topWindow
+    )
+    expect(openDraft).toMatchObject({
+      success: true,
+      data: {
+        method: 'openPublicationDraft',
+        payload: openDraftPayload,
+      },
     })
   })
 
@@ -278,6 +305,29 @@ describe('Bridge v2 request parsing', () => {
       code: 'INVALID_PAYLOAD',
     })
   })
+
+  it.each([
+    ['zero appMsgId', { ...openDraftPayload, platformPostId: '0' }],
+    ['non-canonical appMsgId', { ...openDraftPayload, platformPostId: '09001' }],
+    ['mismatched request ID', { ...openDraftPayload, requestId: 'another-id' }],
+    ['unknown field', { ...openDraftPayload, token: 'secret' }],
+  ])('rejects openPublicationDraft with %s', (_label, payload) => {
+    const event = requestEvent({
+      data: {
+        namespace: BRIDGE_NAMESPACE,
+        apiVersion: BRIDGE_API_VERSION,
+        direction: BRIDGE_DIRECTIONS.request,
+        requestId: openDraftPayload.requestId,
+        method: 'openPublicationDraft',
+        payload,
+      },
+    })
+
+    expect(parseBridgeRequestEvent(event, topWindow)).toEqual({
+      success: false,
+      code: 'INVALID_PAYLOAD',
+    })
+  })
 })
 
 describe('Bridge v2 responses', () => {
@@ -324,6 +374,42 @@ describe('Bridge v2 responses', () => {
         topWindow,
       ),
     ).toEqual({ success: true, data: response })
+  })
+
+  it('accepts only the URL-free draft-open success result', () => {
+    const parsedRequest = parseBridgeRequestEvent(
+      requestEvent({
+        data: {
+          namespace: BRIDGE_NAMESPACE,
+          apiVersion: BRIDGE_API_VERSION,
+          direction: BRIDGE_DIRECTIONS.request,
+          requestId: openDraftPayload.requestId,
+          method: 'openPublicationDraft',
+          payload: openDraftPayload,
+        },
+      }),
+      topWindow
+    )
+    if (!parsedRequest.success || parsedRequest.data.method !== 'openPublicationDraft') {
+      throw new Error('expected an openPublicationDraft request')
+    }
+
+    const response = createBridgeSuccessResponse(parsedRequest.data, {
+      opened: true,
+    })
+    expect(
+      parseBridgeResponseEvent(
+        { origin: 'http://localhost', source: topWindow, data: response },
+        topWindow
+      )
+    ).toEqual({ success: true, data: response })
+
+    expect(() =>
+      createBridgeSuccessResponse(parsedRequest.data, {
+        opened: true,
+        url: 'https://mp.weixin.qq.com/cgi-bin/appmsg?token=secret',
+      } as never)
+    ).toThrow('Invalid result for bridge method openPublicationDraft')
   })
 
   it('rejects malformed response results', () => {
