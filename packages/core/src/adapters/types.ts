@@ -1,6 +1,8 @@
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../types'
 import type { RuntimeInterface } from '../runtime/interface'
 import type {
+  OpenPublicationDraftRequest,
+  OpenPublicationDraftResult,
   PublicationInspectRequest,
   PublicationObservation,
 } from '../publication-inspection/types'
@@ -134,6 +136,17 @@ export interface PublishOptions {
 }
 
 /**
+ * Context shared by one adapter operation.
+ *
+ * Callers use the signal to cancel every nested request when an operation
+ * reaches its deadline. Adapters that do not perform cancellable work may
+ * ignore it.
+ */
+export interface AdapterOperationContext {
+  signal?: AbortSignal
+}
+
+/**
  * 平台适配器接口
  */
 export interface PlatformAdapter {
@@ -147,7 +160,7 @@ export interface PlatformAdapter {
   init(runtime: RuntimeInterface): Promise<void>
 
   /** 检查认证状态 */
-  checkAuth(): Promise<AuthResult>
+  checkAuth(context?: AdapterOperationContext): Promise<AuthResult>
 
   /** 发布文章 */
   publish(article: Article, options?: PublishOptions): Promise<SyncResult>
@@ -158,8 +171,18 @@ export interface PlatformAdapter {
    * request or an unverified response shape.
    */
   inspectPublication?(
-    request: PublicationInspectRequest
+    request: PublicationInspectRequest,
+    context?: AdapterOperationContext,
   ): Promise<PublicationObservation[]>
+
+  /**
+   * Open an authenticated draft without exposing token-bearing editor URLs
+   * outside the adapter/runtime boundary.
+   */
+  openPublicationDraft?(
+    request: OpenPublicationDraftRequest,
+    context?: AdapterOperationContext,
+  ): Promise<OpenPublicationDraftResult>
 
   /** 上传图片 (如果支持) */
   uploadImage?(file: Blob, filename?: string): Promise<string>

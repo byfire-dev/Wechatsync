@@ -52,4 +52,70 @@ describe('ExtensionRuntime.fetch credentials', () => {
       expect.objectContaining({ credentials: 'include' }),
     )
   })
+
+  it('forwards an external abort without misclassifying it as a timeout', async () => {
+    let runtimeSignal: AbortSignal | undefined
+    const fetchMock = vi.fn(
+      async (_url: string, options?: RequestInit): Promise<Response> => {
+        runtimeSignal = options?.signal ?? undefined
+        return new Promise((_resolve, reject) => {
+          runtimeSignal?.addEventListener(
+            'abort',
+            () => reject(runtimeSignal?.reason),
+            { once: true },
+          )
+        })
+      },
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const callerController = new AbortController()
+    const request = new ExtensionRuntime({ timeout: 10_000 }).fetch(
+      'https://example.com/cancellable',
+      { signal: callerController.signal },
+    )
+
+    callerController.abort()
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' })
+    expect(runtimeSignal).not.toBe(callerController.signal)
+    expect(runtimeSignal?.aborted).toBe(true)
+  })
+
+  it('keeps the external deadline active while the response body is pending', async () => {
+    let runtimeSignal: AbortSignal | undefined
+    let rejectBody!: (reason?: unknown) => void
+    const response = {
+      body: {},
+      text: vi.fn(
+        () =>
+          new Promise<string>((_resolve, reject) => {
+            rejectBody = reject
+          }),
+      ),
+    } as unknown as Response
+    const fetchMock = vi.fn(
+      async (_url: string, options?: RequestInit): Promise<Response> => {
+        runtimeSignal = options?.signal ?? undefined
+        runtimeSignal?.addEventListener(
+          'abort',
+          () => rejectBody(runtimeSignal?.reason),
+          { once: true },
+        )
+        return response
+      },
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const callerController = new AbortController()
+    const receivedResponse = await new ExtensionRuntime({
+      timeout: 10_000,
+    }).fetch('https://example.com/slow-body', {
+      signal: callerController.signal,
+    })
+    const bodyRead = receivedResponse.text()
+
+    callerController.abort()
+
+    await expect(bodyRead).rejects.toMatchObject({ name: 'AbortError' })
+    expect(runtimeSignal?.aborted).toBe(true)
+  })
 })

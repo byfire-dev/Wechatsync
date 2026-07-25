@@ -78,6 +78,15 @@
     );
   };
 
+  poster.openPublicationDraft = function(request, cb) {
+    callBridge(
+      'openPublicationDraft',
+      request,
+      cb,
+      request && request.requestId
+    );
+  };
+
   poster.addTask = function(task, statueandler, cb) {
     _statueandler = statueandler;
     callFunc(

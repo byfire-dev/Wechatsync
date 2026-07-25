@@ -1,0 +1,65 @@
+{
+  "base_resp": {
+    "err_msg": "ok",
+    "ret": 0
+  },
+  "publish_page": {
+    "total_count": 1,
+    "publish_count": 0,
+    "masssend_count": 1,
+    "publish_list": [
+      {
+        "publish_type": 101,
+        "publish_info": {
+          "type": 9,
+          "msgid": 1000000463,
+          "sent_info": {
+            "time": 1720000000,
+            "func_flag": 268468226,
+            "is_send_all": true,
+            "is_published": 0
+          },
+          "sent_status": {
+            "total": 100,
+            "succ": 100,
+            "fail": 0,
+            "progress": 100,
+            "userprotect": 0
+          },
+          "sent_result": {
+            "msg_status": 2,
+            "refuse_reason": "",
+            "reject_index_list": [],
+            "update_time": 1720000100
+          },
+          "appmsg_info": [
+            {
+              "share_type": 8,
+              "appmsgid": 777,
+              "itemidx": 1,
+              "is_pay_subscribe": 0,
+              "is_from_transfer": 0,
+              "open_fansmsg": 0
+            }
+          ],
+          "appmsgex": [
+            {
+              "aid": "777_1",
+              "title": "Sanitized mass-send article",
+              "link": "https://mp.weixin.qq.com/s/AbCdEfGh1234",
+              "appmsgid": 777,
+              "itemidx": 1,
+              "create_time": 1719999900,
+              "update_time": 1720000000
+            }
+          ],
+          "copy_type": 80,
+          "copy_appmsg_id": 900000001,
+          "new_publish": 0,
+          "publish_type": 101
+        }
+      }
+    ],
+    "featured_count": 0
+  }
+}

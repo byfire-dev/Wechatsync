@@ -20,9 +20,19 @@
  * 2. 处理图片上传 (如果平台需要)
  * 3. 调用平台 API
  */
-import type { Article, AuthResult, SyncResult, PlatformMeta, HeaderRule } from '../types'
+import type {
+  Article,
+  AuthResult,
+  SyncResult,
+  PlatformMeta,
+  HeaderRule,
+} from '../types'
 import type { RuntimeInterface } from '../runtime/interface'
-import type { PlatformAdapter, PublishOptions } from './types'
+import type {
+  AdapterOperationContext,
+  PlatformAdapter,
+  PublishOptions,
+} from './types'
 import { createLogger } from '../lib/logger'
 import { parseMarkdownImages } from '../lib/markdown-images'
 
@@ -57,17 +67,17 @@ export abstract class CodeAdapter implements PlatformAdapter {
   abstract readonly meta: PlatformMeta
   protected runtime!: RuntimeInterface
 
-  /** Header 规则 ID 列表（用于请求拦截） */
-  protected headerRuleIds: string[] = []
-
   async init(runtime: RuntimeInterface): Promise<void> {
     this.runtime = runtime
   }
 
   // ============ 抽象方法，子类必须实现 ============
 
-  abstract checkAuth(): Promise<AuthResult>
-  abstract publish(article: Article, options?: PublishOptions): Promise<SyncResult>
+  abstract checkAuth(context?: AdapterOperationContext): Promise<AuthResult>
+  abstract publish(
+    article: Article,
+    options?: PublishOptions,
+  ): Promise<SyncResult>
 
   // ============ Header 规则管理 ============
 
@@ -76,38 +86,47 @@ export abstract class CodeAdapter implements PlatformAdapter {
    * @param rule 规则配置
    * @returns 规则 ID
    */
-  protected async addHeaderRule(rule: Omit<HeaderRule, 'id'>): Promise<string | null> {
+  protected async addHeaderRule(
+    rule: Omit<HeaderRule, 'id'>,
+  ): Promise<string | null> {
     if (!this.runtime.headerRules) return null
 
-    const ruleId = await this.runtime.headerRules.add(rule)
-    this.headerRuleIds.push(ruleId)
-    return ruleId
+    return this.runtime.headerRules.add(rule)
   }
 
   /**
    * 批量添加 Header 规则
    * @param rules 规则配置列表
    */
-  protected async addHeaderRules(rules: Array<Omit<HeaderRule, 'id'>>): Promise<void> {
-    for (const rule of rules) {
-      await this.addHeaderRule(rule)
+  protected async addHeaderRules(
+    rules: Array<Omit<HeaderRule, 'id'>>,
+  ): Promise<string[]> {
+    const ruleIds: string[] = []
+    try {
+      for (const rule of rules) {
+        const ruleId = await this.addHeaderRule(rule)
+        if (ruleId) ruleIds.push(ruleId)
+      }
+    } catch (error) {
+      await this.clearHeaderRules(ruleIds)
+      throw error
     }
-    if (this.headerRuleIds.length > 0) {
-      logger.debug(`[${this.meta.id}] Header rules added:`, this.headerRuleIds)
+    if (ruleIds.length > 0) {
+      logger.debug(`[${this.meta.id}] Header rules added:`, ruleIds)
     }
+    return ruleIds
   }
 
   /**
    * 清除所有已添加的 Header 规则
    */
-  protected async clearHeaderRules(): Promise<void> {
-    if (!this.runtime.headerRules || this.headerRuleIds.length === 0) return
+  protected async clearHeaderRules(ruleIds: readonly string[]): Promise<void> {
+    if (!this.runtime.headerRules || ruleIds.length === 0) return
 
-    for (const ruleId of this.headerRuleIds) {
+    for (const ruleId of ruleIds) {
       await this.runtime.headerRules.remove(ruleId)
     }
-    logger.debug(`[${this.meta.id}] Header rules cleared:`, this.headerRuleIds)
-    this.headerRuleIds = []
+    logger.debug(`[${this.meta.id}] Header rules cleared:`, ruleIds)
   }
 
   /**
@@ -118,13 +137,15 @@ export abstract class CodeAdapter implements PlatformAdapter {
    */
   protected async withHeaderRules<T>(
     rules: Array<Omit<HeaderRule, 'id'>>,
-    fn: () => Promise<T>
+    fn: () => Promise<T>,
   ): Promise<T> {
-    await this.addHeaderRules(rules)
+    const ruleIds = await this.addHeaderRules(rules)
     try {
       return await fn()
     } finally {
-      await this.clearHeaderRules()
+      // Keep rule ownership local to this invocation. Concurrent operations
+      // must never remove one another's dynamic header rules.
+      await this.clearHeaderRules(ruleIds)
     }
   }
 
@@ -133,7 +154,10 @@ export abstract class CodeAdapter implements PlatformAdapter {
   /**
    * GET 请求
    */
-  protected async get<T = unknown>(url: string, headers?: Record<string, string>): Promise<T> {
+  protected async get<T = unknown>(
+    url: string,
+    headers?: Record<string, string>,
+  ): Promise<T> {
     const response = await this.runtime.fetch(url, {
       method: 'GET',
       credentials: 'include',
@@ -148,7 +172,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
   protected async postJson<T = unknown>(
     url: string,
     data: Record<string, unknown>,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
   ): Promise<T> {
     const response = await this.runtime.fetch(url, {
       method: 'POST',
@@ -168,7 +192,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
   protected async postForm<T = unknown>(
     url: string,
     data: Record<string, string>,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
   ): Promise<T> {
     const response = await this.runtime.fetch(url, {
       method: 'POST',
@@ -188,7 +212,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
   protected async postMultipart<T = unknown>(
     url: string,
     formData: FormData,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
   ): Promise<T> {
     const response = await this.runtime.fetch(url, {
       method: 'POST',
@@ -230,12 +254,17 @@ export abstract class CodeAdapter implements PlatformAdapter {
   protected async processImages(
     content: string,
     uploadFn: (src: string) => Promise<ImageUploadResult>,
-    options?: ImageProcessOptions
+    options?: ImageProcessOptions,
   ): Promise<string> {
     const { skipPatterns = [], onProgress, failOnError = false } = options || {}
 
     // 提取所有图片（HTML + Markdown）
-    const matches: { full: string; src: string; alt?: string; type: 'html' | 'markdown' }[] = []
+    const matches: {
+      full: string
+      src: string
+      alt?: string
+      type: 'html' | 'markdown'
+    }[] = []
 
     // 1. HTML 格式: <img ... src="url" ...>
     const htmlImgRegex = /<img[^>]+src="([^"]+)"[^>]*>/gi
@@ -246,7 +275,12 @@ export abstract class CodeAdapter implements PlatformAdapter {
 
     // 2. Markdown 格式: ![alt](url)
     for (const mdMatch of parseMarkdownImages(content)) {
-      matches.push({ full: mdMatch.full, src: mdMatch.src, alt: mdMatch.alt, type: 'markdown' })
+      matches.push({
+        full: mdMatch.full,
+        src: mdMatch.src,
+        alt: mdMatch.alt,
+        type: 'markdown',
+      })
     }
 
     if (matches.length === 0) {
@@ -265,7 +299,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
 
       // 跳过匹配的模式（但不跳过 data URI）
       if (!src.startsWith('data:')) {
-        const shouldSkip = skipPatterns.some(pattern => src.includes(pattern))
+        const shouldSkip = skipPatterns.some((pattern) => src.includes(pattern))
         if (shouldSkip) {
           logger.debug('Skipping image matched by configured pattern')
           continue
@@ -281,7 +315,7 @@ export abstract class CodeAdapter implements PlatformAdapter {
 
         if (!uploadResult) {
           logger.debug(
-            `Uploading image ${processed}/${matches.length}: ${src.startsWith('data:') ? 'data URI' : 'remote URL'}`
+            `Uploading image ${processed}/${matches.length}: ${src.startsWith('data:') ? 'data URI' : 'remote URL'}`,
           )
           // uploadFn 应该能处理 URL 和 data URI（通过 fetch）
           uploadResult = await uploadFn(src)
@@ -377,13 +411,16 @@ export abstract class CodeAdapter implements PlatformAdapter {
    * 延迟
    */
   protected delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
   /**
    * 创建同步结果
    */
-  protected createResult(success: boolean, data?: Partial<SyncResult>): SyncResult {
+  protected createResult(
+    success: boolean,
+    data?: Partial<SyncResult>,
+  ): SyncResult {
     return {
       platform: this.meta.id,
       success,

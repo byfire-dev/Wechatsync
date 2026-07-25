@@ -14,6 +14,7 @@
 
 import { htmlToMarkdownNative } from '@wechatsync/core'
 import type {
+  OpenPublicationDraftResult,
   PublicationObservation,
   SyncerAccountV2,
 } from '@wechatsync/core/publication-inspection'
@@ -40,12 +41,14 @@ const logger = createLogger('Wechatsync')
 
 const BRIDGE_CAPABILITIES = [
   'account_identity',
+  'draft_open',
   'publication_inspect',
   'public_url',
 ] as const
 
 interface BridgeRuntimeResponse {
   accounts?: SyncerAccountV2[]
+  draftOpenResult?: OpenPublicationDraftResult
   observations?: PublicationObservation[]
   error?: string
 }
@@ -116,6 +119,8 @@ function createBridgeFailure(
     case 'getAccountsV2':
       return createBridgeErrorResponse(request, { code, message })
     case 'inspectPublication':
+      return createBridgeErrorResponse(request, { code, message })
+    case 'openPublicationDraft':
       return createBridgeErrorResponse(request, { code, message })
   }
 }
@@ -198,6 +203,22 @@ async function handleBridgeRequest(evt: MessageEvent): Promise<void> {
         }
         postBridgeResponse(
           createBridgeSuccessResponse(request, response.observations),
+          evt.origin
+        )
+        return
+      }
+
+      case 'openPublicationDraft': {
+        const response = await sendBridgeRuntimeMessage({
+          type: 'BRIDGE_OPEN_PUBLICATION_DRAFT',
+          requestId: request.requestId,
+          payload: request.payload,
+        })
+        if (!response.draftOpenResult) {
+          throw new Error('Bridge draft-open response is missing')
+        }
+        postBridgeResponse(
+          createBridgeSuccessResponse(request, response.draftOpenResult),
           evt.origin
         )
         return

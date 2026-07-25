@@ -58,9 +58,63 @@ describe('parsePublicationUrl', () => {
     ).toEqual({ platform: 'sohu', surface: 'UNKNOWN' })
   })
 
-  it('keeps paused platforms outside identity inference', () => {
+  it('rejects a valid-looking Weixin identity hosted on the wrong domain', () => {
     expect(
-      parsePublicationUrl('weixin', 'https://mp.weixin.qq.com/s/example'),
+      parsePublicationUrl(
+        'weixin',
+        'https://attacker.example/cgi-bin/appmsg?action=edit&appmsgid=900000001',
+      ),
+    ).toBeNull()
+  })
+
+  it('does not infer Weixin identities from ambiguous or malformed locators', () => {
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=1&appmsgid=2',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&action=view&appmsgid=1',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&t=not-an-editor&appmsgid=1',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'https://mp.weixin.qq.com/cgi-bin/appmsg?action=view&t=media%2Fappmsg_edit&appmsgid=1',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'http://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=1',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1&idx=2',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'weixin',
+        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1&sn=not-a-signature',
+      ),
+    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+  })
+
+  it('keeps unimplemented platforms outside identity inference', () => {
+    expect(
+      parsePublicationUrl('toutiao', 'https://www.toutiao.com/item/1'),
     ).toBeNull()
   })
 

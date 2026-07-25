@@ -1,10 +1,14 @@
 import {
+  OpenPublicationDraftRequestSchema,
+  OpenPublicationDraftResultSchema,
   PublicationInspectRequestSchema,
   PublicationObservationSchema,
   PublicationPlatformSchema,
   SYNCER_BRIDGE_REQUEST_ID_MAX_LENGTH,
   SyncerAccountV2Schema,
   SyncerBridgeInfoSchema,
+  type OpenPublicationDraftRequest,
+  type OpenPublicationDraftResult,
   type PublicationInspectRequest,
   type PublicationObservation,
   type PublicationPlatform,
@@ -24,6 +28,7 @@ export const BRIDGE_METHODS = [
   'getBridgeInfo',
   'getAccountsV2',
   'inspectPublication',
+  'openPublicationDraft',
 ] as const
 
 export type BridgeMethod = (typeof BRIDGE_METHODS)[number]
@@ -43,12 +48,14 @@ export interface BridgeRequestPayloadMap {
   getBridgeInfo: Record<string, never>
   getAccountsV2: GetAccountsV2Payload
   inspectPublication: PublicationInspectRequest
+  openPublicationDraft: OpenPublicationDraftRequest
 }
 
 export interface BridgeResponseResultMap {
   getBridgeInfo: SyncerBridgeInfo
   getAccountsV2: SyncerAccountV2[]
   inspectPublication: PublicationObservation[]
+  openPublicationDraft: OpenPublicationDraftResult
 }
 
 export type BridgeRequestFor<M extends BridgeMethod> = {
@@ -163,6 +170,12 @@ const INSPECT_ARTICLE_HINT_KEYS = new Set([
 ])
 
 const GET_ACCOUNTS_KEYS = new Set(['platforms', 'forceRefresh'])
+const OPEN_PUBLICATION_DRAFT_KEYS = new Set([
+  'requestId',
+  'platform',
+  'externalAccountId',
+  'platformPostId',
+])
 const ERROR_KEYS = new Set(['code', 'message'])
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -304,6 +317,21 @@ function parseInspectPublicationPayload(
   return parsed.data
 }
 
+function parseOpenPublicationDraftPayload(
+  value: unknown,
+  envelopeRequestId: string
+): OpenPublicationDraftRequest | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, OPEN_PUBLICATION_DRAFT_KEYS)) {
+    return null
+  }
+
+  const parsed = OpenPublicationDraftRequestSchema.safeParse(value)
+  if (!parsed.success || parsed.data.requestId !== envelopeRequestId) {
+    return null
+  }
+  return parsed.data
+}
+
 function parseRequestPayload<M extends BridgeMethod>(
   method: M,
   value: unknown,
@@ -320,6 +348,10 @@ function parseRequestPayload<M extends BridgeMethod>(
         | null
     case 'inspectPublication':
       return parseInspectPublicationPayload(value, requestId) as
+        | BridgeRequestPayloadMap[M]
+        | null
+    case 'openPublicationDraft':
+      return parseOpenPublicationDraftPayload(value, requestId) as
         | BridgeRequestPayloadMap[M]
         | null
   }
@@ -399,6 +431,11 @@ function parseResponseResult<M extends BridgeMethod>(
 ): BridgeResponseResultMap[M] | null {
   if (method === 'getBridgeInfo') {
     const parsed = SyncerBridgeInfoSchema.safeParse(value)
+    return parsed.success ? (parsed.data as BridgeResponseResultMap[M]) : null
+  }
+
+  if (method === 'openPublicationDraft') {
+    const parsed = OpenPublicationDraftResultSchema.safeParse(value)
     return parsed.success ? (parsed.data as BridgeResponseResultMap[M]) : null
   }
 

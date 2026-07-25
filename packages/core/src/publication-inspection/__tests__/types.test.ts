@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  OpenPublicationDraftRequestSchema,
+  OpenPublicationDraftResultSchema,
   PublicationInspectRequestSchema,
   PublicationObservationSchema,
   SYNCER_BRIDGE_REQUEST_ID_MAX_LENGTH,
@@ -7,6 +9,38 @@ import {
 } from '../types'
 
 describe('publication inspection contracts', () => {
+  it('strictly validates a canonical WeChat draft-open contract', () => {
+    const request = {
+      requestId: 'open-weixin-1',
+      platform: 'weixin',
+      externalAccountId: 'gh_account',
+      platformPostId: '9001',
+    }
+
+    expect(OpenPublicationDraftRequestSchema.parse(request)).toEqual(request)
+    expect(
+      OpenPublicationDraftRequestSchema.safeParse({
+        ...request,
+        platformPostId: '09001',
+      }).success,
+    ).toBe(false)
+    expect(
+      OpenPublicationDraftRequestSchema.safeParse({
+        ...request,
+        unexpected: true,
+      }).success,
+    ).toBe(false)
+    expect(OpenPublicationDraftResultSchema.parse({ opened: true })).toEqual({
+      opened: true,
+    })
+    expect(
+      OpenPublicationDraftResultSchema.safeParse({
+        opened: true,
+        url: 'https://mp.weixin.qq.com/cgi-bin/appmsg?token=secret',
+      }).success,
+    ).toBe(false)
+  })
+
   it('accepts one stable account identity for a supported platform', () => {
     expect(
       SyncerAccountV2Schema.parse({
@@ -199,5 +233,129 @@ describe('publication inspection contracts', () => {
         publishedAt: '2026-07-24T16:40:14+08:00',
       }).success,
     ).toBe(true)
+  })
+
+  it('requires a post ID for successful WeChat lifecycle observations', () => {
+    const result = PublicationObservationSchema.safeParse({
+      observationKey: 'observation-weixin-draft',
+      platform: 'weixin',
+      externalAccountId: 'gh_account_001',
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      observedAt: '2026-07-24T19:10:00+08:00',
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  it('requires complete draft evidence for WeChat DRAFT_PRESENT observations', () => {
+    const base = {
+      observationKey: 'observation-weixin-draft',
+      platform: 'weixin' as const,
+      externalAccountId: 'gh_account_001',
+      outcome: 'DRAFT_PRESENT' as const,
+      source: 'DRAFT_DETAIL' as const,
+      platformPostId: '900000001',
+      observedAt: '2026-07-24T19:10:00+08:00',
+    }
+
+    expect(PublicationObservationSchema.safeParse(base).success).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        title: 'Verified draft',
+        bodyText: 'Verified draft body',
+        bodyTruncated: false,
+      }).success,
+    ).toBe(true)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        title: 'Verified draft',
+        bodyText: 'Verified draft body',
+        bodyTruncated: false,
+        canonicalUrl: 'https://mp.weixin.qq.com/s/AbCdEfGh1234',
+      }).success,
+    ).toBe(false)
+  })
+
+  it('requires exact identity and evidence-only facts for WeChat review results', () => {
+    const valid = {
+      observationKey: 'observation-weixin-review',
+      platform: 'weixin' as const,
+      externalAccountId: 'gh_account_001',
+      outcome: 'REVIEW_REQUIRED' as const,
+      source: 'PUBLISHED_LIST' as const,
+      platformPostId: '900000001',
+      observedAt: '2026-07-24T19:10:00+08:00',
+      errorCode: 'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+      errorMessage: 'The published-list scan was incomplete.',
+    }
+
+    expect(PublicationObservationSchema.safeParse(valid).success).toBe(true)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...valid,
+        platformPostId: undefined,
+      }).success,
+    ).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...valid,
+        canonicalUrl: 'https://mp.weixin.qq.com/s/AbCdEfGh1234',
+      }).success,
+    ).toBe(false)
+  })
+
+  it('requires post ID, canonical URL, source, and publication time for published WeChat observations', () => {
+    const base = {
+      observationKey: 'observation-weixin-published',
+      platform: 'weixin' as const,
+      externalAccountId: 'gh_account_001',
+      outcome: 'PUBLISHED' as const,
+      source: 'PUBLIC_PAGE' as const,
+      platformPostId: '900000001',
+      observedAt: '2026-07-24T19:10:00+08:00',
+    }
+
+    expect(PublicationObservationSchema.safeParse(base).success).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        canonicalUrl:
+          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+      }).success,
+    ).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        canonicalUrl:
+          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        publishedAt: '2026-07-24T19:00:00+08:00',
+      }).success,
+    ).toBe(false)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        canonicalUrl:
+          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        publishedAt: '2026-07-24T19:00:00+08:00',
+        title: 'Verified public article',
+        bodyText: 'Verified public body',
+        bodyTruncated: false,
+      }).success,
+    ).toBe(true)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...base,
+        source: 'PUBLISHED_LIST',
+        canonicalUrl:
+          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        publishedAt: '2026-07-24T19:00:00+08:00',
+        title: 'Unverified list title',
+        bodyText: 'Unverified list body',
+        bodyTruncated: false,
+      }).success,
+    ).toBe(false)
   })
 })

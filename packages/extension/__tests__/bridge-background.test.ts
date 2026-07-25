@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest'
 import {
   buildSyncerAccountsV2,
   createUnsupportedPublicationObservation,
+  runOpenPublicationDraft,
   runPublicationInspection,
   validateBridgeMessageSender,
   validateGetAccountsV2Payload,
   validateInspectPublicationPayload,
+  validateOpenPublicationDraftPayload,
   validateLegacyMutationMessageSender,
 } from '../src/background/bridge-v2'
 
@@ -40,6 +42,12 @@ const inspectPayload = {
     publishedAfter: '2026-07-21T10:00:00+08:00',
   },
   limit: 20,
+}
+const openDraftPayload = {
+  requestId: 'open-weixin-001',
+  platform: 'weixin',
+  externalAccountId: 'account-weixin',
+  platformPostId: '9001',
 }
 
 describe('Bridge v2 background sender boundary', () => {
@@ -207,6 +215,37 @@ describe('Bridge v2 background payload validation', () => {
       code: 'INVALID_PAYLOAD',
     })
   })
+
+  it('strictly validates and binds openPublicationDraft', () => {
+    expect(
+      validateOpenPublicationDraftPayload(
+        openDraftPayload,
+        openDraftPayload.requestId,
+      ),
+    ).toEqual({ success: true, data: openDraftPayload })
+
+    for (const payload of [
+      { ...openDraftPayload, platformPostId: '0' },
+      { ...openDraftPayload, platformPostId: '09001' },
+      { ...openDraftPayload, token: 'secret' },
+    ]) {
+      expect(
+        validateOpenPublicationDraftPayload(
+          payload,
+          openDraftPayload.requestId,
+        ),
+      ).toEqual({
+        success: false,
+        code: 'INVALID_PAYLOAD',
+      })
+    }
+    expect(
+      validateOpenPublicationDraftPayload(openDraftPayload, 'another-id'),
+    ).toEqual({
+      success: false,
+      code: 'INVALID_PAYLOAD',
+    })
+  })
 })
 
 describe('Bridge v2 account projection', () => {
@@ -282,7 +321,12 @@ describe('Bridge v2 account projection', () => {
         platform: 'weixin',
         externalAccountId: 'account-weixin',
         displayName: 'WeChat',
-        capabilities: ['account_identity'],
+        capabilities: [
+          'account_identity',
+          'draft_open',
+          'publication_inspect',
+          'public_url',
+        ],
       },
     ])
   })
@@ -321,6 +365,121 @@ describe('Bridge v2 account projection', () => {
   })
 })
 
+describe('Bridge v2 authenticated draft opening', () => {
+  it('re-authenticates, binds the account, and returns only opened=true', async () => {
+    const events: string[] = []
+    const checkAuth = vi.fn(async () => {
+      events.push('auth')
+      return {
+        isAuthenticated: true,
+        userId: openDraftPayload.externalAccountId,
+      }
+    })
+    const openPublicationDraft = vi.fn(async () => {
+      events.push('open')
+      return { opened: true as const }
+    })
+
+    await expect(
+      runOpenPublicationDraft(openDraftPayload, {
+        checkAuth,
+        openPublicationDraft,
+      }),
+    ).resolves.toEqual({ opened: true })
+    expect(events).toEqual(['auth', 'open'])
+    expect(openPublicationDraft).toHaveBeenCalledWith(
+      openDraftPayload,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('uses one end-to-end deadline for authentication and tab opening', async () => {
+    vi.useFakeTimers()
+    try {
+      let authSignal: AbortSignal | undefined
+      let openSignal: AbortSignal | undefined
+      const checkAuth = vi.fn(async (context) => {
+        authSignal = context?.signal
+        await new Promise((resolve) => setTimeout(resolve, 7))
+        return {
+          isAuthenticated: true,
+          userId: openDraftPayload.externalAccountId,
+        }
+      })
+      const openPublicationDraft = vi.fn((_request, context) => {
+        openSignal = context?.signal
+        return new Promise((_resolve, reject) => {
+          context?.signal?.addEventListener(
+            'abort',
+            () => reject(context.signal?.reason),
+            { once: true },
+          )
+        })
+      })
+      const result = runOpenPublicationDraft(
+        openDraftPayload,
+        { checkAuth, openPublicationDraft },
+        10,
+      )
+      const rejection = expect(result).rejects.toThrow(
+        'PUBLICATION_DRAFT_OPEN_FAILED',
+      )
+
+      await vi.advanceTimersByTimeAsync(7)
+      expect(openPublicationDraft).toHaveBeenCalledTimes(1)
+      expect(openSignal).toBe(authSignal)
+
+      await vi.advanceTimersByTimeAsync(3)
+      await rejection
+      expect(openSignal?.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not open a draft for another active account', async () => {
+    const openPublicationDraft = vi.fn()
+
+    await expect(
+      runOpenPublicationDraft(openDraftPayload, {
+        checkAuth: vi.fn().mockResolvedValue({
+          isAuthenticated: true,
+          userId: 'another-account',
+        }),
+        openPublicationDraft,
+      }),
+    ).rejects.toThrow('ACCOUNT_MISMATCH')
+    expect(openPublicationDraft).not.toHaveBeenCalled()
+  })
+
+  it('rejects over-broad results and redacts adapter exception details', async () => {
+    const adapter = {
+      checkAuth: vi.fn().mockResolvedValue({
+        isAuthenticated: true,
+        userId: openDraftPayload.externalAccountId,
+      }),
+      openPublicationDraft: vi.fn(),
+    }
+
+    adapter.openPublicationDraft.mockResolvedValueOnce({
+      opened: true,
+      url: 'https://mp.weixin.qq.com/cgi-bin/appmsg?token=secret',
+    })
+    await expect(
+      runOpenPublicationDraft(openDraftPayload, adapter),
+    ).rejects.toThrow('INVALID_DRAFT_OPEN_RESULT')
+
+    adapter.openPublicationDraft.mockRejectedValueOnce(
+      new Error(
+        'Cannot open https://mp.weixin.qq.com/cgi-bin/appmsg?token=secret',
+      ),
+    )
+    await expect(
+      runOpenPublicationDraft(openDraftPayload, adapter),
+    ).rejects.toThrow('PUBLICATION_DRAFT_OPEN_FAILED')
+  })
+})
+
 describe('Bridge v2 unsupported inspection prototype', () => {
   it('returns an explicit UNSUPPORTED observation instead of NOT_FOUND', () => {
     const request = validateInspectPublicationPayload(
@@ -350,11 +509,7 @@ describe('Bridge v2 unsupported inspection prototype', () => {
 
   it('does not execute an inspector for a paused platform', async () => {
     const request = validateInspectPublicationPayload(
-      {
-        ...inspectPayload,
-        platform: 'weixin',
-        externalAccountId: 'account-weixin',
-      },
+      inspectPayload,
       'inspect-001',
     )
     expect(request.success).toBe(true)
@@ -368,7 +523,7 @@ describe('Bridge v2 unsupported inspection prototype', () => {
     expect(inspectPublication).not.toHaveBeenCalled()
     expect(observations).toHaveLength(1)
     expect(observations[0]).toMatchObject({
-      platform: 'weixin',
+      platform: 'toutiao',
       outcome: 'UNSUPPORTED',
     })
   })
@@ -519,15 +674,28 @@ describe('Bridge v2 inspection execution boundary', () => {
     })
     expect(JSON.stringify(failed)).not.toContain('secret platform response')
 
+    let inspectionSignal: AbortSignal | undefined
     const timedOut = await runPublicationInspection(
       request,
-      { inspectPublication: () => new Promise(() => {}) },
+      {
+        inspectPublication: (_request, context) => {
+          inspectionSignal = context?.signal
+          return new Promise((_resolve, reject) => {
+            context?.signal?.addEventListener(
+              'abort',
+              () => reject(context.signal?.reason),
+              { once: true },
+            )
+          })
+        },
+      },
       1,
     )
     expect(timedOut[0]).toMatchObject({
       outcome: 'FETCH_ERROR',
       errorCode: 'PUBLICATION_INSPECTION_TIMEOUT',
     })
+    expect(inspectionSignal?.aborted).toBe(true)
   })
 })
 
@@ -562,7 +730,10 @@ describe('Bridge v2 Sohu inspection identity boundary', () => {
       inspectPublication,
     })
 
-    expect(inspectPublication).toHaveBeenCalledWith(request)
+    expect(inspectPublication).toHaveBeenCalledWith(
+      request,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
     expect(observations).toEqual([
       expect.objectContaining({
         outcome: 'PUBLISHED',
@@ -756,4 +927,233 @@ describe('Bridge v2 Sohu inspection identity boundary', () => {
       errorCode: 'INVALID_INSPECTION_RESULT',
     })
   })
+})
+
+describe('Bridge v2 WeChat inspection identity boundary', () => {
+  const request = {
+    ...inspectPayload,
+    platform: 'weixin' as const,
+    externalAccountId: 'account-weixin',
+    draft: {
+      platformPostId: '9001',
+      draftUrl:
+        'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9001&token=old-token',
+      draftedAt: inspectPayload.draft.draftedAt,
+    },
+  }
+
+  it('returns a schema-valid unsupported result bound to the requested appMsgId', async () => {
+    const observations = await runPublicationInspection(request, null)
+
+    expect(observations).toEqual([
+      expect.objectContaining({
+        platform: 'weixin',
+        outcome: 'UNSUPPORTED',
+        source: 'DRAFT_DETAIL',
+        platformPostId: '9001',
+        errorCode: 'PUBLICATION_INSPECTION_NOT_IMPLEMENTED',
+      }),
+    ])
+  })
+
+  it('accepts DRAFT_PRESENT for the exact requested appMsgId', async () => {
+    const inspectPublication = vi.fn().mockResolvedValue([
+      {
+        observationKey: 'weixin:9001:draft',
+        platform: 'weixin',
+        externalAccountId: 'account-weixin',
+        outcome: 'DRAFT_PRESENT',
+        source: 'DRAFT_DETAIL',
+        platformPostId: '9001',
+        title: 'Verified WeChat draft',
+        bodyText: 'Verified WeChat draft body',
+        bodyTruncated: false,
+        observedAt: '2026-07-24T12:00:00.000Z',
+      },
+    ])
+
+    const observations = await runPublicationInspection(request, {
+      inspectPublication,
+    })
+
+    expect(inspectPublication).toHaveBeenCalledWith(
+      request,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(observations).toEqual([
+      expect.objectContaining({
+        outcome: 'DRAFT_PRESENT',
+        platformPostId: '9001',
+      }),
+    ])
+  })
+
+  it('rejects a WeChat review result for a different appMsgId', async () => {
+    const observations = await runPublicationInspection(request, {
+      inspectPublication: async () => [
+        {
+          observationKey: 'weixin:9002:review',
+          platform: 'weixin',
+          externalAccountId: 'account-weixin',
+          outcome: 'REVIEW_REQUIRED',
+          source: 'DRAFT_DETAIL',
+          platformPostId: '9002',
+          observedAt: '2026-07-24T12:00:00.000Z',
+          errorCode: 'WEIXIN_DRAFT_STATE_REVIEW_REQUIRED',
+          errorMessage: 'Manual review is required.',
+        },
+      ],
+    })
+
+    expect(observations[0]).toMatchObject({
+      platform: 'weixin',
+      outcome: 'PARSE_ERROR',
+      source: 'DRAFT_DETAIL',
+      platformPostId: '9001',
+      errorCode: 'INVALID_INSPECTION_RESULT',
+    })
+  })
+
+  it.each([
+    [
+      'a different observed appMsgId',
+      request,
+      {
+        outcome: 'DRAFT_PRESENT',
+        source: 'DRAFT_DETAIL',
+        platformPostId: '9002',
+      },
+    ],
+    [
+      'a conflicting request locator',
+      {
+        ...request,
+        draft: {
+          ...request.draft,
+          draftUrl:
+            'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9002',
+        },
+      },
+      {
+        outcome: 'DRAFT_PRESENT',
+        source: 'DRAFT_DETAIL',
+        platformPostId: '9001',
+      },
+    ],
+    [
+      'an unverified NOT_FOUND lifecycle result',
+      request,
+      {
+        outcome: 'NOT_FOUND',
+        source: 'PLATFORM_DETAIL',
+        platformPostId: '9001',
+      },
+    ],
+  ] as const)(
+    'rejects %s',
+    async (_name, candidateRequest, observationOverrides) => {
+      const observations = await runPublicationInspection(candidateRequest, {
+        inspectPublication: async () =>
+          [
+            {
+              observationKey: 'weixin:9001:invalid',
+              platform: 'weixin',
+              externalAccountId: 'account-weixin',
+              observedAt: '2026-07-24T12:00:00.000Z',
+              ...observationOverrides,
+            },
+          ] as never,
+      })
+
+      expect(observations[0]).toMatchObject({
+        outcome: 'PARSE_ERROR',
+        errorCode: 'INVALID_INSPECTION_RESULT',
+      })
+    },
+  )
+
+  it('accepts a verified public URL while preserving the original appMsgId', async () => {
+    const observations = await runPublicationInspection(request, {
+      inspectPublication: async () => [
+        {
+          observationKey: 'weixin:9001:published',
+          platform: 'weixin',
+          externalAccountId: 'account-weixin',
+          outcome: 'PUBLISHED',
+          source: 'PUBLIC_PAGE',
+          platformPostId: '9001',
+          canonicalUrl:
+            'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+          publishedAt: '2026-07-24T11:55:00.000Z',
+          title: 'Verified public article',
+          bodyText: 'Verified public body',
+          bodyTruncated: false,
+          observedAt: '2026-07-24T12:00:00.000Z',
+        },
+      ],
+    })
+
+    expect(observations).toEqual([
+      expect.objectContaining({
+        outcome: 'PUBLISHED',
+        source: 'PUBLIC_PAGE',
+        platformPostId: '9001',
+        canonicalUrl:
+          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+      }),
+    ])
+  })
+
+  it.each([
+    {
+      source: 'PUBLISHED_LIST',
+      platformPostId: '9001',
+      canonicalUrl:
+        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+    },
+    {
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9002',
+      canonicalUrl:
+        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+    },
+    {
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9001',
+      canonicalUrl: 'https://attacker.example/s?mid=1&idx=1',
+    },
+    {
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9001',
+      canonicalUrl:
+        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+      bodyText: '',
+    },
+  ] as const)(
+    'rejects a PUBLISHED result without the exact bridge proof boundary',
+    async (overrides) => {
+      const observations = await runPublicationInspection(request, {
+        inspectPublication: async () =>
+          [
+            {
+              observationKey: 'weixin:9001:published-invalid',
+              platform: 'weixin',
+              externalAccountId: 'account-weixin',
+              outcome: 'PUBLISHED',
+              publishedAt: '2026-07-24T11:55:00.000Z',
+              title: 'Verified public article',
+              bodyText: 'Verified public body',
+              bodyTruncated: false,
+              observedAt: '2026-07-24T12:00:00.000Z',
+              ...overrides,
+            },
+          ] as never,
+      })
+
+      expect(observations[0]).toMatchObject({
+        outcome: 'PARSE_ERROR',
+        errorCode: 'INVALID_INSPECTION_RESULT',
+      })
+    },
+  )
 })

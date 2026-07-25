@@ -85,6 +85,11 @@ export interface RuntimeInterface {
      */
     create(url: string, active?: boolean): Promise<{ id: number }>
     /**
+     * Remove a tab created by an operation that was cancelled after Chrome
+     * accepted the create request.
+     */
+    remove?(tabId: number): Promise<void>
+    /**
      * 等待 tab 加载完成
      */
     waitForLoad(tabId: number, timeout?: number): Promise<void>
@@ -98,7 +103,7 @@ export interface RuntimeInterface {
     executeScript<T, A extends unknown[]>(
       tabId: number,
       func: (...args: A) => T | Promise<T>,
-      args: A
+      args: A,
     ): Promise<T>
   }
 
