@@ -9,10 +9,24 @@ import {
   isAllowedBridgeOrigin,
   parseBridgeRequestEvent,
   parseBridgeResponseEvent,
+  projectBridgeRuntimeError,
   type BridgeMessageEventLike,
 } from '../src/bridge'
 
 const topWindow = { kind: 'top-window' }
+
+it('projects runtime exceptions to a fixed non-sensitive bridge failure', () => {
+  const failure = projectBridgeRuntimeError(
+    new Error('token=secret&cookie=session'),
+  )
+
+  expect(failure).toEqual({
+    code: 'BRIDGE_RUNTIME_ERROR',
+    message: 'Bridge request failed',
+  })
+  expect(JSON.stringify(failure)).not.toContain('secret')
+  expect(JSON.stringify(failure)).not.toContain('session')
+})
 
 function requestEvent(
   overrides: Partial<BridgeMessageEventLike> = {},
@@ -86,7 +100,7 @@ describe('Bridge v2 origin policy', () => {
 })
 
 describe('Bridge v2 request parsing', () => {
-  it('accepts the four allowlisted methods with validated payloads', () => {
+  it('accepts the additive allowlisted methods with validated payloads', () => {
     const bridgeInfo = parseBridgeRequestEvent(requestEvent(), topWindow)
     expect(bridgeInfo.success).toBe(true)
 
@@ -109,6 +123,27 @@ describe('Bridge v2 request parsing', () => {
     expect(accounts).toMatchObject({
       success: true,
       data: { method: 'getAccountsV2' },
+    })
+
+    const detailedAccounts = parseBridgeRequestEvent(
+      requestEvent({
+        data: {
+          namespace: BRIDGE_NAMESPACE,
+          apiVersion: BRIDGE_API_VERSION,
+          direction: BRIDGE_DIRECTIONS.request,
+          requestId: 'accounts-detailed-001',
+          method: 'getAccountsV2Detailed',
+          payload: {
+            platforms: ['toutiao'],
+            forceRefresh: true,
+          },
+        },
+      }),
+      topWindow,
+    )
+    expect(detailedAccounts).toMatchObject({
+      success: true,
+      data: { method: 'getAccountsV2Detailed' },
     })
 
     const inspect = parseBridgeRequestEvent(
@@ -374,6 +409,62 @@ describe('Bridge v2 responses', () => {
         topWindow,
       ),
     ).toEqual({ success: true, data: response })
+  })
+
+  it('strictly parses a detailed account probe response', () => {
+    const parsedRequest = parseBridgeRequestEvent(
+      requestEvent({
+        data: {
+          namespace: BRIDGE_NAMESPACE,
+          apiVersion: BRIDGE_API_VERSION,
+          direction: BRIDGE_DIRECTIONS.request,
+          requestId: 'accounts-detailed-001',
+          method: 'getAccountsV2Detailed',
+          payload: { platforms: ['toutiao'], forceRefresh: true },
+        },
+      }),
+      topWindow,
+    )
+    if (
+      !parsedRequest.success ||
+      parsedRequest.data.method !== 'getAccountsV2Detailed'
+    ) {
+      throw new Error('expected a getAccountsV2Detailed request')
+    }
+
+    const response = createBridgeSuccessResponse(parsedRequest.data, {
+      accounts: [],
+      probes: [
+        {
+          platform: 'toutiao',
+          status: 'PROBE_FAILED',
+          source: 'MAIN_WORLD',
+          errorCode: 'PAGE_CONTEXT_UNAVAILABLE',
+          primaryErrorCode: 'NETWORK_ERROR',
+        },
+      ],
+    })
+    expect(
+      parseBridgeResponseEvent(
+        { origin: 'http://localhost', source: topWindow, data: response },
+        topWindow,
+      ),
+    ).toEqual({ success: true, data: response })
+
+    expect(() =>
+      createBridgeSuccessResponse(parsedRequest.data, {
+        accounts: [],
+        probes: [
+          {
+            platform: 'toutiao',
+            status: 'PROBE_FAILED',
+            source: 'EXTENSION',
+            errorCode: 'NETWORK_ERROR',
+            rawError: 'cookie=secret',
+          },
+        ],
+      } as never),
+    ).toThrow('Invalid result for bridge method getAccountsV2Detailed')
   })
 
   it('accepts only the URL-free draft-open success result', () => {

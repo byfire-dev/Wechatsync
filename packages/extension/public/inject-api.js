@@ -69,6 +69,14 @@
     callBridge('getAccountsV2', options || {}, cb);
   };
 
+  poster.getAccountsV2Detailed = function(options, cb) {
+    if (typeof options === 'function') {
+      cb = options;
+      options = {};
+    }
+    callBridge('getAccountsV2Detailed', options || {}, cb);
+  };
+
   poster.inspectPublication = function(request, cb) {
     callBridge(
       'inspectPublication',

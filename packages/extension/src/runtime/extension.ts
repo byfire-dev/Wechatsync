@@ -1,56 +1,56 @@
-import type { RuntimeInterface, RuntimeConfig } from '@wechatsync/core'
-import type { Cookie, HeaderRule } from '@wechatsync/core'
+import type { RuntimeInterface, RuntimeConfig } from "@wechatsync/core";
+import type { Cookie, HeaderRule } from "@wechatsync/core";
 
 /**
  * Chrome 扩展运行时实现
  */
 // 默认请求超时：30 秒
-const DEFAULT_FETCH_TIMEOUT = 30 * 1000
+const DEFAULT_FETCH_TIMEOUT = 30 * 1000;
 const RESPONSE_BODY_READERS = new Set<PropertyKey>([
-  'arrayBuffer',
-  'blob',
-  'bytes',
-  'formData',
-  'json',
-  'text',
-])
+  "arrayBuffer",
+  "blob",
+  "bytes",
+  "formData",
+  "json",
+  "text",
+]);
 
 function keepAbortScopeThroughBody(
   response: Response,
   cleanup: () => void,
-  abortSource: () => 'external' | 'timeout' | null,
+  abortSource: () => "external" | "timeout" | null,
   timeout: number,
   url: string,
 ): Response {
   if (!response.body) {
-    cleanup()
-    return response
+    cleanup();
+    return response;
   }
 
   return new Proxy(response, {
     get(target, property) {
-      const value = Reflect.get(target, property, target)
-      if (typeof value !== 'function') return value
-      if (!RESPONSE_BODY_READERS.has(property)) return value.bind(target)
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+      if (!RESPONSE_BODY_READERS.has(property)) return value.bind(target);
 
       return (...args: unknown[]) =>
         Promise.resolve(Reflect.apply(value, target, args))
           .catch((error) => {
-            if (abortSource() === 'timeout') {
-              throw new Error(`请求超时（${timeout / 1000}秒）: ${url}`)
+            if (abortSource() === "timeout") {
+              throw new Error(`请求超时（${timeout / 1000}秒）: ${url}`);
             }
-            throw error
+            throw error;
           })
-          .finally(cleanup)
+          .finally(cleanup);
     },
-  })
+  });
 }
 
 export class ExtensionRuntime implements RuntimeInterface {
-  readonly type = 'extension' as const
+  readonly type = "extension" as const;
   // 使用时间戳+随机数避免规则 ID 冲突（扩展重载或并发场景）
-  private ruleIdBase = Date.now() % 100000
-  private ruleIdCounter = 0
+  private ruleIdBase = Date.now() % 100000;
+  private ruleIdCounter = 0;
 
   constructor(private config?: RuntimeConfig) {}
 
@@ -58,60 +58,60 @@ export class ExtensionRuntime implements RuntimeInterface {
    * HTTP 请求 - 自动携带 cookies，带超时保护
    */
   async fetch(url: string, options?: RequestInit): Promise<Response> {
-    const timeout = this.config?.timeout ?? DEFAULT_FETCH_TIMEOUT
-    const controller = new AbortController()
-    const externalSignal = options?.signal
-    let abortSource: 'external' | 'timeout' | null = null
-    let timeoutId: ReturnType<typeof setTimeout> | undefined
-    let cleanedUp = false
+    const timeout = this.config?.timeout ?? DEFAULT_FETCH_TIMEOUT;
+    const controller = new AbortController();
+    const externalSignal = options?.signal;
+    let abortSource: "external" | "timeout" | null = null;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let cleanedUp = false;
     const cleanup = () => {
-      if (cleanedUp) return
-      cleanedUp = true
-      if (timeoutId !== undefined) clearTimeout(timeoutId)
-      externalSignal?.removeEventListener('abort', abortFromExternal)
-    }
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+      externalSignal?.removeEventListener("abort", abortFromExternal);
+    };
     const abortFromExternal = () => {
-      if (abortSource) return
-      abortSource = 'external'
-      controller.abort(externalSignal?.reason)
-      cleanup()
-    }
+      if (abortSource) return;
+      abortSource = "external";
+      controller.abort(externalSignal?.reason);
+      cleanup();
+    };
 
     if (externalSignal?.aborted) {
-      abortFromExternal()
+      abortFromExternal();
     } else {
-      externalSignal?.addEventListener('abort', abortFromExternal, {
+      externalSignal?.addEventListener("abort", abortFromExternal, {
         once: true,
-      })
+      });
     }
 
     timeoutId = setTimeout(() => {
-      if (abortSource) return
-      abortSource = 'timeout'
-      controller.abort()
-      cleanup()
-    }, timeout)
-    if (cleanedUp) clearTimeout(timeoutId)
+      if (abortSource) return;
+      abortSource = "timeout";
+      controller.abort();
+      cleanup();
+    }, timeout);
+    if (cleanedUp) clearTimeout(timeoutId);
 
     try {
       const response = await fetch(url, {
         ...options,
-        credentials: options?.credentials ?? 'include',
+        credentials: options?.credentials ?? "include",
         signal: controller.signal,
-      })
+      });
       return keepAbortScopeThroughBody(
         response,
         cleanup,
         () => abortSource,
         timeout,
         url,
-      )
+      );
     } catch (error) {
-      cleanup()
-      if (abortSource === 'timeout') {
-        throw new Error(`请求超时（${timeout / 1000}秒）: ${url}`)
+      cleanup();
+      if (abortSource === "timeout") {
+        throw new Error(`请求超时（${timeout / 1000}秒）: ${url}`);
       }
-      throw error
+      throw error;
     }
   }
 
@@ -120,7 +120,7 @@ export class ExtensionRuntime implements RuntimeInterface {
    */
   cookies = {
     async get(domain: string): Promise<Cookie[]> {
-      const cookies = await chrome.cookies.getAll({ domain })
+      const cookies = await chrome.cookies.getAll({ domain });
       return cookies.map((c) => ({
         name: c.name,
         value: c.value,
@@ -129,12 +129,12 @@ export class ExtensionRuntime implements RuntimeInterface {
         secure: c.secure,
         httpOnly: c.httpOnly,
         expirationDate: c.expirationDate,
-      }))
+      }));
     },
 
     async set(cookie: Cookie): Promise<void> {
       await chrome.cookies.set({
-        url: `https://${cookie.domain}${cookie.path || '/'}`,
+        url: `https://${cookie.domain}${cookie.path || "/"}`,
         name: cookie.name,
         value: cookie.value,
         domain: cookie.domain,
@@ -142,23 +142,23 @@ export class ExtensionRuntime implements RuntimeInterface {
         secure: cookie.secure,
         httpOnly: cookie.httpOnly,
         expirationDate: cookie.expirationDate,
-      })
+      });
     },
 
     async remove(name: string, domain: string): Promise<void> {
       await chrome.cookies.remove({
         url: `https://${domain}`,
         name,
-      })
+      });
     },
-  }
+  };
 
   /**
    * 获取单个 Cookie 值（便捷方法）
    */
   async getCookie(domain: string, name: string): Promise<string | null> {
-    const cookies = await chrome.cookies.getAll({ domain, name })
-    return cookies.length > 0 ? cookies[0].value : null
+    const cookies = await chrome.cookies.getAll({ domain, name });
+    return cookies.length > 0 ? cookies[0].value : null;
   }
 
   /**
@@ -166,32 +166,32 @@ export class ExtensionRuntime implements RuntimeInterface {
    */
   storage = {
     async get<T>(key: string): Promise<T | null> {
-      const result = await chrome.storage.local.get(key)
-      return (result[key] as T) ?? null
+      const result = await chrome.storage.local.get(key);
+      return (result[key] as T) ?? null;
     },
 
     async set<T>(key: string, value: T): Promise<void> {
-      await chrome.storage.local.set({ [key]: value })
+      await chrome.storage.local.set({ [key]: value });
     },
 
     async remove(key: string): Promise<void> {
-      await chrome.storage.local.remove(key)
+      await chrome.storage.local.remove(key);
     },
-  }
+  };
 
   /**
    * 会话存储
    */
   session = {
     async get<T>(key: string): Promise<T | null> {
-      const result = await chrome.storage.session.get(key)
-      return (result[key] as T) ?? null
+      const result = await chrome.storage.session.get(key);
+      return (result[key] as T) ?? null;
     },
 
     async set<T>(key: string, value: T): Promise<void> {
-      await chrome.storage.session.set({ [key]: value })
+      await chrome.storage.session.set({ [key]: value });
     },
-  }
+  };
 
   /**
    * Header 规则管理 (declarativeNetRequest)
@@ -200,8 +200,8 @@ export class ExtensionRuntime implements RuntimeInterface {
   headerRules = {
     add: async (rule: HeaderRule): Promise<string> => {
       // 组合 base + counter 生成唯一 ID，避免冲突
-      const ruleId = this.ruleIdBase + this.ruleIdCounter++
-      const id = `rule_${ruleId}`
+      const ruleId = this.ruleIdBase + this.ruleIdCounter++;
+      const id = `rule_${ruleId}`;
 
       await chrome.declarativeNetRequest.updateDynamicRules({
         addRules: [
@@ -223,30 +223,30 @@ export class ExtensionRuntime implements RuntimeInterface {
               // 只对扩展自身发起的请求生效，不影响其他网页
               initiatorDomains: [chrome.runtime.id],
               resourceTypes: (rule.resourceTypes || [
-                'xmlhttprequest',
+                "xmlhttprequest",
               ]) as chrome.declarativeNetRequest.ResourceType[],
             },
           },
         ],
-      })
+      });
 
-      return id
+      return id;
     },
 
     remove: async (ruleId: string): Promise<void> => {
-      const id = parseInt(ruleId.replace('rule_', ''), 10)
+      const id = parseInt(ruleId.replace("rule_", ""), 10);
       await chrome.declarativeNetRequest.updateDynamicRules({
         removeRuleIds: [id],
-      })
+      });
     },
 
     clear: async (): Promise<void> => {
-      const rules = await chrome.declarativeNetRequest.getDynamicRules()
+      const rules = await chrome.declarativeNetRequest.getDynamicRules();
       await chrome.declarativeNetRequest.updateDynamicRules({
         removeRuleIds: rules.map((r) => r.id),
-      })
+      });
     },
-  }
+  };
 
   /**
    * 文件下载
@@ -259,24 +259,24 @@ export class ExtensionRuntime implements RuntimeInterface {
       saveAs = true,
     ): Promise<number> {
       // 将 Blob 转换为 data URL
-      const buffer = await blob.arrayBuffer()
+      const buffer = await blob.arrayBuffer();
       const base64 = btoa(
         new Uint8Array(buffer).reduce(
           (data, byte) => data + String.fromCharCode(byte),
-          '',
+          "",
         ),
-      )
-      const mimeType = blob.type || 'application/octet-stream'
-      const dataUrl = `data:${mimeType};base64,${base64}`
+      );
+      const mimeType = blob.type || "application/octet-stream";
+      const dataUrl = `data:${mimeType};base64,${base64}`;
 
       const downloadId = await chrome.downloads.download({
         url: dataUrl,
         filename,
         saveAs,
-      })
-      return downloadId
+      });
+      return downloadId;
     },
-  }
+  };
 
   /**
    * Tab 管理
@@ -285,85 +285,88 @@ export class ExtensionRuntime implements RuntimeInterface {
     async query(
       urlPattern: string,
     ): Promise<Array<{ id: number; url?: string }>> {
-      const tabs = await chrome.tabs.query({ url: urlPattern })
+      const tabs = await chrome.tabs.query({ url: urlPattern });
       return tabs
         .filter((t) => t.id !== undefined)
-        .map((t) => ({ id: t.id!, url: t.url }))
+        .map((t) => ({ id: t.id!, url: t.url }));
     },
 
     async create(url: string, active = false): Promise<{ id: number }> {
-      const tab = await chrome.tabs.create({ url, active })
-      return { id: tab.id! }
+      const tab = await chrome.tabs.create({ url, active });
+      return { id: tab.id! };
     },
 
     async remove(tabId: number): Promise<void> {
-      await chrome.tabs.remove(tabId)
+      await chrome.tabs.remove(tabId);
     },
 
     async waitForLoad(tabId: number, timeout = 30000): Promise<void> {
       return new Promise((resolve, reject) => {
         const timeoutId = setTimeout(() => {
-          chrome.tabs.onUpdated.removeListener(listener)
-          reject(new Error('Tab load timeout'))
-        }, timeout)
+          chrome.tabs.onUpdated.removeListener(listener);
+          reject(new Error("Tab load timeout"));
+        }, timeout);
 
         const listener = (
           updatedTabId: number,
           info: chrome.tabs.TabChangeInfo,
         ) => {
-          if (updatedTabId === tabId && info.status === 'complete') {
-            clearTimeout(timeoutId)
-            chrome.tabs.onUpdated.removeListener(listener)
+          if (updatedTabId === tabId && info.status === "complete") {
+            clearTimeout(timeoutId);
+            chrome.tabs.onUpdated.removeListener(listener);
             // 额外等待让页面 JS 初始化
-            setTimeout(resolve, 1000)
+            setTimeout(resolve, 1000);
           }
-        }
-        chrome.tabs.onUpdated.addListener(listener)
-      })
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+      });
     },
 
     async executeScript<T, A extends unknown[]>(
       tabId: number,
       func: (...args: A) => T | Promise<T>,
       args: A,
+      options?: {
+        world?: "MAIN" | "ISOLATED";
+      },
     ): Promise<T> {
       const results = await chrome.scripting.executeScript({
         target: { tabId },
-        world: 'MAIN',
+        world: options?.world ?? "MAIN",
         func: func as (...args: unknown[]) => unknown,
         args: args as unknown[],
-      })
+      });
 
-      const result = results[0]?.result as T
-      return result
+      const result = results[0]?.result as T;
+      return result;
     },
-  }
+  };
 
   /**
    * DOM 操作 - 通过 Offscreen Document 实现
    */
   dom = {
     parseHTML: async (html: string): Promise<Document> => {
-      const parser = new DOMParser()
-      return parser.parseFromString(html, 'text/html')
+      const parser = new DOMParser();
+      return parser.parseFromString(html, "text/html");
     },
 
     querySelector: (doc: Document, selector: string): Element | null => {
-      return doc.querySelector(selector)
+      return doc.querySelector(selector);
     },
 
     querySelectorAll: (doc: Document, selector: string): Element[] => {
-      return Array.from(doc.querySelectorAll(selector))
+      return Array.from(doc.querySelectorAll(selector));
     },
 
     getTextContent: (element: Element): string => {
-      return element.textContent || ''
+      return element.textContent || "";
     },
 
     getInnerHTML: (element: Element): string => {
-      return element.innerHTML
+      return element.innerHTML;
     },
-  }
+  };
 }
 
 /**
@@ -372,5 +375,5 @@ export class ExtensionRuntime implements RuntimeInterface {
 export function createExtensionRuntime(
   config?: RuntimeConfig,
 ): ExtensionRuntime {
-  return new ExtensionRuntime(config)
+  return new ExtensionRuntime(config);
 }

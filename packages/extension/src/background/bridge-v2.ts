@@ -7,13 +7,18 @@ import {
   PublicationPlatformSchema,
   normalizeWeixinAppMsgId,
   resolveWeixinAppMsgId,
+  SyncerAccountProbeErrorCodeSchema,
+  SyncerAccountProbeV2Schema,
   SyncerAccountV2Schema,
+  SyncerAccountsV2DetailedSchema,
   type OpenPublicationDraftRequest,
   type OpenPublicationDraftResult,
   type PublicationInspectRequest,
   type PublicationObservation,
   type PublicationPlatform,
+  type SyncerAccountProbeV2,
   type SyncerAccountV2,
+  type SyncerAccountsV2Detailed,
 } from '@wechatsync/core/publication-inspection'
 import type { PlatformAdapter } from '@wechatsync/core'
 
@@ -111,6 +116,11 @@ export interface AuthenticatedPlatformCandidate {
   username?: unknown
   userId?: unknown
   avatar?: unknown
+  error?: unknown
+  probeStatus?: unknown
+  probeSource?: unknown
+  probeErrorCode?: unknown
+  primaryProbeErrorCode?: unknown
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -374,6 +384,18 @@ function safeHttpUrl(value: unknown): string | undefined {
   }
 }
 
+function safeAvatarUrl(value: unknown): string | undefined {
+  const safeUrl = safeHttpUrl(value)
+  if (!safeUrl) return undefined
+
+  const parsed = new URL(safeUrl)
+  // Do not rewrite signed CDN URLs into broken resources, and do not expose
+  // their query/hash across the bridge. Avatar is optional, so omission is the
+  // safe compatibility behavior.
+  if (parsed.search || parsed.hash) return undefined
+  return parsed.href
+}
+
 function nonEmptyString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const normalized = value.trim()
@@ -415,8 +437,8 @@ export function buildSyncerAccountsV2(
         nonEmptyString(candidate.username) ??
         nonEmptyString(candidate.name) ??
         externalAccountId,
-      ...(safeHttpUrl(candidate.avatar)
-        ? { avatarUrl: safeHttpUrl(candidate.avatar) }
+      ...(safeAvatarUrl(candidate.avatar)
+        ? { avatarUrl: safeAvatarUrl(candidate.avatar) }
         : {}),
       ...(safeHttpUrl(candidate.homepage)
         ? { homepage: safeHttpUrl(candidate.homepage) }
@@ -430,6 +452,119 @@ export function buildSyncerAccountsV2(
   }
 
   return accounts
+}
+
+const PHASE0_ACCOUNT_PLATFORMS = [
+  'toutiao',
+  'zhihu',
+  'sohu',
+  'weixin',
+] as const satisfies readonly PublicationPlatform[]
+
+/**
+ * Additive Bridge v2 detail response. The existing getAccountsV2 array remains
+ * frozen for old callers; new callers can feature-detect getAccountsV2Detailed
+ * and distinguish a confirmed logout from a failed probe.
+ */
+export function buildSyncerAccountsV2Detailed(
+  candidates: readonly AuthenticatedPlatformCandidate[],
+  requestedPlatforms?: readonly PublicationPlatform[],
+): SyncerAccountsV2Detailed {
+  const requested = requestedPlatforms
+    ? [...requestedPlatforms]
+    : [...PHASE0_ACCOUNT_PLATFORMS]
+  const accounts = buildSyncerAccountsV2(candidates, requested)
+  const accountByPlatform = new Map(
+    accounts.map((account) => [account.platform, account] as const),
+  )
+  const candidateByPlatform = new Map<
+    PublicationPlatform,
+    AuthenticatedPlatformCandidate
+  >()
+
+  for (const candidate of candidates) {
+    const platform = PublicationPlatformSchema.safeParse(candidate.id)
+    if (
+      platform.success &&
+      requested.includes(platform.data) &&
+      !candidateByPlatform.has(platform.data)
+    ) {
+      candidateByPlatform.set(platform.data, candidate)
+    }
+  }
+
+  const probes: SyncerAccountProbeV2[] = requested.map((platform) => {
+    const candidate = candidateByPlatform.get(platform)
+    if (!candidate) {
+      return SyncerAccountProbeV2Schema.parse({
+        platform,
+        status: 'PROBE_FAILED',
+        source: 'EXTENSION',
+        errorCode: 'PLATFORM_NOT_FOUND',
+      })
+    }
+
+    const source =
+      candidate.probeSource === 'MAIN_WORLD' ? 'MAIN_WORLD' : 'EXTENSION'
+    const primaryErrorCode =
+      source === 'MAIN_WORLD'
+        ? SyncerAccountProbeErrorCodeSchema.safeParse(
+            candidate.primaryProbeErrorCode,
+          )
+        : null
+    const primaryFields =
+      primaryErrorCode?.success === true
+        ? { primaryErrorCode: primaryErrorCode.data }
+        : {}
+
+    if (accountByPlatform.has(platform)) {
+      return SyncerAccountProbeV2Schema.parse({
+        platform,
+        status: 'AUTHENTICATED',
+        source,
+        ...primaryFields,
+      })
+    }
+
+    if (candidate.isAuthenticated === true) {
+      return SyncerAccountProbeV2Schema.parse({
+        platform,
+        status: 'PROBE_FAILED',
+        source,
+        errorCode: nonEmptyString(candidate.userId)
+          ? 'RESPONSE_SCHEMA_MISMATCH'
+          : 'ACCOUNT_ID_MISSING',
+        ...primaryFields,
+      })
+    }
+
+    if (
+      candidate.probeStatus === 'NOT_AUTHENTICATED' &&
+      !nonEmptyString(candidate.error)
+    ) {
+      return SyncerAccountProbeV2Schema.parse({
+        platform,
+        status: 'NOT_AUTHENTICATED',
+        source,
+        ...primaryFields,
+      })
+    }
+
+    const parsedErrorCode = SyncerAccountProbeErrorCodeSchema.safeParse(
+      candidate.probeErrorCode,
+    )
+    return SyncerAccountProbeV2Schema.parse({
+      platform,
+      status: 'PROBE_FAILED',
+      source,
+      errorCode: parsedErrorCode.success
+        ? parsedErrorCode.data
+        : 'UNKNOWN_ERROR',
+      ...primaryFields,
+    })
+  })
+
+  return SyncerAccountsV2DetailedSchema.parse({ accounts, probes })
 }
 
 function resolveWeixinFailurePostId(

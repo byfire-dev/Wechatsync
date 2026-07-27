@@ -1,4 +1,4 @@
-import type { Cookie, HeaderRule } from '../types'
+import type { Cookie, HeaderRule } from "../types";
 
 /**
  * 运行时接口抽象
@@ -6,22 +6,22 @@ import type { Cookie, HeaderRule } from '../types'
  */
 export interface RuntimeInterface {
   /** 运行时类型标识 */
-  readonly type: 'extension' | 'node'
+  readonly type: "extension" | "node";
 
   /**
    * HTTP 请求
    * 在扩展环境自动携带 cookies，Node 环境需手动管理
    */
-  fetch(url: string, options?: RequestInit): Promise<Response>
+  fetch(url: string, options?: RequestInit): Promise<Response>;
 
   /**
    * Cookie 管理
    */
   cookies: {
-    get(domain: string): Promise<Cookie[]>
-    set(cookie: Cookie): Promise<void>
-    remove(name: string, domain: string): Promise<void>
-  }
+    get(domain: string): Promise<Cookie[]>;
+    set(cookie: Cookie): Promise<void>;
+    remove(name: string, domain: string): Promise<void>;
+  };
 
   /**
    * 获取单个 Cookie 值（便捷方法）
@@ -29,34 +29,34 @@ export interface RuntimeInterface {
    * @param name Cookie 名称
    * @returns Cookie 值，不存在返回 null
    */
-  getCookie?(domain: string, name: string): Promise<string | null>
+  getCookie?(domain: string, name: string): Promise<string | null>;
 
   /**
    * 持久化存储
    */
   storage: {
-    get<T>(key: string): Promise<T | null>
-    set<T>(key: string, value: T): Promise<void>
-    remove(key: string): Promise<void>
-  }
+    get<T>(key: string): Promise<T | null>;
+    set<T>(key: string, value: T): Promise<void>;
+    remove(key: string): Promise<void>;
+  };
 
   /**
    * 会话存储 (扩展重启后清空)
    */
   session: {
-    get<T>(key: string): Promise<T | null>
-    set<T>(key: string, value: T): Promise<void>
-  }
+    get<T>(key: string): Promise<T | null>;
+    set<T>(key: string, value: T): Promise<void>;
+  };
 
   /**
    * Header 规则管理 (用于请求拦截)
    * 仅扩展环境支持
    */
   headerRules?: {
-    add(rule: HeaderRule): Promise<string>
-    remove(ruleId: string): Promise<void>
-    clear(): Promise<void>
-  }
+    add(rule: HeaderRule): Promise<string>;
+    remove(ruleId: string): Promise<void>;
+    clear(): Promise<void>;
+  };
 
   /**
    * 文件下载（仅扩展环境支持）
@@ -69,8 +69,8 @@ export interface RuntimeInterface {
      * @param saveAs 是否弹出保存对话框
      * @returns 下载 ID
      */
-    download(blob: Blob, filename: string, saveAs?: boolean): Promise<number>
-  }
+    download(blob: Blob, filename: string, saveAs?: boolean): Promise<number>;
+  };
 
   /**
    * Tab 管理（仅扩展环境支持）
@@ -79,20 +79,20 @@ export interface RuntimeInterface {
     /**
      * 查找匹配 URL 的 tab
      */
-    query(urlPattern: string): Promise<Array<{ id: number; url?: string }>>
+    query(urlPattern: string): Promise<Array<{ id: number; url?: string }>>;
     /**
      * 创建新 tab
      */
-    create(url: string, active?: boolean): Promise<{ id: number }>
+    create(url: string, active?: boolean): Promise<{ id: number }>;
     /**
      * Remove a tab created by an operation that was cancelled after Chrome
      * accepted the create request.
      */
-    remove?(tabId: number): Promise<void>
+    remove?(tabId: number): Promise<void>;
     /**
      * 等待 tab 加载完成
      */
-    waitForLoad(tabId: number, timeout?: number): Promise<void>
+    waitForLoad(tabId: number, timeout?: number): Promise<void>;
     /**
      * 在 tab 的页面上下文中执行函数
      * @param tabId Tab ID
@@ -104,8 +104,11 @@ export interface RuntimeInterface {
       tabId: number,
       func: (...args: A) => T | Promise<T>,
       args: A,
-    ): Promise<T>
-  }
+      options?: {
+        world?: "MAIN" | "ISOLATED";
+      },
+    ): Promise<T>;
+  };
 
   /**
    * DOM 操作
@@ -113,27 +116,27 @@ export interface RuntimeInterface {
    * Node 环境使用 jsdom 或类似库
    */
   dom: {
-    parseHTML(html: string): Promise<Document>
-    querySelector(doc: Document, selector: string): Element | null
-    querySelectorAll(doc: Document, selector: string): Element[]
-    getTextContent(element: Element): string
-    getInnerHTML(element: Element): string
-  }
+    parseHTML(html: string): Promise<Document>;
+    querySelector(doc: Document, selector: string): Element | null;
+    querySelectorAll(doc: Document, selector: string): Element[];
+    getTextContent(element: Element): string;
+    getInnerHTML(element: Element): string;
+  };
 }
 
 /**
  * 创建运行时的工厂函数类型
  */
-export type RuntimeFactory = (config?: RuntimeConfig) => RuntimeInterface
+export type RuntimeFactory = (config?: RuntimeConfig) => RuntimeInterface;
 
 /**
  * 运行时配置
  */
 export interface RuntimeConfig {
   /** Node 环境：预加载的 cookies */
-  cookies?: Record<string, Cookie[]>
+  cookies?: Record<string, Cookie[]>;
   /** 请求超时时间 (ms) */
-  timeout?: number
+  timeout?: number;
   /** 用户代理 */
-  userAgent?: string
+  userAgent?: string;
 }

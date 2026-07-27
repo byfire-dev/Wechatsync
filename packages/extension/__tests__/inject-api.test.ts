@@ -67,5 +67,63 @@ describe('injected Bridge v2 API', () => {
     })
 
     expect(callback).toHaveBeenCalledWith(null, { opened: true })
+
+    const detailedCallback = vi.fn()
+    const detailedPoster = windowObject.$poster as {
+      getAccountsV2Detailed(
+        options: { platforms: string[]; forceRefresh: boolean },
+        cb: typeof detailedCallback
+      ): void
+    }
+    detailedPoster.getAccountsV2Detailed(
+      { platforms: ['toutiao'], forceRefresh: true },
+      detailedCallback,
+    )
+
+    const detailedRequest = postMessage.mock.calls.at(-1)?.[0] as {
+      requestId: string
+    }
+    expect(detailedRequest).toMatchObject({
+      namespace: 'vibemarket.syncer.bridge',
+      apiVersion: '2.0',
+      direction: 'PAGE_TO_EXTENSION',
+      method: 'getAccountsV2Detailed',
+      payload: { platforms: ['toutiao'], forceRefresh: true },
+    })
+
+    listeners[0]?.({
+      source: windowObject,
+      origin: location.origin,
+      data: {
+        namespace: 'vibemarket.syncer.bridge',
+        apiVersion: '2.0',
+        direction: 'EXTENSION_TO_PAGE',
+        requestId: detailedRequest.requestId,
+        method: 'getAccountsV2Detailed',
+        ok: true,
+        result: {
+          accounts: [],
+          probes: [
+            {
+              platform: 'toutiao',
+              status: 'PROBE_FAILED',
+              source: 'MAIN_WORLD',
+              errorCode: 'PAGE_CONTEXT_UNAVAILABLE',
+            },
+          ],
+        },
+      },
+    })
+    expect(detailedCallback).toHaveBeenCalledWith(null, {
+      accounts: [],
+      probes: [
+        {
+          platform: 'toutiao',
+          status: 'PROBE_FAILED',
+          source: 'MAIN_WORLD',
+          errorCode: 'PAGE_CONTEXT_UNAVAILABLE',
+        },
+      ],
+    })
   })
 })

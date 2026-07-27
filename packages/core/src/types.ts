@@ -36,12 +36,41 @@ export interface SyncResult {
 /**
  * 认证状态
  */
+export type AuthProbeStatus =
+  | 'AUTHENTICATED'
+  | 'NOT_AUTHENTICATED'
+  | 'PROBE_FAILED'
+
+export type AuthProbeSource = 'EXTENSION' | 'MAIN_WORLD'
+
+/**
+ * Safe, non-sensitive account-probe failures that may cross Bridge v2.
+ * Raw response bodies, cookies, headers, URLs and exception messages must
+ * never be placed in this field.
+ */
+export type AuthProbeErrorCode =
+  | 'PLATFORM_NOT_FOUND'
+  | 'TIMEOUT'
+  | 'NETWORK_ERROR'
+  | 'HTTP_ERROR'
+  | 'REDIRECTED'
+  | 'INVALID_CONTENT_TYPE'
+  | 'RESPONSE_SCHEMA_MISMATCH'
+  | 'ACCOUNT_ID_MISSING'
+  | 'PAGE_CONTEXT_UNAVAILABLE'
+  | 'UNTRUSTED_PAGE'
+  | 'UNKNOWN_ERROR'
+
 export interface AuthResult {
   isAuthenticated: boolean
   username?: string
   userId?: string
   avatar?: string
   error?: string
+  probeStatus?: AuthProbeStatus
+  probeSource?: AuthProbeSource
+  probeErrorCode?: AuthProbeErrorCode
+  primaryProbeErrorCode?: AuthProbeErrorCode
 }
 
 /**

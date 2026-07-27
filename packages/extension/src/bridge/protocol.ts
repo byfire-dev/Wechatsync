@@ -6,6 +6,7 @@ import {
   PublicationPlatformSchema,
   SYNCER_BRIDGE_REQUEST_ID_MAX_LENGTH,
   SyncerAccountV2Schema,
+  SyncerAccountsV2DetailedSchema,
   SyncerBridgeInfoSchema,
   type OpenPublicationDraftRequest,
   type OpenPublicationDraftResult,
@@ -13,11 +14,19 @@ import {
   type PublicationObservation,
   type PublicationPlatform,
   type SyncerAccountV2,
+  type SyncerAccountsV2Detailed,
   type SyncerBridgeInfo,
 } from '@wechatsync/core/publication-inspection'
 
 export const BRIDGE_NAMESPACE = 'vibemarket.syncer.bridge' as const
 export const BRIDGE_API_VERSION = '2.0' as const
+
+export function projectBridgeRuntimeError(_error: unknown) {
+  return {
+    code: 'BRIDGE_RUNTIME_ERROR' as const,
+    message: 'Bridge request failed',
+  }
+}
 
 export const BRIDGE_DIRECTIONS = {
   request: 'PAGE_TO_EXTENSION',
@@ -27,6 +36,7 @@ export const BRIDGE_DIRECTIONS = {
 export const BRIDGE_METHODS = [
   'getBridgeInfo',
   'getAccountsV2',
+  'getAccountsV2Detailed',
   'inspectPublication',
   'openPublicationDraft',
 ] as const
@@ -47,6 +57,7 @@ export interface GetAccountsV2Payload {
 export interface BridgeRequestPayloadMap {
   getBridgeInfo: Record<string, never>
   getAccountsV2: GetAccountsV2Payload
+  getAccountsV2Detailed: GetAccountsV2Payload
   inspectPublication: PublicationInspectRequest
   openPublicationDraft: OpenPublicationDraftRequest
 }
@@ -54,6 +65,7 @@ export interface BridgeRequestPayloadMap {
 export interface BridgeResponseResultMap {
   getBridgeInfo: SyncerBridgeInfo
   getAccountsV2: SyncerAccountV2[]
+  getAccountsV2Detailed: SyncerAccountsV2Detailed
   inspectPublication: PublicationObservation[]
   openPublicationDraft: OpenPublicationDraftResult
 }
@@ -343,6 +355,7 @@ function parseRequestPayload<M extends BridgeMethod>(
         | BridgeRequestPayloadMap[M]
         | null
     case 'getAccountsV2':
+    case 'getAccountsV2Detailed':
       return parseGetAccountsV2Payload(value) as
         | BridgeRequestPayloadMap[M]
         | null
@@ -436,6 +449,11 @@ function parseResponseResult<M extends BridgeMethod>(
 
   if (method === 'openPublicationDraft') {
     const parsed = OpenPublicationDraftResultSchema.safeParse(value)
+    return parsed.success ? (parsed.data as BridgeResponseResultMap[M]) : null
+  }
+
+  if (method === 'getAccountsV2Detailed') {
+    const parsed = SyncerAccountsV2DetailedSchema.safeParse(value)
     return parsed.success ? (parsed.data as BridgeResponseResultMap[M]) : null
   }
 
