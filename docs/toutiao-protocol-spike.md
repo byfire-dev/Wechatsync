@@ -8,7 +8,7 @@
 
 ## 已验证事实
 
-本 Spike 使用了三类证据：
+本 Spike 使用了四类证据：
 
 1. 当前登录态下，`https://mp.toutiao.com/profile_v4/graphic/publish` 可以打开头条图文编辑器。
 2. 已安装的 Wechatsync `2.0.9` 构建中，头条适配器使用以下协议：
@@ -17,6 +17,7 @@
    - 图片：`POST /spice/image`
    - 草稿：`POST /mp/agw/article/publish?source=mp&type=article&aid=1231`
 3. 上游仓库历史实现也使用 `get_media_info` 和 `article/publish`，说明协议来源不是本次凭空推断。
+4. `get_media_info` 与 `user_login_status_api` 的真实响应是 `HTTP 200`、`Content-Type: text/plain; charset=utf-8`，正文为 JSON。生产探测因此以有界 JSON 解析和严格业务结构为准，MIME 只在正文无法解析时用于错误分类。
 
 本 PR 没有把历史实现中的原始响应日志和任意 URL 页面转发能力带入新实现。
 
@@ -55,7 +56,7 @@
 
 - 不实现 `inspectPublication`
 - 不启用头条 `publication_inspection` 桥接能力
-- 不调用草稿列表、发布列表或登录状态 Spike 接口
+- 不调用草稿列表或发布列表；登录状态接口只在账号接口缺少身份时做只读消歧，不作为账号身份来源
 - 不支持直接发布；`draftOnly: false` 会在发出网络请求前失败
 - 不自动修改、重投或发布文章
 

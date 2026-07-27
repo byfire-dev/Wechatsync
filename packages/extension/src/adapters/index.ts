@@ -5,6 +5,7 @@ import {
   adapterRegistry,
   type PlatformAdapter,
   type PlatformMeta,
+  type AuthProbeErrorCode,
   type AuthResult,
   type Article,
   type SyncResult,
@@ -192,13 +193,20 @@ const AUTH_CHECK_CONCURRENCY = 5 // 并行检查数量
 const AUTH_CHECK_TIMEOUT = 10 * 1000 // 单个平台认证检查超时：10 秒
 const PUBLISH_TIMEOUT = 10 * 60 * 1000 // 单个平台发布超时：10 分钟（包含图片上传）
 
+class OperationTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'OperationTimeoutError'
+  }
+}
+
 /**
  * 带超时的 Promise 包装
  */
 function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(errorMessage))
+      reject(new OperationTimeoutError(errorMessage))
     }, ms)
 
     promise
@@ -213,22 +221,85 @@ function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): 
   })
 }
 
+function normalizeAuthProbeResult(auth: AuthResult): AuthResult {
+  const probeSource =
+    auth.probeSource === 'MAIN_WORLD' ? 'MAIN_WORLD' : 'EXTENSION'
+
+  if (auth.isAuthenticated) {
+    return {
+      ...auth,
+      probeStatus: 'AUTHENTICATED',
+      probeSource,
+      probeErrorCode: undefined,
+    }
+  }
+
+  if (auth.probeStatus === 'NOT_AUTHENTICATED' && !auth.error) {
+    return {
+      ...auth,
+      probeStatus: 'NOT_AUTHENTICATED',
+      probeSource,
+      probeErrorCode: undefined,
+    }
+  }
+
+  if (auth.probeStatus === 'PROBE_FAILED' || auth.error) {
+    return {
+      ...auth,
+      probeStatus: 'PROBE_FAILED',
+      probeSource,
+      probeErrorCode: auth.probeErrorCode ?? 'UNKNOWN_ERROR',
+    }
+  }
+
+  // A legacy adapter returning only `isAuthenticated: false` has not proven
+  // logout. The same shape is also used for response drift, missing IDs and
+  // platform rejection, so fail closed unless the adapter opts into the
+  // explicit NOT_AUTHENTICATED contract.
+  return {
+    ...auth,
+    probeStatus: 'PROBE_FAILED',
+    probeSource,
+    probeErrorCode: 'UNKNOWN_ERROR',
+  }
+}
+
+function authFailureFromError(error: unknown): AuthResult {
+  const probeErrorCode: AuthProbeErrorCode =
+    error instanceof OperationTimeoutError ? 'TIMEOUT' : 'UNKNOWN_ERROR'
+  return {
+    isAuthenticated: false,
+    error: error instanceof Error ? error.message : 'Account probe failed',
+    probeStatus: 'PROBE_FAILED',
+    probeSource: 'EXTENSION',
+    probeErrorCode,
+  }
+}
+
 /**
  * 检查平台登录状态
  */
 export async function checkPlatformAuth(platformId: string) {
   const adapter = await getAdapter(platformId)
   if (!adapter) {
-    return { isAuthenticated: false, error: 'Platform not found' }
+    return {
+      isAuthenticated: false,
+      error: 'Platform not found',
+      probeStatus: 'PROBE_FAILED' as const,
+      probeSource: 'EXTENSION' as const,
+      probeErrorCode: 'PLATFORM_NOT_FOUND' as const,
+    }
   }
   try {
-    return await withTimeout(
-      adapter.checkAuth(),
-      AUTH_CHECK_TIMEOUT,
-      `认证检查超时（${AUTH_CHECK_TIMEOUT / 1000}秒）`
+    return normalizeAuthProbeResult(
+      await withTimeout(
+        adapter.checkAuth(),
+        AUTH_CHECK_TIMEOUT,
+        `认证检查超时（${AUTH_CHECK_TIMEOUT / 1000}秒）`
+      )
     )
   } catch (error) {
-    return { isAuthenticated: false, error: (error as Error).message }
+    return authFailureFromError(error)
   }
 }
 
@@ -303,6 +374,10 @@ export async function checkAllPlatformsAuth(
         userId: cached.userId,
         avatar: cached.avatar,
         error: cached.error,
+        probeStatus: cached.probeStatus,
+        probeSource: cached.probeSource,
+        probeErrorCode: cached.probeErrorCode,
+        primaryProbeErrorCode: cached.primaryProbeErrorCode,
       })
     } else {
       needsCheck.push(meta)
@@ -320,10 +395,12 @@ export async function checkAllPlatformsAuth(
           const adapter = await adapterRegistry.get(meta.id)
           if (adapter) {
             logger.debug(` Checking auth for ${meta.id}...`)
-            const auth = await withTimeout(
-              adapter.checkAuth(),
-              AUTH_CHECK_TIMEOUT,
-              `认证检查超时（${AUTH_CHECK_TIMEOUT / 1000}秒）`
+            const auth = normalizeAuthProbeResult(
+              await withTimeout(
+                adapter.checkAuth(),
+                AUTH_CHECK_TIMEOUT,
+                `认证检查超时（${AUTH_CHECK_TIMEOUT / 1000}秒）`
+              )
             )
             logger.debug(` ${meta.id} auth result:`, {
               isAuthenticated: auth.isAuthenticated,
@@ -341,6 +418,10 @@ export async function checkAllPlatformsAuth(
               userId: auth.userId,
               avatar: auth.avatar,
               error: auth.error,
+              probeStatus: auth.probeStatus,
+              probeSource: auth.probeSource,
+              probeErrorCode: auth.probeErrorCode,
+              primaryProbeErrorCode: auth.primaryProbeErrorCode,
               timestamp: now,
             }
 
@@ -351,23 +432,33 @@ export async function checkAllPlatformsAuth(
               userId: auth.userId,
               avatar: auth.avatar,
               error: auth.error,
+              probeStatus: auth.probeStatus,
+              probeSource: auth.probeSource,
+              probeErrorCode: auth.probeErrorCode,
+              primaryProbeErrorCode: auth.primaryProbeErrorCode,
             }
           }
-          return { ...meta, isAuthenticated: false, error: 'Adapter not found' }
+          return {
+            ...meta,
+            isAuthenticated: false,
+            error: 'Adapter not found',
+            probeStatus: 'PROBE_FAILED' as const,
+            probeSource: 'EXTENSION' as const,
+            probeErrorCode: 'PLATFORM_NOT_FOUND' as const,
+          }
         } catch (error) {
           logger.error(`${meta.id} auth error:`, error)
+          const failure = authFailureFromError(error)
 
           // 缓存错误状态
           cache[meta.id] = {
-            isAuthenticated: false,
-            error: (error as Error).message,
+            ...failure,
             timestamp: now,
           }
 
           return {
             ...meta,
-            isAuthenticated: false,
-            error: (error as Error).message,
+            ...failure,
           }
         }
       }))

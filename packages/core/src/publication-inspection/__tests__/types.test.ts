@@ -5,7 +5,9 @@ import {
   PublicationInspectRequestSchema,
   PublicationObservationSchema,
   SYNCER_BRIDGE_REQUEST_ID_MAX_LENGTH,
+  SyncerAccountProbeV2Schema,
   SyncerAccountV2Schema,
+  SyncerAccountsV2DetailedSchema,
 } from '../types'
 
 describe('publication inspection contracts', () => {
@@ -50,6 +52,56 @@ describe('publication inspection contracts', () => {
         capabilities: ['account_identity', 'publication_inspect'],
       }),
     ).toMatchObject({ externalAccountId: 'account-1' })
+  })
+
+  it('strictly validates detailed account probe invariants', () => {
+    const account = {
+      platform: 'toutiao',
+      externalAccountId: '7390000000000000001',
+      displayName: '头条账号',
+      capabilities: ['account_identity'],
+    }
+    const result = {
+      accounts: [account],
+      probes: [
+        {
+          platform: 'toutiao',
+          status: 'AUTHENTICATED',
+          source: 'MAIN_WORLD',
+          primaryErrorCode: 'NETWORK_ERROR',
+        },
+      ],
+    }
+
+    expect(SyncerAccountsV2DetailedSchema.parse(result)).toEqual(result)
+    expect(
+      SyncerAccountProbeV2Schema.safeParse({
+        platform: 'toutiao',
+        status: 'PROBE_FAILED',
+        source: 'EXTENSION',
+      }).success,
+    ).toBe(false)
+    expect(
+      SyncerAccountProbeV2Schema.safeParse({
+        platform: 'toutiao',
+        status: 'NOT_AUTHENTICATED',
+        source: 'EXTENSION',
+        errorCode: 'NETWORK_ERROR',
+      }).success,
+    ).toBe(false)
+    expect(
+      SyncerAccountsV2DetailedSchema.safeParse({
+        accounts: [account],
+        probes: [
+          {
+            platform: 'toutiao',
+            status: 'PROBE_FAILED',
+            source: 'EXTENSION',
+            errorCode: 'NETWORK_ERROR',
+          },
+        ],
+      }).success,
+    ).toBe(false)
   })
 
   it('limits one inspection to at most 20 candidates', () => {

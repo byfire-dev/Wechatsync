@@ -45,6 +45,133 @@ export const SyncerAccountV2Schema = z.object({
 
 export type SyncerAccountV2 = z.infer<typeof SyncerAccountV2Schema>
 
+export const SyncerAccountProbeStatusSchema = z.enum([
+  'AUTHENTICATED',
+  'NOT_AUTHENTICATED',
+  'PROBE_FAILED',
+])
+
+export const SyncerAccountProbeSourceSchema = z.enum([
+  'EXTENSION',
+  'MAIN_WORLD',
+])
+
+export const SyncerAccountProbeErrorCodeSchema = z.enum([
+  'PLATFORM_NOT_FOUND',
+  'TIMEOUT',
+  'NETWORK_ERROR',
+  'HTTP_ERROR',
+  'REDIRECTED',
+  'INVALID_CONTENT_TYPE',
+  'RESPONSE_SCHEMA_MISMATCH',
+  'ACCOUNT_ID_MISSING',
+  'PAGE_CONTEXT_UNAVAILABLE',
+  'UNTRUSTED_PAGE',
+  'UNKNOWN_ERROR',
+])
+
+export const SyncerAccountProbeV2Schema = z
+  .object({
+    platform: PublicationPlatformSchema,
+    status: SyncerAccountProbeStatusSchema,
+    source: SyncerAccountProbeSourceSchema,
+    errorCode: SyncerAccountProbeErrorCodeSchema.optional(),
+    primaryErrorCode: SyncerAccountProbeErrorCodeSchema.optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.status === 'PROBE_FAILED' && !value.errorCode) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'failed account probes require a safe error code',
+        path: ['errorCode'],
+      })
+    }
+
+    if (value.status !== 'PROBE_FAILED' && value.errorCode !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'successful account probes cannot contain a final error code',
+        path: ['errorCode'],
+      })
+    }
+
+    if (
+      value.source !== 'MAIN_WORLD' &&
+      value.primaryErrorCode !== undefined
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'primary probe errors require a MAIN_WORLD fallback',
+        path: ['primaryErrorCode'],
+      })
+    }
+  })
+
+export type SyncerAccountProbeV2 = z.infer<
+  typeof SyncerAccountProbeV2Schema
+>
+
+export const SyncerAccountsV2DetailedSchema = z
+  .object({
+    accounts: z.array(SyncerAccountV2Schema).max(4),
+    probes: z.array(SyncerAccountProbeV2Schema).max(4),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const accountPlatforms = new Set<PublicationPlatform>()
+    for (const account of value.accounts) {
+      if (accountPlatforms.has(account.platform)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'detailed accounts must be unique per platform',
+          path: ['accounts'],
+        })
+      }
+      accountPlatforms.add(account.platform)
+    }
+
+    const probePlatforms = new Set<PublicationPlatform>()
+    for (const probe of value.probes) {
+      if (probePlatforms.has(probe.platform)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'account probes must be unique per platform',
+          path: ['probes'],
+        })
+      }
+      probePlatforms.add(probe.platform)
+
+      if (
+        probe.status === 'AUTHENTICATED' &&
+        !accountPlatforms.has(probe.platform)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'authenticated probes require a projected account',
+          path: ['probes'],
+        })
+      }
+    }
+
+    for (const platform of accountPlatforms) {
+      const probe = value.probes.find(
+        (candidate) => candidate.platform === platform,
+      )
+      if (probe?.status !== 'AUTHENTICATED') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'projected accounts require an authenticated probe',
+          path: ['accounts'],
+        })
+      }
+    }
+  })
+
+export type SyncerAccountsV2Detailed = z.infer<
+  typeof SyncerAccountsV2DetailedSchema
+>
+
 export const SYNCER_BRIDGE_REQUEST_ID_MAX_LENGTH = 128
 
 export const OpenPublicationDraftRequestSchema = z

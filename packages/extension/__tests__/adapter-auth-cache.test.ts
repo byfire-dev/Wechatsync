@@ -128,6 +128,38 @@ describe('adapter auth cache', () => {
     expect(results[0]).toMatchObject(completeAuthResult)
   })
 
+  it('fails closed when a legacy adapter returns false without explicit logout evidence', async () => {
+    authTestState.checkAuth.mockResolvedValue({
+      isAuthenticated: false,
+    })
+
+    const results = await checkAllPlatformsAuth(true)
+
+    expect(results[0]).toMatchObject({
+      isAuthenticated: false,
+      probeStatus: 'PROBE_FAILED',
+      probeSource: 'EXTENSION',
+      probeErrorCode: 'UNKNOWN_ERROR',
+    })
+  })
+
+  it('preserves an adapter-confirmed logout', async () => {
+    authTestState.checkAuth.mockResolvedValue({
+      isAuthenticated: false,
+      probeStatus: 'NOT_AUTHENTICATED',
+      probeSource: 'EXTENSION',
+    })
+
+    const results = await checkAllPlatformsAuth(true)
+
+    expect(results[0]).toMatchObject({
+      isAuthenticated: false,
+      probeStatus: 'NOT_AUTHENTICATED',
+      probeSource: 'EXTENSION',
+    })
+    expect(results[0].probeErrorCode).toBeUndefined()
+  })
+
   it('checks only the requested platform and never invokes unrelated adapters', async () => {
     authTestState.metas.push(authTestState.sohuMeta)
     authTestState.otherCheckAuth.mockRejectedValue(

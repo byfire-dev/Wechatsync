@@ -30,6 +30,7 @@ import { checkForUpdates, isUpdateDismissed } from '../lib/version-check'
 import { fetchRemoteConfig, fetchConfigIfNeeded } from '../lib/remote-config'
 import {
   buildSyncerAccountsV2,
+  buildSyncerAccountsV2Detailed,
   runOpenPublicationDraft,
   runPublicationInspection,
   validateBridgeMessageSender,
@@ -40,6 +41,7 @@ import {
 } from './bridge-v2'
 import { dispatchLegacyMagicCall } from '../bridge/legacy-magic-call'
 import { isLegacyMutationRuntimeMessage } from '../bridge/legacy-origin-policy'
+import { projectBridgeRuntimeError } from '../bridge'
 
 const logger = createLogger('Background')
 
@@ -137,6 +139,11 @@ type MessageAction =
   | { type: 'GET_PLATFORMS' }
   | { type: 'CHECK_ALL_AUTH'; payload?: { forceRefresh?: boolean } }
   | { type: 'BRIDGE_GET_ACCOUNTS_V2'; requestId: string; payload: unknown }
+  | {
+      type: 'BRIDGE_GET_ACCOUNTS_V2_DETAILED'
+      requestId: string
+      payload: unknown
+    }
   | { type: 'BRIDGE_INSPECT_PUBLICATION'; requestId: string; payload: unknown }
   | {
       type: 'BRIDGE_OPEN_PUBLICATION_DRAFT'
@@ -172,7 +179,15 @@ type MessageAction =
 chrome.runtime.onMessage.addListener((message: MessageAction, sender, sendResponse) => {
   handleMessage(message, sender)
     .then(sendResponse)
-    .catch(error => sendResponse({ error: error.message }))
+    .catch(error => {
+      if (message.type.startsWith('BRIDGE_')) {
+        sendResponse({ error: projectBridgeRuntimeError(error).code })
+        return
+      }
+      sendResponse({
+        error: error instanceof Error ? error.message : 'Operation failed',
+      })
+    })
 
   return true // 异步响应
 })
@@ -246,6 +261,29 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
         accounts: buildSyncerAccountsV2(
           authResults,
           validatedPayload.data.platforms
+        ),
+      }
+    }
+
+    case 'BRIDGE_GET_ACCOUNTS_V2_DETAILED': {
+      const verifiedSender = validateBridgeMessageSender(sender || {})
+      if (!verifiedSender.success) {
+        return { error: verifiedSender.code }
+      }
+
+      const validatedPayload = validateGetAccountsV2Payload(message.payload)
+      if (!validatedPayload.success) {
+        return { error: validatedPayload.code }
+      }
+
+      const authResults = await checkAllPlatformsAuth(
+        validatedPayload.data.forceRefresh ?? false,
+        validatedPayload.data.platforms,
+      )
+      return {
+        detailedAccounts: buildSyncerAccountsV2Detailed(
+          authResults,
+          validatedPayload.data.platforms,
         ),
       }
     }

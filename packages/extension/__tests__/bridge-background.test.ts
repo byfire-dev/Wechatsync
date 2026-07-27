@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildSyncerAccountsV2,
+  buildSyncerAccountsV2Detailed,
   createUnsupportedPublicationObservation,
   runOpenPublicationDraft,
   runPublicationInspection,
@@ -257,7 +258,7 @@ describe('Bridge v2 account projection', () => {
         isAuthenticated: true,
         username: ' Creator A ',
         userId: ' account-toutiao ',
-        avatar: 'https://cdn.example/avatar.png',
+        avatar: 'https://cdn.example/avatar.png?token=secret#private',
         homepage: 'https://mp.toutiao.com/profile_v4/index',
       },
       {
@@ -301,7 +302,6 @@ describe('Bridge v2 account projection', () => {
         platform: 'toutiao',
         externalAccountId: 'account-toutiao',
         displayName: 'Creator A',
-        avatarUrl: 'https://cdn.example/avatar.png',
         homepage: 'https://mp.toutiao.com/profile_v4/index',
         capabilities: ['account_identity'],
       },
@@ -329,6 +329,7 @@ describe('Bridge v2 account projection', () => {
         ],
       },
     ])
+    expect(JSON.stringify(accounts)).not.toContain('secret')
   })
 
   it('applies the requested platform filter and emits one account per platform', () => {
@@ -362,6 +363,78 @@ describe('Bridge v2 account projection', () => {
       externalAccountId: 'first',
       capabilities: ['account_identity'],
     })
+  })
+
+  it('projects authenticated, logged-out and failed probes without leaking errors', () => {
+    const detailed = buildSyncerAccountsV2Detailed(
+      [
+        {
+          id: 'toutiao',
+          isAuthenticated: true,
+          userId: '7390000000000000001',
+          username: 'Toutiao',
+          probeStatus: 'AUTHENTICATED',
+          probeSource: 'MAIN_WORLD',
+          primaryProbeErrorCode: 'NETWORK_ERROR',
+        },
+        {
+          id: 'zhihu',
+          isAuthenticated: false,
+          probeStatus: 'NOT_AUTHENTICATED',
+          probeSource: 'EXTENSION',
+        },
+        {
+          id: 'sohu',
+          isAuthenticated: false,
+          error: 'cookie=secret-token',
+          probeStatus: 'PROBE_FAILED',
+          probeSource: 'EXTENSION',
+          probeErrorCode: 'HTTP_ERROR',
+        },
+        {
+          id: 'weixin',
+          isAuthenticated: false,
+        },
+      ],
+      ['toutiao', 'zhihu', 'sohu', 'weixin'],
+    )
+
+    expect(detailed).toEqual({
+      accounts: [
+        {
+          platform: 'toutiao',
+          externalAccountId: '7390000000000000001',
+          displayName: 'Toutiao',
+          capabilities: ['account_identity'],
+        },
+      ],
+      probes: [
+        {
+          platform: 'toutiao',
+          status: 'AUTHENTICATED',
+          source: 'MAIN_WORLD',
+          primaryErrorCode: 'NETWORK_ERROR',
+        },
+        {
+          platform: 'zhihu',
+          status: 'NOT_AUTHENTICATED',
+          source: 'EXTENSION',
+        },
+        {
+          platform: 'sohu',
+          status: 'PROBE_FAILED',
+          source: 'EXTENSION',
+          errorCode: 'HTTP_ERROR',
+        },
+        {
+          platform: 'weixin',
+          status: 'PROBE_FAILED',
+          source: 'EXTENSION',
+          errorCode: 'UNKNOWN_ERROR',
+        },
+      ],
+    })
+    expect(JSON.stringify(detailed)).not.toContain('secret-token')
   })
 })
 

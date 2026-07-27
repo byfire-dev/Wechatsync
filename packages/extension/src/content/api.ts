@@ -17,6 +17,7 @@ import type {
   OpenPublicationDraftResult,
   PublicationObservation,
   SyncerAccountV2,
+  SyncerAccountsV2Detailed,
 } from '@wechatsync/core/publication-inspection'
 import { createLogger } from '../lib/logger'
 import {
@@ -26,6 +27,7 @@ import {
   createBridgeSuccessResponse,
   isLegacyMutationMethod,
   LEGACY_API_ORIGIN_NOT_ALLOWED,
+  projectBridgeRuntimeError,
   parseLegacyPageActionEvent,
   parseBridgeRequestEvent,
   validateLegacyMutationPageEvent,
@@ -48,6 +50,7 @@ const BRIDGE_CAPABILITIES = [
 
 interface BridgeRuntimeResponse {
   accounts?: SyncerAccountV2[]
+  detailedAccounts?: SyncerAccountsV2Detailed
   draftOpenResult?: OpenPublicationDraftResult
   observations?: PublicationObservation[]
   error?: string
@@ -117,6 +120,7 @@ function createBridgeFailure(
     case 'getBridgeInfo':
       return createBridgeErrorResponse(request, { code, message })
     case 'getAccountsV2':
+    case 'getAccountsV2Detailed':
       return createBridgeErrorResponse(request, { code, message })
     case 'inspectPublication':
       return createBridgeErrorResponse(request, { code, message })
@@ -192,6 +196,22 @@ async function handleBridgeRequest(evt: MessageEvent): Promise<void> {
         return
       }
 
+      case 'getAccountsV2Detailed': {
+        const response = await sendBridgeRuntimeMessage({
+          type: 'BRIDGE_GET_ACCOUNTS_V2_DETAILED',
+          requestId: request.requestId,
+          payload: request.payload,
+        })
+        if (!response.detailedAccounts) {
+          throw new Error('Detailed Bridge account response is missing')
+        }
+        postBridgeResponse(
+          createBridgeSuccessResponse(request, response.detailedAccounts),
+          evt.origin
+        )
+        return
+      }
+
       case 'inspectPublication': {
         const response = await sendBridgeRuntimeMessage({
           type: 'BRIDGE_INSPECT_PUBLICATION',
@@ -225,11 +245,12 @@ async function handleBridgeRequest(evt: MessageEvent): Promise<void> {
       }
     }
   } catch (error) {
+    const failure = projectBridgeRuntimeError(error)
     postBridgeResponse(
       createBridgeFailure(
         request,
-        'BRIDGE_RUNTIME_ERROR',
-        (error as Error).message || 'Bridge request failed'
+        failure.code,
+        failure.message
       ),
       evt.origin
     )
