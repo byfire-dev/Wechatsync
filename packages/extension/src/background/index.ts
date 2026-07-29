@@ -6,6 +6,7 @@ import {
   getAllPlatformMetas,
   cancelSync,
   getAdapter,
+  getRegisteredPublicationInspectorPlatforms,
   getPlatformPreprocessConfigs,
   type SyncDetailProgress,
 } from '../adapters'
@@ -39,6 +40,12 @@ import {
   validateOpenPublicationDraftPayload,
   validateLegacyMutationMessageSender,
 } from './bridge-v2'
+import {
+  buildPublicationBridgeInfoV3,
+  runPublicationInspectionV3,
+  validatePublicationBridgeInfoPayloadV3,
+  validatePublicationInspectPayloadV3,
+} from './bridge-v3'
 import { dispatchLegacyMagicCall } from '../bridge/legacy-magic-call'
 import { isLegacyMutationRuntimeMessage } from '../bridge/legacy-origin-policy'
 import { projectBridgeRuntimeError } from '../bridge'
@@ -145,6 +152,16 @@ type MessageAction =
       payload: unknown
     }
   | { type: 'BRIDGE_INSPECT_PUBLICATION'; requestId: string; payload: unknown }
+  | {
+      type: 'BRIDGE_GET_PUBLICATION_INFO_V3'
+      requestId: string
+      payload: unknown
+    }
+  | {
+      type: 'BRIDGE_INSPECT_PUBLICATION_V3'
+      requestId: string
+      payload: unknown
+    }
   | {
       type: 'BRIDGE_OPEN_PUBLICATION_DRAFT'
       requestId: string
@@ -307,6 +324,55 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
         observations: await runPublicationInspection(
           validatedPayload.data,
           adapter,
+        ),
+      }
+    }
+
+    case 'BRIDGE_GET_PUBLICATION_INFO_V3': {
+      const verifiedSender = validateBridgeMessageSender(sender || {})
+      if (!verifiedSender.success) {
+        return { error: verifiedSender.code }
+      }
+      if (
+        !validatePublicationBridgeInfoPayloadV3(
+          message.payload,
+          message.requestId,
+        )
+      ) {
+        return { error: 'INVALID_PAYLOAD' }
+      }
+
+      const extensionVersion = chrome.runtime.getManifest().version
+      const platforms = await getRegisteredPublicationInspectorPlatforms()
+      return {
+        publicationBridgeInfoV3: buildPublicationBridgeInfoV3(
+          platforms,
+          extensionVersion,
+        ),
+      }
+    }
+
+    case 'BRIDGE_INSPECT_PUBLICATION_V3': {
+      const verifiedSender = validateBridgeMessageSender(sender || {})
+      if (!verifiedSender.success) {
+        return { error: verifiedSender.code }
+      }
+
+      const validatedPayload = validatePublicationInspectPayloadV3(
+        message.payload,
+        message.requestId,
+      )
+      if (!validatedPayload.success) {
+        return { error: validatedPayload.code }
+      }
+
+      const extensionVersion = chrome.runtime.getManifest().version
+      const adapter = await getAdapter(validatedPayload.data.platform)
+      return {
+        publicationInspectResultV3: await runPublicationInspectionV3(
+          validatedPayload.data,
+          adapter,
+          extensionVersion,
         ),
       }
     }

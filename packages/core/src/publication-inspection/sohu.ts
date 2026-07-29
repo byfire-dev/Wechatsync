@@ -874,7 +874,7 @@ async function inspectPublicPage(
     title: parsed.evidence.title,
     publishedAt: parsed.evidence.publishedAt,
     bodyText: parsed.evidence.bodyText,
-    ...(parsed.evidence.bodyTruncated ? { bodyTruncated: true } : {}),
+    bodyTruncated: parsed.evidence.bodyTruncated,
   })
 }
 

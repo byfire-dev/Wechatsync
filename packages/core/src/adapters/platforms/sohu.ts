@@ -3,7 +3,11 @@
  */
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
-import type { PreprocessConfig, PublishOptions } from '../types'
+import type {
+  PreprocessConfig,
+  PublicationPublishedProof,
+  PublishOptions,
+} from '../types'
 import type {
   PublicationInspectRequest,
   PublicationObservation,
@@ -161,6 +165,39 @@ export class SohuAdapter extends CodeAdapter {
         }),
       }),
     )
+  }
+
+  provePublishedObservation(
+    request: PublicationInspectRequest,
+    observation: PublicationObservation,
+  ): PublicationPublishedProof | null {
+    if (
+      request.platform !== 'sohu' ||
+      observation.platform !== 'sohu' ||
+      observation.externalAccountId !== request.externalAccountId ||
+      observation.outcome !== 'PUBLISHED' ||
+      observation.source !== 'PUBLIC_PAGE' ||
+      !observation.platformPostId ||
+      !observation.canonicalUrl ||
+      !observation.publishedAt ||
+      !observation.title?.trim() ||
+      !observation.bodyText?.trim() ||
+      typeof observation.bodyTruncated !== 'boolean' ||
+      (observation.publicAccess !== undefined &&
+        observation.publicAccess.status !== 'CONFIRMED') ||
+      observation.errorCode !== undefined ||
+      observation.errorMessage !== undefined
+    ) {
+      return null
+    }
+
+    // The inspector reaches PUBLISHED only after the anonymous canonical URL
+    // proves both the stable post ID and the bound Sohu media ID.
+    return {
+      observedAuthorExternalAccountId: observation.externalAccountId,
+      publicAccess: { status: 'CONFIRMED' },
+      bodyTruncated: observation.bodyTruncated,
+    }
   }
 
   /**

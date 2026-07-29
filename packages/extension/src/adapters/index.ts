@@ -10,8 +10,13 @@ import {
   type Article,
   type SyncResult,
 } from '@wechatsync/core'
+import {
+  PublicationPlatformV3Schema,
+  type PublicationPlatformV3,
+} from '@wechatsync/publication-contract/v3'
 import { createExtensionRuntime } from '../runtime/extension'
 import { createLogger } from '../lib/logger'
+import { deriveRegisteredPublicationInspectorPlatforms } from '../bridge/publication-capabilities-v3'
 import {
   trackSyncStart,
   trackPlatformSync,
@@ -169,6 +174,35 @@ export async function getAdapter(platformId: string): Promise<PlatformAdapter | 
  */
 export function getAllPlatformMetas() {
   return adapterRegistry.getAllMeta()
+}
+
+/**
+ * Derive the v3 publication capability surface from the adapters that are
+ * actually registered in this extension build. A platform is advertised only
+ * when its live adapter exposes both inspection and PUBLISHED proof.
+ */
+export async function getRegisteredPublicationInspectorPlatforms(): Promise<
+  PublicationPlatformV3[]
+> {
+  await initAdapters()
+
+  const candidates: Array<{
+    platformId: string
+    inspectPublication?: unknown
+    provePublishedObservation?: unknown
+  }> = []
+  for (const platformId of adapterRegistry.getRegisteredIds()) {
+    const platform = PublicationPlatformV3Schema.safeParse(platformId)
+    if (!platform.success) continue
+
+    const adapter = await adapterRegistry.get(platform.data)
+    candidates.push({
+      platformId: platform.data,
+      inspectPublication: adapter?.inspectPublication,
+      provePublishedObservation: adapter?.provePublishedObservation,
+    })
+  }
+  return deriveRegisteredPublicationInspectorPlatforms(candidates)
 }
 
 /**

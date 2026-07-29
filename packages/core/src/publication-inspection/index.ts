@@ -1,6 +1,7 @@
 export * from './types'
 export * from './url'
 export * from './sanitize'
+export * from './published-proof'
 export * from './zhihu'
 export * from './sohu'
 export * from './weixin'

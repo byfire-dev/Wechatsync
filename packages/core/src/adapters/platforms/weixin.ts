@@ -3,7 +3,11 @@
  */
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
-import type { AdapterOperationContext, PublishOptions } from '../types'
+import type {
+  AdapterOperationContext,
+  PublicationPublishedProof,
+  PublishOptions,
+} from '../types'
 import type {
   OpenPublicationDraftRequest,
   OpenPublicationDraftResult,
@@ -617,6 +621,39 @@ export class WeixinAdapter extends CodeAdapter {
           appMsgId,
         ),
       ]
+    }
+  }
+
+  provePublishedObservation(
+    request: PublicationInspectRequest,
+    observation: PublicationObservation,
+  ): PublicationPublishedProof | null {
+    if (
+      request.platform !== 'weixin' ||
+      observation.platform !== 'weixin' ||
+      observation.externalAccountId !== request.externalAccountId ||
+      observation.outcome !== 'PUBLISHED' ||
+      observation.source !== 'PUBLIC_PAGE' ||
+      !observation.platformPostId ||
+      !observation.canonicalUrl ||
+      !observation.publishedAt ||
+      !observation.title?.trim() ||
+      !observation.bodyText?.trim() ||
+      typeof observation.bodyTruncated !== 'boolean' ||
+      (observation.publicAccess !== undefined &&
+        observation.publicAccess.status !== 'CONFIRMED') ||
+      observation.errorCode !== undefined ||
+      observation.errorMessage !== undefined
+    ) {
+      return null
+    }
+
+    // The inspector binds the active account and exact appMsgId before it
+    // accepts the anonymous public page as publication evidence.
+    return {
+      observedAuthorExternalAccountId: observation.externalAccountId,
+      publicAccess: { status: 'CONFIRMED' },
+      bodyTruncated: observation.bodyTruncated,
     }
   }
 

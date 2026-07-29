@@ -5,6 +5,7 @@ import type {
   OpenPublicationDraftResult,
   PublicationInspectRequest,
   PublicationObservation,
+  PublicationPublicAccess,
 } from '../publication-inspection/types'
 
 /**
@@ -147,6 +148,17 @@ export interface AdapterOperationContext {
 }
 
 /**
+ * Adapter-attested facts required before a PUBLISHED observation can cross a
+ * stricter bridge boundary. These values must come from platform evidence, not
+ * from a bridge request fallback.
+ */
+export interface PublicationPublishedProof {
+  observedAuthorExternalAccountId: string
+  publicAccess: PublicationPublicAccess
+  bodyTruncated: boolean
+}
+
+/**
  * 平台适配器接口
  */
 export interface PlatformAdapter {
@@ -174,6 +186,15 @@ export interface PlatformAdapter {
     request: PublicationInspectRequest,
     context?: AdapterOperationContext,
   ): Promise<PublicationObservation[]>
+
+  /**
+   * Attest the author and public-access facts for one PUBLISHED observation.
+   * Bridges must fail closed when this capability is absent or returns null.
+   */
+  provePublishedObservation?(
+    request: PublicationInspectRequest,
+    observation: PublicationObservation,
+  ): PublicationPublishedProof | null
 
   /**
    * Open an authenticated draft without exposing token-bearing editor URLs

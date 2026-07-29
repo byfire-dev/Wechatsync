@@ -1,0 +1,28 @@
+{
+  "contractVersion": "3.0",
+  "requestId": "golden-weixin-published-1",
+  "platform": "weixin",
+  "externalAccountId": "gh_account",
+  "adapterVersion": "2.0.27",
+  "ok": true,
+  "observations": [
+    {
+      "observationKey": "weixin:golden-v3:PUBLIC_PAGE:PUBLISHED",
+      "platform": "weixin",
+      "externalAccountId": "gh_account",
+      "outcome": "PUBLISHED",
+      "source": "PUBLIC_PAGE",
+      "platformPostId": "9001",
+      "canonicalUrl": "https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1",
+      "publishedAt": "2026-07-29T08:00:00.000Z",
+      "observedAuthorExternalAccountId": "gh_account",
+      "publicAccess": {
+        "status": "CONFIRMED"
+      },
+      "title": "Golden WeChat article",
+      "bodyText": "Golden WeChat body",
+      "bodyTruncated": false,
+      "observedAt": "2026-07-29T08:05:00.000Z"
+    }
+  ]
+}
