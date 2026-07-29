@@ -638,6 +638,42 @@ describe('Bridge v2 inspection execution boundary', () => {
     ])
   })
 
+  it('accepts a published Zhihu result when only anonymous access is blocked', async () => {
+    await expect(
+      runPublicationInspection(request, {
+        inspectPublication: async () => [
+          {
+            observationKey: 'zhihu:42:authenticated-published',
+            platform: 'zhihu',
+            externalAccountId: 'zhihu-account',
+            outcome: 'PUBLISHED',
+            source: 'AUTHENTICATED_PUBLIC_PAGE',
+            platformPostId: '42',
+            canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+            publishedAt: '2026-07-21T11:55:00.000Z',
+            title: 'Verified authenticated article',
+            bodyText: 'Verified authenticated article body',
+            publicAccess: {
+              status: 'BLOCKED_BY_PLATFORM',
+              reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+            },
+            observedAt: '2026-07-21T12:00:00.000Z',
+          },
+        ],
+      }),
+    ).resolves.toMatchObject([
+      {
+        outcome: 'PUBLISHED',
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      },
+    ])
+  })
+
   it.each([
     [
       'an observed post ID different from the request',
@@ -666,6 +702,49 @@ describe('Bridge v2 inspection execution boundary', () => {
         platformPostId: '42',
         canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
         publishedAt: undefined,
+      },
+    ],
+    [
+      'a legacy platform-detail publication source',
+      {
+        source: 'PLATFORM_DETAIL',
+        platformPostId: '42',
+        canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+      },
+    ],
+    [
+      'an authenticated public page without a public access status',
+      {
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        platformPostId: '42',
+        canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+      },
+    ],
+    [
+      'an authenticated public page without a verified title',
+      {
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        platformPostId: '42',
+        canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+        bodyText: 'Verified authenticated article body',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      },
+    ],
+    [
+      'an authenticated public page without verified body text',
+      {
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        platformPostId: '42',
+        canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+        title: 'Verified authenticated article',
+        bodyText: '   ',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
       },
     ],
   ])('rejects published Zhihu output with %s', async (_name, overrides) => {

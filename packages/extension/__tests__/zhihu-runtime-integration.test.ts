@@ -101,8 +101,10 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     expect(observations).toHaveLength(1)
     expect(observations[0]).toMatchObject({
       outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
       platformPostId: POST_ID,
       canonicalUrl: PUBLIC_URL,
+      publicAccess: { status: 'CONFIRMED' },
     })
     expect(fetchMock).toHaveBeenCalledWith(
       'https://www.zhihu.com/api/v4/me',
@@ -114,7 +116,7 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     )
   })
 
-  it('falls back to authenticated platform evidence after an anonymous 403', async () => {
+  it('preserves publication when Zhihu blocks only the anonymous probe', async () => {
     const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
       if (url === 'https://www.zhihu.com/api/v4/me') {
         return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
@@ -132,11 +134,17 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     expect(observations).toHaveLength(1)
     expect(observations[0]).toMatchObject({
       outcome: 'PUBLISHED',
-      source: 'PLATFORM_DETAIL',
+      source: 'AUTHENTICATED_PUBLIC_PAGE',
       platformPostId: POST_ID,
       canonicalUrl: PUBLIC_URL,
       title: 'A trusted publication sample',
+      publicAccess: {
+        status: 'BLOCKED_BY_PLATFORM',
+        reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+      },
     })
+    expect(observations[0]).not.toHaveProperty('errorCode')
+    expect(observations[0]).not.toHaveProperty('errorMessage')
     expect(
       fetchMock.mock.calls
         .filter(([url]) => url === PUBLIC_URL)
@@ -172,7 +180,7 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     )
   })
 
-  it('returns a platform-detail fetch error when both public probes are forbidden', async () => {
+  it('returns an authenticated-public-page error when both probes are forbidden', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (url === 'https://www.zhihu.com/api/v4/me') {
         return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
@@ -186,7 +194,7 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     expect(observations).toHaveLength(1)
     expect(observations[0]).toMatchObject({
       outcome: 'FETCH_ERROR',
-      source: 'PLATFORM_DETAIL',
+      source: 'AUTHENTICATED_PUBLIC_PAGE',
       platformPostId: POST_ID,
       errorCode: 'ZHIHU_AUTHENTICATED_HTTP_403',
     })

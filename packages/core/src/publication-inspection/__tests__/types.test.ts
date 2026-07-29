@@ -247,6 +247,185 @@ describe('publication inspection contracts', () => {
     ).toBe(true)
   })
 
+  it('models publication and public access as separate strict dimensions', () => {
+    const published = {
+      observationKey: 'observation-zhihu-published-access',
+      platform: 'zhihu' as const,
+      externalAccountId: 'account-1',
+      outcome: 'PUBLISHED' as const,
+      platformPostId: '42',
+      canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
+      publishedAt: '2026-07-21T11:55:00+08:00',
+      title: 'Verified authenticated article',
+      bodyText: 'Verified authenticated article body',
+      observedAt: '2026-07-21T12:00:00+08:00',
+    }
+
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...published,
+        source: 'PUBLIC_PAGE',
+        publicAccess: { status: 'CONFIRMED' },
+      }).success,
+    ).toBe(true)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...published,
+        source: 'PUBLIC_PAGE',
+      }).success,
+    ).toBe(true)
+    expect(
+      PublicationObservationSchema.safeParse({
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      }).success,
+    ).toBe(true)
+
+    for (const invalid of [
+      {
+        ...published,
+        source: 'PLATFORM_DETAIL',
+      },
+      {
+        ...published,
+        source: 'PUBLISHED_LIST',
+      },
+      {
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+      },
+      {
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        publicAccess: { status: 'CONFIRMED' },
+      },
+      {
+        ...published,
+        source: 'PUBLIC_PAGE',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      },
+      {
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'UNKNOWN_ACCESS_BLOCK',
+        },
+      },
+      {
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        title: undefined,
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      },
+      {
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        bodyText: '   ',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      },
+      {
+        ...published,
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+        errorCode: 'ZHIHU_PUBLIC_ACCESS_UNVERIFIED',
+      },
+      {
+        ...published,
+        outcome: 'DRAFT_PRESENT',
+        source: 'DRAFT_DETAIL',
+        publicAccess: { status: 'CONFIRMED' },
+      },
+      {
+        ...published,
+        platform: 'sohu',
+        source: 'AUTHENTICATED_PUBLIC_PAGE',
+        publicAccess: {
+          status: 'BLOCKED_BY_PLATFORM',
+          reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+        },
+      },
+    ]) {
+      expect(PublicationObservationSchema.safeParse(invalid).success).toBe(false)
+    }
+  })
+
+  it.each([
+    [
+      'zhihu',
+      '42',
+      'https://zhuanlan.zhihu.com/p/42',
+      {},
+    ],
+    [
+      'sohu',
+      '1054312481',
+      'https://www.sohu.com/a/1054312481_120219780',
+      {},
+    ],
+    [
+      'weixin',
+      '900000001',
+      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+      {
+        title: 'Verified public article',
+        bodyText: 'Verified public body',
+        bodyTruncated: false,
+      },
+    ],
+  ] as const)(
+    'limits published %s article evidence to supported public-page sources',
+    (platform, platformPostId, canonicalUrl, platformFacts) => {
+      const published = {
+        observationKey: `observation-${platform}-published-source`,
+        platform,
+        externalAccountId:
+          platform === 'sohu' ? '120219780' : 'account-1',
+        outcome: 'PUBLISHED' as const,
+        platformPostId,
+        canonicalUrl,
+        publishedAt: '2026-07-21T11:55:00+08:00',
+        observedAt: '2026-07-21T12:00:00+08:00',
+        ...platformFacts,
+      }
+
+      expect(
+        PublicationObservationSchema.safeParse({
+          ...published,
+          source: 'PUBLIC_PAGE',
+        }).success,
+      ).toBe(true)
+      expect(
+        PublicationObservationSchema.safeParse({
+          ...published,
+          source: 'PUBLISHED_LIST',
+        }).success,
+      ).toBe(false)
+      expect(
+        PublicationObservationSchema.safeParse({
+          ...published,
+          source: 'PLATFORM_DETAIL',
+        }).success,
+      ).toBe(false)
+    },
+  )
+
   it('requires a post ID for successful Sohu lifecycle observations', () => {
     const result = PublicationObservationSchema.safeParse({
       observationKey: 'observation-sohu-draft',

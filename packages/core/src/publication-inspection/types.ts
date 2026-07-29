@@ -298,10 +298,29 @@ export const PublicationObservationSourceSchema = z.enum([
   'PLATFORM_DETAIL',
   'PUBLISHED_LIST',
   'PUBLIC_PAGE',
+  'AUTHENTICATED_PUBLIC_PAGE',
 ])
 
 export type PublicationObservationSource = z.infer<
   typeof PublicationObservationSourceSchema
+>
+
+export const PublicationPublicAccessSchema = z.discriminatedUnion('status', [
+  z
+    .object({
+      status: z.literal('CONFIRMED'),
+    })
+    .strict(),
+  z
+    .object({
+      status: z.literal('BLOCKED_BY_PLATFORM'),
+      reasonCode: z.literal('ZHIHU_ANONYMOUS_HTTP_403'),
+    })
+    .strict(),
+])
+
+export type PublicationPublicAccess = z.infer<
+  typeof PublicationPublicAccessSchema
 >
 
 export const PublicationObservationSchema = z
@@ -317,6 +336,7 @@ export const PublicationObservationSchema = z
     publishedAt: z.string().datetime({ offset: true }).optional(),
     bodyText: z.string().max(50_000).optional(),
     bodyTruncated: z.boolean().optional(),
+    publicAccess: PublicationPublicAccessSchema.optional(),
     observedAt: z.string().datetime({ offset: true }),
     errorCode: z.string().max(100).optional(),
     errorMessage: z.string().max(2_000).optional(),
@@ -336,6 +356,121 @@ export const PublicationObservationSchema = z
         code: z.ZodIssueCode.custom,
         message: 'error outcomes require errorCode',
         path: ['errorCode'],
+      })
+    }
+
+    if (value.outcome !== 'PUBLISHED' && value.publicAccess !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'only published observations can contain publicAccess',
+        path: ['publicAccess'],
+      })
+    }
+
+    if (
+      value.outcome === 'PUBLISHED' &&
+      value.source === 'PLATFORM_DETAIL'
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'published observations cannot use PLATFORM_DETAIL as public evidence',
+        path: ['source'],
+      })
+    }
+
+    if (
+      (value.platform === 'zhihu' ||
+        value.platform === 'sohu' ||
+        value.platform === 'weixin') &&
+      value.outcome === 'PUBLISHED' &&
+      value.source !== 'PUBLIC_PAGE' &&
+      !(
+        value.platform === 'zhihu' &&
+        value.source === 'AUTHENTICATED_PUBLIC_PAGE'
+      )
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'published article observations require a supported public-page evidence source',
+        path: ['source'],
+      })
+    }
+
+    if (
+      value.source === 'AUTHENTICATED_PUBLIC_PAGE' &&
+      value.platform !== 'zhihu'
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'AUTHENTICATED_PUBLIC_PAGE is currently supported only for Zhihu',
+        path: ['source'],
+      })
+    }
+
+    if (
+      value.outcome === 'PUBLISHED' &&
+      value.source === 'AUTHENTICATED_PUBLIC_PAGE'
+    ) {
+      if (value.publicAccess?.status !== 'BLOCKED_BY_PLATFORM') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'authenticated public-page publications require blocked public access evidence',
+          path: ['publicAccess'],
+        })
+      }
+      if (!value.title?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'authenticated public-page publications require a verified title',
+          path: ['title'],
+        })
+      }
+      if (!value.bodyText?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'authenticated public-page publications require verified body text',
+          path: ['bodyText'],
+        })
+      }
+      if (value.errorCode !== undefined || value.errorMessage !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'blocked public access is publication evidence, not a top-level error',
+          path: ['errorCode'],
+        })
+      }
+    }
+
+    if (
+      value.publicAccess?.status === 'CONFIRMED' &&
+      (value.outcome !== 'PUBLISHED' || value.source !== 'PUBLIC_PAGE')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'confirmed public access requires a published PUBLIC_PAGE observation',
+        path: ['publicAccess'],
+      })
+    }
+
+    if (
+      value.publicAccess?.status === 'BLOCKED_BY_PLATFORM' &&
+      (value.platform !== 'zhihu' ||
+        value.outcome !== 'PUBLISHED' ||
+        value.source !== 'AUTHENTICATED_PUBLIC_PAGE')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'blocked public access requires a published Zhihu AUTHENTICATED_PUBLIC_PAGE observation',
+        path: ['publicAccess'],
       })
     }
 
