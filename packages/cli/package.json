@@ -43,7 +43,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.13",
-    "@wechatsync/mcp-server": "workspace:*",
+    "@wechatsync/mcp-server": "1.1.0",
     "tsup": "^8.5.1",
     "typescript": "^5.7.2"
   }

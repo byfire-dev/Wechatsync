@@ -1,0 +1,71 @@
+{
+  "name": "@wechatsync/publication-contract",
+  "version": "0.1.0",
+  "description": "Versioned wire contracts shared by VibeMarket and Wechatsync",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "fixtures",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./v2": {
+      "import": {
+        "types": "./dist/v2.d.ts",
+        "default": "./dist/v2.js"
+      },
+      "require": {
+        "types": "./dist/v2.d.cts",
+        "default": "./dist/v2.cjs"
+      }
+    },
+    "./v3": {
+      "import": {
+        "types": "./dist/v3.d.ts",
+        "default": "./dist/v3.js"
+      },
+      "require": {
+        "types": "./dist/v3.d.cts",
+        "default": "./dist/v3.cjs"
+      }
+    },
+    "./fixtures/v2/*.json": "./fixtures/v2/*.json",
+    "./fixtures/v3/*.json": "./fixtures/v3/*.json"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:pack": "node scripts/pack-smoke.mjs",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.1",
+    "vitest": "^1.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
