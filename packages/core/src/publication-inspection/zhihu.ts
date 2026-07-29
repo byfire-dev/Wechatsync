@@ -4,6 +4,7 @@ import type {
   PublicationObservation,
   PublicationObservationOutcome,
   PublicationObservationSource,
+  PublicationPublicAccess,
 } from './types'
 import { normalizeHtmlText, parseTagAttributes } from './html'
 import { parsePublicationUrl } from './url'
@@ -28,6 +29,7 @@ interface ObservationDetails {
   publishedAt?: string
   bodyText?: string
   bodyTruncated?: boolean
+  publicAccess?: PublicationPublicAccess
   errorCode?: string
   errorMessage?: string
 }
@@ -37,7 +39,7 @@ interface PageContent {
   responseUrl: string
 }
 
-type PublishedPageSource = 'PUBLIC_PAGE' | 'PLATFORM_DETAIL'
+type PublishedPageSource = 'PUBLIC_PAGE' | 'AUTHENTICATED_PUBLIC_PAGE'
 
 type PageProbe =
   | { kind: 'FOUND'; page: PageContent }
@@ -583,10 +585,11 @@ async function fetchPage(
  * observation. A valid soft-not-found page returns null so the caller can
  * continue with the authenticated draft-detail probe.
  *
- * PLATFORM_DETAIL means the same canonical article page was fetched with the
- * bound account after Zhihu rejected the anonymous request. It still must
- * prove the exact post ID, canonical URL, published state, visibility,
- * timestamp, and author ID before it can become PUBLISHED.
+ * AUTHENTICATED_PUBLIC_PAGE means the same canonical article URL was fetched
+ * with the bound account after Zhihu returned HTTP 403 anonymously. The
+ * publication fact remains PUBLISHED when the authenticated page proves the
+ * complete article state, while publicAccess records that anonymous access
+ * could not be confirmed automatically.
  */
 function inspectPublishedPage(
   request: PublicationInspectRequest,
@@ -656,6 +659,13 @@ function inspectPublishedPage(
     publishedAt: decision.evidence.publishedAt,
     bodyText: decision.evidence.bodyText,
     ...(decision.evidence.bodyTruncated ? { bodyTruncated: true } : {}),
+    publicAccess:
+      source === 'PUBLIC_PAGE'
+        ? { status: 'CONFIRMED' }
+        : {
+            status: 'BLOCKED_BY_PLATFORM',
+            reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+          },
   })
 }
 
@@ -960,7 +970,7 @@ export async function inspectZhihuPublication(
   )
 
   if (publicProbe.kind === 'ACCESS_DENIED') {
-    publishedPageSource = 'PLATFORM_DETAIL'
+    publishedPageSource = 'AUTHENTICATED_PUBLIC_PAGE'
     publicProbe = await fetchPage(
       request,
       postId,

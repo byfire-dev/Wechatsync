@@ -312,6 +312,7 @@ describe('Zhihu exact-ID publication inspector', () => {
       outcome: 'PUBLISHED',
       platformPostId: POST_ID,
       canonicalUrl: PUBLIC_URL,
+      publicAccess: { status: 'CONFIRMED' },
     })
   })
 
@@ -802,7 +803,7 @@ describe('Zhihu exact-ID publication inspector', () => {
     expect(fetch).toHaveBeenCalledTimes(1)
   })
 
-  it('retries an anonymous 403 with the bound account and preserves the evidence source', async () => {
+  it('preserves publication while recording an anonymous 403 access block', async () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
@@ -814,11 +815,17 @@ describe('Zhihu exact-ID publication inspector', () => {
 
     expect(result[0]).toMatchObject({
       outcome: 'PUBLISHED',
-      source: 'PLATFORM_DETAIL',
+      source: 'AUTHENTICATED_PUBLIC_PAGE',
       platformPostId: POST_ID,
       canonicalUrl: PUBLIC_URL,
       publishedAt: PUBLISHED_AT,
+      publicAccess: {
+        status: 'BLOCKED_BY_PLATFORM',
+        reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+      },
     })
+    expect(result[0]).not.toHaveProperty('errorCode')
+    expect(result[0]).not.toHaveProperty('errorMessage')
     expect(fetch).toHaveBeenNthCalledWith(
       1,
       PUBLIC_URL,
@@ -849,7 +856,7 @@ describe('Zhihu exact-ID publication inspector', () => {
 
     expect(result[0]).toMatchObject({
       outcome: 'REVIEW_REQUIRED',
-      source: 'PLATFORM_DETAIL',
+      source: 'AUTHENTICATED_PUBLIC_PAGE',
       errorCode: 'ZHIHU_PUBLICATION_STATE_UNVERIFIED',
       platformPostId: POST_ID,
     })
@@ -866,7 +873,7 @@ describe('Zhihu exact-ID publication inspector', () => {
 
     expect(result[0]).toMatchObject({
       outcome: 'FETCH_ERROR',
-      source: 'PLATFORM_DETAIL',
+      source: 'AUTHENTICATED_PUBLIC_PAGE',
       errorCode: 'ZHIHU_AUTHENTICATED_HTTP_403',
       platformPostId: POST_ID,
     })
