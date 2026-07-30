@@ -35,6 +35,21 @@ function jsonResponse(value: unknown, status = 200): Response {
   })
 }
 
+function publicHtmlResponse(
+  body: BodyInit | null,
+  url: string,
+  redirected = false,
+): Response {
+  const response = new Response(body, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  })
+  Object.defineProperties(response, {
+    url: { value: url },
+    redirected: { value: redirected },
+  })
+  return response
+}
+
 async function inspectWith(
   fetchMock: ReturnType<typeof vi.fn>,
   events: string[],
@@ -218,11 +233,16 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
         events.push('fetch:public')
         expect(options).toMatchObject({
           credentials: 'omit',
-          redirect: 'follow',
+          redirect: 'error',
+          cache: 'no-store',
+          headers: {
+            Accept: 'text/html,application/xhtml+xml',
+          },
         })
-        return new Response(
+        return publicHtmlResponse(
           '<h1 id="activity-name">Published title</h1>' +
             '<section id="js_content">Published body</section>',
+          publicUrl,
         )
       }
       throw new Error('Draft fallback must not run')
@@ -248,6 +268,60 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
       'rule:remove',
     ])
     expect(JSON.stringify(observations)).not.toContain(TOKEN)
+  })
+
+  it('does not request a published-list short URL in the MV3 runtime', async () => {
+    const events: string[] = []
+    const shortUrl = 'https://mp.weixin.qq.com/s/ShortAbC_123'
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        events.push('fetch:auth')
+        return new Response(authHtml())
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        events.push('fetch:published-list')
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: {
+                  publish_info: {
+                    draft_msgid: POST_ID,
+                    publish_status: 200,
+                    create_time: 1_720_000_000,
+                  },
+                  appmsgex: [
+                    {
+                      itemidx: 1,
+                      content_url: shortUrl,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        })
+      }
+      throw new Error('A short public URL must not leave the service worker')
+    })
+
+    const { observations } = await inspectWith(fetchMock, events)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      source: 'PUBLISHED_LIST',
+      platformPostId: POST_ID,
+      errorCode: 'WEIXIN_PUBLISHED_EVIDENCE_INCOMPLETE',
+    })
+    expect(events).toEqual([
+      'fetch:auth',
+      'rule:add',
+      'fetch:published-list',
+      'rule:remove',
+    ])
+    expect(JSON.stringify(observations)).not.toContain(shortUrl)
   })
 
   it('rejects a conflicting request appMsgId before authentication', async () => {

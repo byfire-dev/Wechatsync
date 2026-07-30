@@ -3,7 +3,7 @@
   "requestId": "golden-weixin-published-1",
   "platform": "weixin",
   "externalAccountId": "gh_account",
-  "adapterVersion": "2.0.27",
+  "adapterVersion": "2.0.28",
   "ok": true,
   "observations": [
     {
