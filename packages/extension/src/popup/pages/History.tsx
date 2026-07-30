@@ -1,9 +1,13 @@
 import { useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, CheckCircle, XCircle, ExternalLink, Clock, Trash2, ImageIcon, Loader2 } from 'lucide-react'
+import { ArrowLeft, CheckCircle, XCircle, ExternalLink, Clock, Trash2, ImageIcon, Loader2, AlertTriangle } from 'lucide-react'
 import { useSyncStore } from '../stores/sync'
 import { Button } from '../components/ui/Button'
 import { trackPageView } from '../../lib/analytics'
+import {
+  isConfirmedSyncSuccess,
+  isSyncReviewRequired,
+} from '../../lib/sync-outcome'
 
 export function HistoryPage() {
   const navigate = useNavigate()
@@ -93,7 +97,9 @@ export function HistoryPage() {
       <div className="flex-1 overflow-auto space-y-3">
         {history.map((item) => {
           const results = item.results || []
-          const successCount = results.filter(r => r.success).length
+          const successCount = results.filter(isConfirmedSyncSuccess).length
+          const reviewRequiredCount =
+            results.filter(isSyncReviewRequired).length
           const failedCount = results.filter(r => !r.success).length
 
           return (
@@ -151,6 +157,12 @@ export function HistoryPage() {
                             <span>{failedCount} 失败</span>
                           </div>
                         )}
+                        {reviewRequiredCount > 0 && (
+                          <div className="flex items-center gap-1 text-amber-600">
+                            <AlertTriangle className="w-3.5 h-3.5" />
+                            <span>{reviewRequiredCount} 待核验</span>
+                          </div>
+                        )}
                       </>
                     )}
                   </div>
@@ -162,17 +174,25 @@ export function HistoryPage() {
                         key={result.platform}
                         className={`
                           inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs
-                          ${result.success
-                            ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-                            : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
-                          }
-                        `}
-                        title={!result.success && result.error ? result.error : undefined}
+                           ${isSyncReviewRequired(result)
+                             ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+                             : result.success
+                             ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                             : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                           }
+                         `}
+                        title={
+                          (!result.success || isSyncReviewRequired(result)) &&
+                          result.error
+                            ? result.error
+                            : undefined
+                        }
                       >
                         <span>{result.platformName || result.platform}</span>
-                        {!result.success && result.error && (
+                        {(!result.success || isSyncReviewRequired(result)) &&
+                          result.error && (
                           <span className="opacity-60 truncate max-w-[80px]">: {result.error}</span>
-                        )}
+                          )}
                         {result.postUrl && (
                           <a
                             href={result.postUrl}

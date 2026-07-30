@@ -2,10 +2,26 @@ import {
   normalizeWeixinAppMsgId,
   sanitizeSyncResultForBoundary,
 } from '@wechatsync/core/publication-inspection'
+import { normalizeAdapterExternalAccountId } from '@wechatsync/core'
+import type { SyncResult, SyncResultOutcome } from '@wechatsync/core'
 
 export interface LegacyEditResponse {
   draftLink?: string
   postId?: string
+}
+
+export const LEGACY_OUTCOME_UNKNOWN_MESSAGE =
+  '平台写入结果尚未确认；请人工核验，勿重复提交'
+
+export interface LegacySyncAccountUpdate {
+  status: 'done' | 'failed'
+  msg?: string
+  error?: string
+  editResp: LegacyEditResponse | null
+  outcome?: SyncResultOutcome
+  retryable?: boolean
+  requestedExternalAccountId?: string
+  observedExternalAccountId?: string
 }
 
 function boundedPostId(value: unknown, platform: unknown): string | undefined {
@@ -48,5 +64,64 @@ export function toLegacyEditResponse(
   return {
     ...(draftLink ? { draftLink } : {}),
     ...(postId ? { postId } : {}),
+  }
+}
+
+export function getLegacySyncResultRoutingAccountId(
+  value: unknown,
+): string | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined
+  }
+
+  const result = value as Record<string, unknown>
+  if (
+    Object.prototype.hasOwnProperty.call(
+      result,
+      'requestedExternalAccountId',
+    )
+  ) {
+    return (
+      normalizeAdapterExternalAccountId(
+        result.requestedExternalAccountId,
+      ) ?? undefined
+    )
+  }
+  return (
+    normalizeAdapterExternalAccountId(result.externalAccountId) ??
+    undefined
+  )
+}
+
+/**
+ * Preserve a confirmed platform write in the legacy API while making the
+ * account-verification uncertainty and no-retry policy explicit.
+ */
+export function toLegacySyncAccountUpdate(
+  result: SyncResult,
+): LegacySyncAccountUpdate {
+  const outcomeUnknown = result.outcome === 'OUTCOME_UNKNOWN'
+  const requestedExternalAccountId = normalizeAdapterExternalAccountId(
+    result.requestedExternalAccountId,
+  )
+  const observedExternalAccountId = normalizeAdapterExternalAccountId(
+    result.observedExternalAccountId,
+  )
+
+  return {
+    status: result.success ? 'done' : 'failed',
+    ...(outcomeUnknown ? { msg: LEGACY_OUTCOME_UNKNOWN_MESSAGE } : {}),
+    ...(result.error ? { error: result.error } : {}),
+    editResp: toLegacyEditResponse(result),
+    ...(result.outcome ? { outcome: result.outcome } : {}),
+    ...(typeof result.retryable === 'boolean'
+      ? { retryable: result.retryable }
+      : {}),
+    ...(requestedExternalAccountId
+      ? { requestedExternalAccountId }
+      : {}),
+    ...(observedExternalAccountId
+      ? { observedExternalAccountId }
+      : {}),
   }
 }

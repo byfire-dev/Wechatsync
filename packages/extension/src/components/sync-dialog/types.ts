@@ -18,13 +18,21 @@ export interface SyncResult {
   platform: string
   platformName?: string
   success: boolean
+  outcome?: 'SUCCEEDED' | 'FAILED' | 'OUTCOME_UNKNOWN'
+  retryable?: boolean
   postUrl?: string
   draftOnly?: boolean
   message?: string
   error?: string
 }
 
-export type SyncStage = 'starting' | 'uploading_images' | 'saving' | 'completed' | 'failed'
+export type SyncStage =
+  | 'starting'
+  | 'uploading_images'
+  | 'saving'
+  | 'completed'
+  | 'review_required'
+  | 'failed'
 
 export interface PlatformProgress {
   platform: string
