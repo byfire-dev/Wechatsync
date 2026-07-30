@@ -57,6 +57,7 @@ import {
   LEGACY_OUTCOME_UNKNOWN_MESSAGE,
   toLegacyEditResponse,
   toLegacySyncAccountUpdate,
+  toLegacyTerminalDetailAccountUpdate,
 } from '../bridge/sync-result'
 
 const logger = createLogger('Wechatsync')
@@ -431,7 +432,10 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
             candidate.externalAccountId === progress.externalAccountId),
       );
       if (account) {
-        if (progress.stage === 'review_required') {
+        const terminalUpdate = toLegacyTerminalDetailAccountUpdate(progress)
+        if (terminalUpdate) {
+          Object.assign(account, terminalUpdate)
+        } else if (progress.stage === 'review_required') {
           account.status = 'done';
           account.outcome = 'OUTCOME_UNKNOWN';
           account.retryable = false;

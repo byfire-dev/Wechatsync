@@ -5,6 +5,7 @@ import {
   LEGACY_OUTCOME_UNKNOWN_MESSAGE,
   toLegacyEditResponse,
   toLegacySyncAccountUpdate,
+  toLegacyTerminalDetailAccountUpdate,
 } from '../src/bridge/sync-result'
 
 describe('toLegacyEditResponse', () => {
@@ -95,6 +96,30 @@ describe('toLegacyEditResponse', () => {
       requestedExternalAccountId: '120219781',
       observedExternalAccountId: '120000002',
     })
+
+    const firstTerminalUpdate = toLegacyTerminalDetailAccountUpdate({
+      platform: 'sohu',
+      stage: 'review_required',
+      error: result.error,
+      result,
+    })
+    expect(firstTerminalUpdate).toMatchObject({
+      status: 'done',
+      outcome: 'OUTCOME_UNKNOWN',
+      retryable: false,
+      requestedExternalAccountId: '120219781',
+      observedExternalAccountId: '120000002',
+      editResp: {
+        draftLink: 'https://www.sohu.com/a/991_120000002',
+        postId: '991',
+      },
+    })
+
+    // SYNC_PROGRESS follows this detail event. The first terminal update must
+    // already carry the same account evidence a first-terminal consumer locks.
+    expect(firstTerminalUpdate).toMatchObject(
+      toLegacySyncAccountUpdate(result),
+    )
   })
 
   it('drops unsafe account identities at the page projection boundary', () => {

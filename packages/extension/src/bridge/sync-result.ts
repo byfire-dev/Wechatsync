@@ -24,6 +24,52 @@ export interface LegacySyncAccountUpdate {
   observedExternalAccountId?: string
 }
 
+/**
+ * SYNC_DETAIL_PROGRESS is emitted before the aggregate SYNC_PROGRESS event.
+ * Project the complete result evidence into that first terminal update so
+ * consumers that freeze the first terminal state cannot lose account mismatch
+ * facts.
+ */
+export function toLegacyTerminalDetailAccountUpdate(
+  progress: unknown,
+): LegacySyncAccountUpdate | null {
+  if (
+    typeof progress !== 'object' ||
+    progress === null ||
+    Array.isArray(progress)
+  ) {
+    return null
+  }
+  const detail = progress as Record<string, unknown>
+  const stage = detail.stage
+  if (
+    (stage !== 'review_required' &&
+      stage !== 'completed' &&
+      stage !== 'failed') ||
+    typeof detail.result !== 'object' ||
+    detail.result === null ||
+    Array.isArray(detail.result)
+  ) {
+    return null
+  }
+
+  const update = toLegacySyncAccountUpdate(detail.result as SyncResult)
+  return {
+    ...update,
+    status: stage === 'failed' ? 'failed' : 'done',
+    ...(stage === 'failed'
+      ? { outcome: 'FAILED', editResp: null }
+      : stage === 'review_required'
+        ? {
+            outcome: 'OUTCOME_UNKNOWN',
+            retryable: false,
+            msg: LEGACY_OUTCOME_UNKNOWN_MESSAGE,
+          }
+        : { msg: undefined }),
+    ...(typeof detail.error === 'string' ? { error: detail.error } : {}),
+  }
+}
+
 function boundedPostId(value: unknown, platform: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   if (platform === 'weixin') {
