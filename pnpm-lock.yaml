@@ -80,7 +80,7 @@ importers:
         specifier: ^8.5.13
         version: 8.18.1
       '@wechatsync/mcp-server':
-        specifier: workspace:*
+        specifier: 1.1.0
         version: link:../mcp-server
       tsup:
         specifier: ^8.5.1
@@ -94,6 +94,9 @@ importers:
       '@types/marked':
         specifier: ^6.0.0
         version: 6.0.0
+      '@wechatsync/publication-contract':
+        specifier: 0.1.0
+        version: link:../publication-contract
       hast-util-to-string:
         specifier: ^3.0.0
         version: 3.0.1
@@ -171,7 +174,7 @@ importers:
   packages/extension:
     dependencies:
       '@wechatsync/core':
-        specifier: workspace:*
+        specifier: 2.0.0
         version: link:../core
       clsx:
         specifier: ^2.0.0
@@ -268,6 +271,19 @@ importers:
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
+
+  packages/publication-contract:
+    dependencies:
+      zod:
+        specifier: ^3.22.4
+        version: 3.25.76
+    devDependencies:
+      tsup:
+        specifier: ^8.0.1
+        version: 8.5.1(jiti@1.21.7)(postcss@8.5.6)(typescript@5.9.3)(yaml@2.8.2)
+      vitest:
+        specifier: ^1.1.0
+        version: 1.6.1(@types/node@22.19.7)
 
 packages:
 

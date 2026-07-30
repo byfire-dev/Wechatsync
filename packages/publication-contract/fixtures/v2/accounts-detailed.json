@@ -1,0 +1,22 @@
+{
+  "accounts": [
+    {
+      "platform": "zhihu",
+      "externalAccountId": "zhihu-user-1",
+      "displayName": "Golden Zhihu account",
+      "homepage": "https://www.zhihu.com/people/zhihu-user-1",
+      "capabilities": [
+        "account_identity",
+        "publication_inspect",
+        "public_url"
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "platform": "zhihu",
+      "status": "AUTHENTICATED",
+      "source": "EXTENSION"
+    }
+  ]
+}

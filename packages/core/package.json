@@ -35,6 +35,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@wechatsync/publication-contract": "0.1.0",
     "@types/marked": "^6.0.0",
     "jszip": "^3.10.1",
     "hast-util-to-string": "^3.0.0",

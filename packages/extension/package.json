@@ -15,7 +15,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@wechatsync/core": "workspace:*",
+    "@wechatsync/core": "2.0.0",
     "clsx": "^2.0.0",
     "defuddle": "^0.14.0",
     "js-md5": "^0.8.3",

@@ -1,5 +1,7 @@
 packages:
   - packages/*
 
+linkWorkspacePackages: true
+
 ignoredBuiltDependencies:
   - esbuild

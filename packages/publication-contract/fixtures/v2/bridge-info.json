@@ -1,0 +1,12 @@
+{
+  "apiVersion": "2.0",
+  "extensionVersion": "2.0.26",
+  "capabilities": [
+    "account_identity",
+    "draft_open",
+    "full_sync_result",
+    "publication_inspect",
+    "published_list",
+    "public_url"
+  ]
+}
