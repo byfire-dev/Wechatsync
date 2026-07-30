@@ -52,7 +52,7 @@ describe("publication contract conformance fixtures", () => {
     expect(PublicationBridgeInfoV3Schema.parse(value)).toEqual(value);
   });
 
-  it.each(["zhihu", "sohu", "weixin"])(
+  it.each(["zhihu", "toutiao", "sohu", "weixin"])(
     "accepts the strict v3 %s published fixture",
     (platform) => {
       const value = fixture(`v3/${platform}-published.json`);

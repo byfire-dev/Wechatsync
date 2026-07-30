@@ -29,7 +29,8 @@ UI code.
 - Platform capability descriptors carry both `contractVersion` and
   `adapterVersion`; consumers must still apply their own rollout allowlist.
 - The extension derives descriptors from live registered inspectors. The
-  current v3 surface is Zhihu, Sohu, and WeChat; Toutiao is not advertised.
+  current v3 surface is Zhihu, Toutiao, Sohu, and WeChat. Bridge v2 remains
+  frozen and does not advertise Toutiao publication inspection.
 
 Golden JSON fixtures under `fixtures/` are part of the compatibility contract.
 Any producer or consumer implementation should parse the same fixtures in its

@@ -1,0 +1,28 @@
+{
+  "contractVersion": "3.0",
+  "requestId": "golden-toutiao-published-1",
+  "platform": "toutiao",
+  "externalAccountId": "toutiao-user-1",
+  "adapterVersion": "2.0.29",
+  "ok": true,
+  "observations": [
+    {
+      "observationKey": "toutiao:7522222222222222222:PUBLIC_PAGE:PUBLISHED",
+      "platform": "toutiao",
+      "externalAccountId": "toutiao-user-1",
+      "outcome": "PUBLISHED",
+      "source": "PUBLIC_PAGE",
+      "platformPostId": "7411111111111111111",
+      "canonicalUrl": "https://www.toutiao.com/article/7522222222222222222/",
+      "publishedAt": "2026-07-29T08:00:00.000Z",
+      "observedAuthorExternalAccountId": "toutiao-user-1",
+      "publicAccess": {
+        "status": "CONFIRMED"
+      },
+      "title": "Golden Toutiao article",
+      "bodyText": "Golden Toutiao body",
+      "bodyTruncated": false,
+      "observedAt": "2026-07-29T08:05:00.000Z"
+    }
+  ]
+}
