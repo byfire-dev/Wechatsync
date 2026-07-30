@@ -6,9 +6,45 @@ import type {
   PlatformMeta,
   SyncResult,
 } from "../../types";
-import type { PublishOptions } from "../types";
+import type {
+  AdapterAccountProbe,
+  AdapterOperationContext,
+  PublicationPublishedProof,
+  PublishOptions,
+} from "../types";
+import {
+  adapterAccountSelectionErrorMessage,
+  normalizeAdapterAccountBinding,
+  resolveAdapterAccountBinding,
+} from "../account-binding";
 import { createLogger } from "../../lib/logger";
 import { parseMarkdownImages } from "../../lib/markdown-images";
+import {
+  PublicationInspectionObservationSchema,
+  type PublicationInspectionObservation,
+  type PublicationInspectionRequest,
+} from "../../publication-inspection/domain";
+import {
+  TOUTIAO_ANONYMOUS_BLOCKED_REASONS,
+  TOUTIAO_ANONYMOUS_HTTP_404_REASON,
+  TOUTIAO_ANONYMOUS_SOFT_404_REASON,
+  TOUTIAO_PUBLIC_PAGE_MAX_BYTES,
+  TOUTIAO_PUBLISHED_LIST_URL,
+  isToutiaoHtmlContentType,
+  isToutiaoSoft404Html,
+  normalizeToutiaoPublicArticleUrl,
+  parseToutiaoPublicArticleHtml,
+  resolveToutiaoPgcId,
+  scanToutiaoPublishedListInPage,
+  validateToutiaoPublishedListScanResult,
+  type ToutiaoPublicArticleHtmlResult,
+  type ToutiaoPublishedListScanResult,
+} from "../../publication-inspection/toutiao";
+import {
+  discardResponseBody,
+  fetchWithValidatedNoRedirects,
+  readBoundedResponseText,
+} from "../../lib/safe-http";
 import {
   TOUTIAO_ENDPOINTS,
   TOUTIAO_MAX_IMAGE_BYTES,
@@ -36,6 +72,20 @@ import {
 const logger = createLogger("Toutiao");
 
 class ToutiaoAdapterError extends Error {}
+
+type ToutiaoPublicPageFetchResult =
+  | {
+      success: true;
+      article: Extract<ToutiaoPublicArticleHtmlResult, { success: true }>;
+    }
+  | {
+      success: false;
+      anonymousNotFound: boolean;
+      blockedReasonCode?: (typeof TOUTIAO_ANONYMOUS_BLOCKED_REASONS)[number];
+      outcome: "FETCH_ERROR" | "REVIEW_REQUIRED";
+      errorCode: string;
+      errorMessage: string;
+    };
 
 function classifyToutiaoInvalidBody(
   contentType: string | null,
@@ -94,7 +144,13 @@ export class ToutiaoAdapter extends CodeAdapter {
     name: "头条",
     icon: "https://mp.toutiao.com/favicon.ico",
     homepage: TOUTIAO_ROUTES.editor,
-    capabilities: ["article", "draft", "image_upload", "cover"],
+    capabilities: [
+      "article",
+      "draft",
+      "image_upload",
+      "cover",
+      "account_binding",
+    ],
   };
 
   readonly preprocessConfig = {
@@ -167,8 +223,15 @@ export class ToutiaoAdapter extends CodeAdapter {
     };
   }
 
-  private async probeAccountInExtension(): Promise<AuthResult> {
+  private async probeAccountInExtension(
+    context?: AdapterOperationContext,
+  ): Promise<AuthResult> {
+    context?.signal?.throwIfAborted();
     const controller = new AbortController();
+    const abortFromContext = () => controller.abort();
+    context?.signal?.addEventListener("abort", abortFromContext, {
+      once: true,
+    });
     const timeoutId = setTimeout(() => controller.abort(), 3_000);
     try {
       return await this.withHeaderRules(this.HEADER_RULES, async () => {
@@ -216,6 +279,7 @@ export class ToutiaoAdapter extends CodeAdapter {
         return this.authenticated(parsed.value, "EXTENSION");
       });
     } catch {
+      context?.signal?.throwIfAborted();
       logger.debug("Extension account status request failed");
       return this.authFailure(
         controller.signal.aborted ? "TIMEOUT" : "NETWORK_ERROR",
@@ -224,6 +288,7 @@ export class ToutiaoAdapter extends CodeAdapter {
     } finally {
       controller.abort();
       clearTimeout(timeoutId);
+      context?.signal?.removeEventListener("abort", abortFromContext);
     }
   }
 
@@ -309,7 +374,9 @@ export class ToutiaoAdapter extends CodeAdapter {
 
   private async probeAccountInMainWorld(
     primary: AuthResult,
+    context?: AdapterOperationContext,
   ): Promise<AuthResult> {
+    context?.signal?.throwIfAborted();
     if (!this.runtime.tabs) {
       return this.authFailure(
         "PAGE_CONTEXT_UNAVAILABLE",
@@ -335,8 +402,10 @@ export class ToutiaoAdapter extends CodeAdapter {
         ToutiaoPageAccountProbeResult | undefined,
         []
       >(trustedTab.id, probeToutiaoAccountInPage, []);
+      context?.signal?.throwIfAborted();
       return this.normalizePageAccountProbe(result, primary);
     } catch {
+      context?.signal?.throwIfAborted();
       logger.debug("MAIN-world account status request failed");
       return this.authFailure(
         "UNKNOWN_ERROR",
@@ -346,30 +415,639 @@ export class ToutiaoAdapter extends CodeAdapter {
     }
   }
 
-  async checkAuth(): Promise<AuthResult> {
-    const primary = await this.probeAccountInExtension();
+  async checkAuth(context?: AdapterOperationContext): Promise<AuthResult> {
+    const primary = await this.probeAccountInExtension(context);
     if (primary.isAuthenticated) {
       return primary;
     }
 
-    return this.probeAccountInMainWorld(primary);
+    return this.probeAccountInMainWorld(primary, context);
+  }
+
+  async probeAccounts(
+    context?: AdapterOperationContext,
+  ): Promise<AdapterAccountProbe> {
+    const auth = await this.checkAuth(context);
+    if (!auth.isAuthenticated) {
+      return auth.probeStatus === "NOT_AUTHENTICATED"
+        ? { status: "NOT_AUTHENTICATED", accounts: [] }
+        : {
+            status: "PROBE_FAILED",
+            accounts: [],
+            errorCode: auth.probeErrorCode ?? "UNKNOWN_ERROR",
+          };
+    }
+
+    const externalAccountId = normalizeToutiaoId(auth.userId);
+    const displayName =
+      typeof auth.username === "string"
+        ? auth.username.replace(/\s+/g, " ").trim()
+        : "";
+    if (
+      !externalAccountId ||
+      displayName.length === 0 ||
+      displayName.length > 500
+    ) {
+      return {
+        status: "PROBE_FAILED",
+        accounts: [],
+        errorCode: externalAccountId
+          ? "RESPONSE_SCHEMA_MISMATCH"
+          : "ACCOUNT_ID_MISSING",
+      };
+    }
+
+    return {
+      status: "AUTHENTICATED",
+      accounts: [
+        {
+          externalAccountId,
+          displayName,
+          ...(auth.avatar ? { avatarUrl: auth.avatar } : {}),
+        },
+      ],
+    };
+  }
+
+  private createInspectionError(
+    request: PublicationInspectionRequest,
+    outcome:
+      | "ACCOUNT_MISMATCH"
+      | "LOGIN_REQUIRED"
+      | "UNSUPPORTED"
+      | "FETCH_ERROR"
+      | "PARSE_ERROR"
+      | "REVIEW_REQUIRED",
+    errorCode: string,
+    errorMessage: string,
+    platformPostId?: string,
+    source: PublicationInspectionObservation["source"] = "PUBLISHED_LIST",
+    publicItemId?: string,
+  ): PublicationInspectionObservation {
+    return PublicationInspectionObservationSchema.parse({
+      observationKey: `toutiao:${request.requestId}:${source
+        .toLowerCase()
+        .replace(/_/g, "-")}`,
+      platform: "toutiao",
+      externalAccountId: request.externalAccountId,
+      outcome,
+      source,
+      ...(platformPostId ? { platformPostId } : {}),
+      observedAt: new Date().toISOString(),
+      errorCode,
+      errorMessage,
+      ...(publicItemId ? { internalEvidence: { publicItemId } } : {}),
+    });
+  }
+
+  private async scanPublishedList(
+    pgcId: string,
+    expectedTitle: string,
+    limit: number,
+    context?: AdapterOperationContext,
+  ): Promise<ToutiaoPublishedListScanResult> {
+    const tabs = this.runtime.tabs;
+    if (!tabs?.remove) {
+      return {
+        success: false,
+        errorCode: "TOUTIAO_PUBLISHED_DOM_UNAVAILABLE",
+      };
+    }
+
+    let createdTabId: number | undefined;
+    const raceWithAbort = async <T>(operation: Promise<T>): Promise<T> => {
+      const signal = context?.signal;
+      if (!signal) return operation;
+      signal.throwIfAborted();
+      return new Promise<T>((resolve, reject) => {
+        const abort = () =>
+          reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+        signal.addEventListener("abort", abort, { once: true });
+        operation.then(
+          (value) => {
+            signal.removeEventListener("abort", abort);
+            resolve(value);
+          },
+          (error) => {
+            signal.removeEventListener("abort", abort);
+            reject(error);
+          },
+        );
+      });
+    };
+    try {
+      context?.signal?.throwIfAborted();
+      const tab = await tabs.create(TOUTIAO_PUBLISHED_LIST_URL, false);
+      createdTabId = tab.id;
+      context?.signal?.throwIfAborted();
+      await raceWithAbort(tabs.waitForLoad(tab.id, 30_000));
+      context?.signal?.throwIfAborted();
+      const result = await raceWithAbort(
+        tabs.executeScript<
+          ToutiaoPublishedListScanResult | undefined,
+          [string, string, number, number]
+        >(
+          tab.id,
+          scanToutiaoPublishedListInPage,
+          [pgcId, expectedTitle, limit, 10_000],
+          { world: "ISOLATED" },
+        ),
+      );
+      context?.signal?.throwIfAborted();
+      return (
+        validateToutiaoPublishedListScanResult(result, pgcId) ?? {
+          success: false,
+          errorCode: "TOUTIAO_PUBLISHED_SCAN_INVALID",
+        }
+      );
+    } catch {
+      context?.signal?.throwIfAborted();
+      return {
+        success: false,
+        errorCode: "TOUTIAO_PUBLISHED_DOM_UNAVAILABLE",
+      };
+    } finally {
+      if (createdTabId !== undefined) {
+        try {
+          await tabs.remove(createdTabId);
+        } catch {
+          // The inspection result stays fail-closed if Chrome already removed
+          // the short-lived background tab.
+        }
+      }
+    }
+  }
+
+  private async fetchPublicArticlePage(
+    publicArticleUrl: string,
+    publicItemId: string,
+    displayName: string,
+    credentials: "omit" | "include",
+    context?: AdapterOperationContext,
+  ): Promise<ToutiaoPublicPageFetchResult> {
+    context?.signal?.throwIfAborted();
+    const fetched = await fetchWithValidatedNoRedirects({
+      fetch: (url, options) => this.runtime.fetch(url, options),
+      initialUrl: publicArticleUrl,
+      validateUrl: (url) => normalizeToutiaoPublicArticleUrl(url, publicItemId),
+      request: {
+        method: "GET",
+        credentials,
+        cache: "no-store",
+        signal: context?.signal,
+        headers: {
+          Accept: "text/html,application/xhtml+xml",
+        },
+      },
+    });
+    if (!fetched.success) {
+      context?.signal?.throwIfAborted();
+      return {
+        success: false,
+        anonymousNotFound: false,
+        outcome: "FETCH_ERROR",
+        errorCode: "TOUTIAO_PUBLIC_PAGE_FETCH_ERROR",
+        errorMessage: "The Toutiao public-page request failed.",
+      };
+    }
+
+    const response = fetched.response;
+    if (response.status === 404) {
+      await discardResponseBody(response);
+      return {
+        success: false,
+        anonymousNotFound: credentials === "omit",
+        ...(credentials === "omit"
+          ? { blockedReasonCode: TOUTIAO_ANONYMOUS_HTTP_404_REASON }
+          : {}),
+        outcome: "REVIEW_REQUIRED",
+        errorCode:
+          credentials === "omit"
+            ? TOUTIAO_ANONYMOUS_HTTP_404_REASON
+            : "TOUTIAO_AUTHENTICATED_HTTP_404",
+        errorMessage:
+          credentials === "omit"
+            ? "The anonymous Toutiao page returned HTTP 404."
+            : "The authenticated Toutiao page returned HTTP 404.",
+      };
+    }
+    if (!response.ok) {
+      await discardResponseBody(response);
+      return {
+        success: false,
+        anonymousNotFound: false,
+        outcome: "REVIEW_REQUIRED",
+        errorCode: "TOUTIAO_PUBLIC_PAGE_HTTP_ERROR",
+        errorMessage: `The Toutiao public page returned HTTP ${response.status}.`,
+      };
+    }
+    if (!isToutiaoHtmlContentType(response.headers)) {
+      await discardResponseBody(response);
+      return {
+        success: false,
+        anonymousNotFound: false,
+        outcome: "REVIEW_REQUIRED",
+        errorCode: "TOUTIAO_PUBLIC_CONTENT_TYPE_INVALID",
+        errorMessage: "The Toutiao public page did not return HTML.",
+      };
+    }
+
+    const body = await readBoundedResponseText(
+      response,
+      TOUTIAO_PUBLIC_PAGE_MAX_BYTES,
+    );
+    if (!body.success) {
+      context?.signal?.throwIfAborted();
+      return {
+        success: false,
+        anonymousNotFound: false,
+        outcome: "REVIEW_REQUIRED",
+        errorCode:
+          body.errorCode === "SAFE_RESPONSE_BODY_TOO_LARGE"
+            ? "TOUTIAO_PUBLIC_BODY_TOO_LARGE"
+            : "TOUTIAO_PUBLIC_BODY_READ_ERROR",
+        errorMessage: "The Toutiao public-page body could not be verified.",
+      };
+    }
+
+    if (isToutiaoSoft404Html(body.text)) {
+      return {
+        success: false,
+        anonymousNotFound: credentials === "omit",
+        ...(credentials === "omit"
+          ? { blockedReasonCode: TOUTIAO_ANONYMOUS_SOFT_404_REASON }
+          : {}),
+        outcome: "REVIEW_REQUIRED",
+        errorCode:
+          credentials === "omit"
+            ? TOUTIAO_ANONYMOUS_SOFT_404_REASON
+            : "TOUTIAO_AUTHENTICATED_SOFT_404",
+        errorMessage:
+          credentials === "omit"
+            ? "The anonymous Toutiao page returned its not-found shell."
+            : "The authenticated Toutiao page returned its not-found shell.",
+      };
+    }
+
+    const article = parseToutiaoPublicArticleHtml(
+      body.text,
+      publicItemId,
+      displayName,
+    );
+    if (!article.success) {
+      return {
+        success: false,
+        anonymousNotFound: false,
+        outcome: "REVIEW_REQUIRED",
+        errorCode: article.errorCode,
+        errorMessage: "The Toutiao public article evidence was incomplete.",
+      };
+    }
+
+    return { success: true, article };
+  }
+
+  async inspectPublication(
+    request: PublicationInspectionRequest,
+    context?: AdapterOperationContext,
+  ): Promise<PublicationInspectionObservation[]> {
+    context?.signal?.throwIfAborted();
+    if (request.platform !== "toutiao") {
+      return [
+        this.createInspectionError(
+          request,
+          "UNSUPPORTED",
+          "TOUTIAO_PLATFORM_REQUIRED",
+          "This inspector only supports Toutiao.",
+        ),
+      ];
+    }
+
+    const pgcResolution = resolveToutiaoPgcId(
+      request.draft.platformPostId,
+      request.draft.draftUrl,
+    );
+    if (!pgcResolution.success) {
+      return [
+        this.createInspectionError(
+          request,
+          "PARSE_ERROR",
+          pgcResolution.errorCode,
+          "The Toutiao draft identity is missing or inconsistent.",
+        ),
+      ];
+    }
+    const pgcId = pgcResolution.pgcId;
+
+    let probe: AdapterAccountProbe;
+    try {
+      probe = await this.probeAccounts(context);
+    } catch {
+      context?.signal?.throwIfAborted();
+      return [
+        this.createInspectionError(
+          request,
+          "FETCH_ERROR",
+          "TOUTIAO_ACCOUNT_PROBE_FAILED",
+          "The Toutiao account could not be verified.",
+          pgcId,
+        ),
+      ];
+    }
+    const selection = resolveAdapterAccountBinding(probe, {
+      externalAccountId: request.externalAccountId,
+    });
+    if (!selection.ok) {
+      const isLoggedOut = selection.errorCode === "ACCOUNT_NOT_AUTHENTICATED";
+      const isMismatch = selection.errorCode === "ACCOUNT_BINDING_NOT_FOUND";
+      return [
+        this.createInspectionError(
+          request,
+          isLoggedOut
+            ? "LOGIN_REQUIRED"
+            : isMismatch
+              ? "ACCOUNT_MISMATCH"
+              : "FETCH_ERROR",
+          isLoggedOut
+            ? "TOUTIAO_LOGIN_REQUIRED"
+            : isMismatch
+              ? "TOUTIAO_ACCOUNT_MISMATCH"
+              : "TOUTIAO_ACCOUNT_PROBE_FAILED",
+          isLoggedOut
+            ? "Log in to Toutiao before inspecting this publication."
+            : isMismatch
+              ? "The active Toutiao account does not match the bound account."
+              : "The Toutiao account could not be verified.",
+          pgcId,
+        ),
+      ];
+    }
+
+    const scan = await this.scanPublishedList(
+      pgcId,
+      request.articleHint.title,
+      request.limit,
+      context,
+    );
+    if (!scan.success) {
+      return [
+        this.createInspectionError(
+          request,
+          "REVIEW_REQUIRED",
+          scan.errorCode,
+          "The Toutiao published list could not be verified completely.",
+          pgcId,
+        ),
+      ];
+    }
+    if (scan.match === "REVIEW_REQUIRED") {
+      return [
+        this.createInspectionError(
+          request,
+          "REVIEW_REQUIRED",
+          scan.errorCode,
+          "The Toutiao published-list evidence requires manual review.",
+          pgcId,
+        ),
+      ];
+    }
+    if (scan.match === "NOT_FOUND") {
+      return [
+        PublicationInspectionObservationSchema.parse({
+          observationKey: `toutiao:${request.requestId}:published-list`,
+          platform: "toutiao",
+          externalAccountId: request.externalAccountId,
+          outcome: "NOT_FOUND",
+          source: "PUBLISHED_LIST",
+          platformPostId: pgcId,
+          observedAt: new Date().toISOString(),
+          internalEvidence: { scanComplete: true },
+        }),
+      ];
+    }
+
+    const anonymousPage = await this.fetchPublicArticlePage(
+      scan.publicArticleUrl,
+      scan.publicItemId,
+      selection.account.displayName,
+      "omit",
+      context,
+    );
+    let page = anonymousPage;
+    let source: "PUBLIC_PAGE" | "AUTHENTICATED_PUBLIC_PAGE" = "PUBLIC_PAGE";
+    let blockedReasonCode:
+      | (typeof TOUTIAO_ANONYMOUS_BLOCKED_REASONS)[number]
+      | undefined;
+    if (!anonymousPage.success && anonymousPage.anonymousNotFound) {
+      blockedReasonCode = anonymousPage.blockedReasonCode;
+      if (!blockedReasonCode) {
+        return [
+          this.createInspectionError(
+            request,
+            "REVIEW_REQUIRED",
+            "TOUTIAO_ANONYMOUS_BLOCK_REASON_MISSING",
+            "The anonymous Toutiao access result was incomplete.",
+            pgcId,
+            "PUBLIC_PAGE",
+            scan.publicItemId,
+          ),
+        ];
+      }
+      page = await this.fetchPublicArticlePage(
+        scan.publicArticleUrl,
+        scan.publicItemId,
+        selection.account.displayName,
+        "include",
+        context,
+      );
+      source = "AUTHENTICATED_PUBLIC_PAGE";
+    }
+    if (!page.success) {
+      return [
+        this.createInspectionError(
+          request,
+          page.outcome,
+          page.errorCode,
+          page.errorMessage,
+          pgcId,
+          source,
+          scan.publicItemId,
+        ),
+      ];
+    }
+
+    const expectedTitle = request.articleHint.title.replace(/\s+/g, " ").trim();
+    if (page.article.title !== expectedTitle) {
+      return [
+        this.createInspectionError(
+          request,
+          "REVIEW_REQUIRED",
+          "TOUTIAO_PUBLIC_TITLE_MISMATCH",
+          "The Toutiao public article title does not match the requested article.",
+          pgcId,
+          source,
+          scan.publicItemId,
+        ),
+      ];
+    }
+    const publishedAt = Date.parse(page.article.publishedAt);
+    const publishedAfter = request.articleHint.publishedAfter
+      ? Date.parse(request.articleHint.publishedAfter)
+      : undefined;
+    const publishedBefore = request.articleHint.publishedBefore
+      ? Date.parse(request.articleHint.publishedBefore)
+      : undefined;
+    if (
+      (publishedAfter !== undefined && publishedAt < publishedAfter) ||
+      (publishedBefore !== undefined && publishedAt > publishedBefore)
+    ) {
+      return [
+        this.createInspectionError(
+          request,
+          "REVIEW_REQUIRED",
+          "TOUTIAO_PUBLIC_TIME_MISMATCH",
+          "The Toutiao publication time is outside the requested inspection window.",
+          pgcId,
+          source,
+          scan.publicItemId,
+        ),
+      ];
+    }
+
+    return [
+      PublicationInspectionObservationSchema.parse({
+        observationKey: `toutiao:${request.requestId}:public-page`,
+        platform: "toutiao",
+        externalAccountId: request.externalAccountId,
+        outcome: "PUBLISHED",
+        source,
+        platformPostId: pgcId,
+        canonicalUrl: page.article.canonicalUrl,
+        title: page.article.title,
+        publishedAt: page.article.publishedAt,
+        bodyText: page.article.bodyText,
+        bodyTruncated: page.article.bodyTruncated,
+        publicAccess:
+          source === "PUBLIC_PAGE"
+            ? { status: "CONFIRMED" }
+            : {
+                status: "BLOCKED_BY_PLATFORM",
+                reasonCode: blockedReasonCode,
+              },
+        observedAt: new Date().toISOString(),
+        internalEvidence: {
+          publicItemId: scan.publicItemId,
+          ...(scan.scanComplete ? { scanComplete: true } : {}),
+        },
+      }),
+    ];
+  }
+
+  provePublishedObservation(
+    request: PublicationInspectionRequest,
+    observation: PublicationInspectionObservation,
+  ): PublicationPublishedProof | null {
+    const pgcResolution = resolveToutiaoPgcId(
+      request.draft.platformPostId,
+      request.draft.draftUrl,
+    );
+    const publicItemId = observation.internalEvidence?.publicItemId;
+    const canonicalUrl =
+      observation.canonicalUrl && publicItemId
+        ? normalizeToutiaoPublicArticleUrl(
+            observation.canonicalUrl,
+            publicItemId,
+          )
+        : null;
+    const normalizedObservedTitle = observation.title
+      ?.replace(/\s+/g, " ")
+      .trim();
+    const normalizedRequestedTitle = request.articleHint.title
+      .replace(/\s+/g, " ")
+      .trim();
+    const publishedAt = observation.publishedAt
+      ? Date.parse(observation.publishedAt)
+      : Number.NaN;
+    const publishedAfter = request.articleHint.publishedAfter
+      ? Date.parse(request.articleHint.publishedAfter)
+      : undefined;
+    const publishedBefore = request.articleHint.publishedBefore
+      ? Date.parse(request.articleHint.publishedBefore)
+      : undefined;
+    if (
+      request.platform !== "toutiao" ||
+      observation.platform !== "toutiao" ||
+      observation.externalAccountId !== request.externalAccountId ||
+      !pgcResolution.success ||
+      observation.outcome !== "PUBLISHED" ||
+      observation.platformPostId !== pgcResolution.pgcId ||
+      !publicItemId ||
+      !normalizeToutiaoId(publicItemId) ||
+      canonicalUrl !== observation.canonicalUrl ||
+      !observation.publishedAt ||
+      normalizedObservedTitle !== normalizedRequestedTitle ||
+      !Number.isFinite(publishedAt) ||
+      (publishedAfter !== undefined && publishedAt < publishedAfter) ||
+      (publishedBefore !== undefined && publishedAt > publishedBefore) ||
+      !observation.bodyText?.trim() ||
+      typeof observation.bodyTruncated !== "boolean" ||
+      observation.errorCode !== undefined ||
+      observation.errorMessage !== undefined
+    ) {
+      return null;
+    }
+
+    const publicAccess = observation.publicAccess;
+    const hasValidPublicEvidence =
+      (observation.source === "PUBLIC_PAGE" &&
+        publicAccess?.status === "CONFIRMED") ||
+      (observation.source === "AUTHENTICATED_PUBLIC_PAGE" &&
+        publicAccess?.status === "BLOCKED_BY_PLATFORM" &&
+        (publicAccess.reasonCode === TOUTIAO_ANONYMOUS_HTTP_404_REASON ||
+          publicAccess.reasonCode === TOUTIAO_ANONYMOUS_SOFT_404_REASON));
+    if (!hasValidPublicEvidence || !publicAccess) return null;
+
+    return {
+      observedAuthorExternalAccountId: observation.externalAccountId,
+      publicAccess,
+      bodyTruncated: observation.bodyTruncated,
+    };
   }
 
   async publish(
     article: Article,
     options?: PublishOptions,
   ): Promise<SyncResult> {
+    const requestedBinding =
+      options?.accountBinding === undefined
+        ? undefined
+        : normalizeAdapterAccountBinding(options.accountBinding);
+    let operationExternalAccountId = requestedBinding?.externalAccountId;
+
     if (options?.draftOnly === false) {
       return this.createResult(false, {
+        ...(operationExternalAccountId
+          ? { externalAccountId: operationExternalAccountId }
+          : {}),
         error: "头条适配器当前仅允许保存草稿，不支持直接发布",
       });
     }
 
     try {
-      const auth = await this.checkAuth();
-      if (!auth.isAuthenticated) {
-        throw new ToutiaoAdapterError(auth.error || "请先登录头条创作中心");
+      const selection = resolveAdapterAccountBinding(
+        await this.probeAccounts(),
+        options?.accountBinding,
+      );
+      if (!selection.ok) {
+        return this.createResult(false, {
+          ...(operationExternalAccountId
+            ? { externalAccountId: operationExternalAccountId }
+            : {}),
+          errorCode: selection.errorCode,
+          error: adapterAccountSelectionErrorMessage(selection.errorCode),
+        });
       }
+      operationExternalAccountId = selection.account.externalAccountId;
 
       let content = article.html || article.markdown || "";
       content = content
@@ -401,6 +1079,16 @@ export class ToutiaoAdapter extends CodeAdapter {
       const pageResult = await this.saveDraftInPage(payload);
 
       if (!pageResult.ok) {
+        if (pageResult.code === "OUTCOME_UNKNOWN") {
+          return this.createResult(true, {
+            externalAccountId: operationExternalAccountId,
+            outcome: "OUTCOME_UNKNOWN",
+            retryable: false,
+            draftOnly: true,
+            errorCode: "TOUTIAO_DRAFT_SAVE_OUTCOME_UNKNOWN",
+            error: this.getDraftSaveErrorMessage(pageResult),
+          });
+        }
         throw new ToutiaoAdapterError(
           this.getDraftSaveErrorMessage(pageResult),
         );
@@ -412,11 +1100,15 @@ export class ToutiaoAdapter extends CodeAdapter {
       return this.createResult(true, {
         postId: pageResult.pgcId,
         postUrl: buildToutiaoDraftUrl(pageResult.pgcId),
+        externalAccountId: operationExternalAccountId,
         draftOnly: true,
       });
     } catch (error) {
       logger.debug("Draft save failed");
       return this.createResult(false, {
+        ...(operationExternalAccountId
+          ? { externalAccountId: operationExternalAccountId }
+          : {}),
         error:
           error instanceof ToutiaoAdapterError
             ? error.message

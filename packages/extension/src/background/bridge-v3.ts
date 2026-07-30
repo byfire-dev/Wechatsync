@@ -1,9 +1,8 @@
-import type { PlatformAdapter } from "@wechatsync/core";
 import {
+  PublicationInspectionRequestSchema,
   PublicationPublishedProofSchema,
-  PublicationInspectRequestSchema,
-  type PublicationInspectRequest,
-  type PublicationObservation,
+  type PublicationInspectionObservation,
+  type PublicationInspectionRequest,
 } from "@wechatsync/core/publication-inspection";
 import {
   PUBLICATION_CONTRACT_VERSION_V3,
@@ -20,14 +19,13 @@ import {
   type PublicationPlatformV3,
 } from "@wechatsync/publication-contract/v3";
 
-import { runPublicationInspection } from "./bridge-v2";
+import {
+  runInternalPublicationInspection,
+  type PublicationInspectionRunnerFailureCode,
+  type PublicationInspectorAdapter,
+} from "./publication-inspection-runner";
 
 const INFO_PAYLOAD_KEYS = new Set<string>();
-
-type PublicationInspectorAdapter = Pick<
-  PlatformAdapter,
-  "inspectPublication" | "provePublishedObservation"
->;
 
 type V3Failure = Extract<PublicationInspectResultV3, { ok: false }>["failure"];
 
@@ -107,10 +105,10 @@ export function buildPublicationBridgeInfoV3(
   });
 }
 
-function toV2Request(
+function toInternalRequest(
   request: PublicationInspectRequestV3,
-): PublicationInspectRequest {
-  return PublicationInspectRequestSchema.parse({
+): PublicationInspectionRequest {
+  return PublicationInspectionRequestSchema.parse({
     requestId: request.requestId,
     platform: request.platform,
     externalAccountId: request.externalAccountId,
@@ -137,11 +135,8 @@ function failureResult(
 }
 
 function commandFailureFor(
-  observations: readonly PublicationObservation[],
-): V3Failure | null {
-  if (observations.length !== 1) return null;
-  const errorCode = observations[0]?.errorCode;
-
+  errorCode: PublicationInspectionRunnerFailureCode,
+): V3Failure {
   if (errorCode === "PUBLICATION_INSPECTION_TIMEOUT") {
     return {
       stage: "TIMEOUT",
@@ -160,30 +155,33 @@ function commandFailureFor(
       requiredAction: "RETRY",
     };
   }
-  if (errorCode === "INVALID_INSPECTION_RESULT") {
+  if (
+    errorCode === "INVALID_INSPECTION_RESULT" ||
+    errorCode === "INVALID_INSPECTION_REQUEST"
+  ) {
     return {
       stage: "PROTOCOL",
-      code: errorCode,
+      code:
+        errorCode === "INVALID_INSPECTION_REQUEST"
+          ? "INVALID_INSPECTION_REQUEST"
+          : "INVALID_INSPECTION_RESULT",
       retryable: false,
       message: "The publication inspector returned an invalid result.",
       requiredAction: "INSTALL_OR_UPGRADE_EXTENSION",
     };
   }
-  if (errorCode === "PUBLICATION_INSPECTION_NOT_IMPLEMENTED") {
-    return {
-      stage: "CAPABILITY",
-      code: errorCode,
-      retryable: false,
-      message: "Publication inspection is not available for this platform.",
-      requiredAction: "INSTALL_OR_UPGRADE_EXTENSION",
-    };
-  }
-  return null;
+  return {
+    stage: "CAPABILITY",
+    code: "PUBLICATION_INSPECTION_NOT_IMPLEMENTED",
+    retryable: false,
+    message: "Publication inspection is not available for this platform.",
+    requiredAction: "INSTALL_OR_UPGRADE_EXTENSION",
+  };
 }
 
 function publicAccessMatches(
-  left: NonNullable<PublicationObservation["publicAccess"]>,
-  right: NonNullable<PublicationObservation["publicAccess"]>,
+  left: NonNullable<PublicationInspectionObservation["publicAccess"]>,
+  right: NonNullable<PublicationInspectionObservation["publicAccess"]>,
 ): boolean {
   if (left.status !== right.status) return false;
   return (
@@ -194,8 +192,8 @@ function publicAccessMatches(
 }
 
 function publishedObservationV3(
-  request: PublicationInspectRequest,
-  observation: PublicationObservation,
+  request: PublicationInspectionRequest,
+  observation: PublicationInspectionObservation,
   adapter: PublicationInspectorAdapter,
 ): PublicationObservationV3 | null {
   if (
@@ -218,8 +216,7 @@ function publishedObservationV3(
   } catch {
     return null;
   }
-  const parsedProof =
-    PublicationPublishedProofSchema.safeParse(untrustedProof);
+  const parsedProof = PublicationPublishedProofSchema.safeParse(untrustedProof);
   if (!parsedProof.success) return null;
 
   const proof = parsedProof.data;
@@ -243,8 +240,7 @@ function publishedObservationV3(
     canonicalUrl: observation.canonicalUrl,
     publishedAt: observation.publishedAt,
     publicAccess: proof.publicAccess,
-    observedAuthorExternalAccountId:
-      proof.observedAuthorExternalAccountId,
+    observedAuthorExternalAccountId: proof.observedAuthorExternalAccountId,
     title: observation.title,
     bodyText: observation.bodyText,
     bodyTruncated: proof.bodyTruncated,
@@ -254,8 +250,8 @@ function publishedObservationV3(
 }
 
 function projectObservationV3(
-  request: PublicationInspectRequest,
-  observation: PublicationObservation,
+  request: PublicationInspectionRequest,
+  observation: PublicationInspectionObservation,
   adapter: PublicationInspectorAdapter,
 ): PublicationObservationV3 | null {
   if (observation.outcome === "PUBLISHED") {
@@ -343,9 +339,9 @@ export async function runPublicationInspectionV3(
     });
   }
 
-  let v2Request: PublicationInspectRequest;
+  let internalRequest: PublicationInspectionRequest;
   try {
-    v2Request = toV2Request(request);
+    internalRequest = toInternalRequest(request);
   } catch {
     return failureResult(request, adapterVersion, {
       stage: "PROTOCOL",
@@ -356,18 +352,21 @@ export async function runPublicationInspectionV3(
     });
   }
 
-  const v2Observations = await runPublicationInspection(
-    v2Request,
+  const inspection = await runInternalPublicationInspection(
+    internalRequest,
     adapter,
-    timeoutMs,
+    { timeoutMs },
   );
-  const commandFailure = commandFailureFor(v2Observations);
-  if (commandFailure) {
-    return failureResult(request, adapterVersion, commandFailure);
+  if (!inspection.ok) {
+    return failureResult(
+      request,
+      adapterVersion,
+      commandFailureFor(inspection.code),
+    );
   }
 
-  const observations = v2Observations.map((observation) =>
-    projectObservationV3(v2Request, observation, adapter),
+  const observations = inspection.observations.map((observation) =>
+    projectObservationV3(internalRequest, observation, adapter),
   );
   if (
     observations.length === 0 ||

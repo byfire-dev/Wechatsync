@@ -46,6 +46,18 @@ const requests = {
     articleHint: { title: "WeChat article" },
     limit: 20,
   },
+  toutiao: {
+    contractVersion: "3.0" as const,
+    requestId: "inspect-v3-toutiao",
+    platform: "toutiao" as const,
+    externalAccountId: "toutiao-user-1",
+    draft: {
+      platformPostId: "7411111111111111111",
+      draftedAt,
+    },
+    articleHint: { title: "Toutiao article" },
+    limit: 20,
+  },
 };
 
 const publishedObservations = {
@@ -103,11 +115,11 @@ const publishedProofAdapters = {
 
 describe("publication Bridge v3 capability descriptors", () => {
   it("keeps the extension package and manifest on the v3 release version", () => {
-    expect(extensionPackage.version).toBe("2.0.28");
+    expect(extensionPackage.version).toBe("2.0.29");
     expect(manifest.version).toBe(extensionPackage.version);
   });
 
-  it("derives only registered inspectors and never advertises Toutiao", async () => {
+  it("derives only adapters with both internal inspection capabilities", async () => {
     const inspector = vi.fn();
     const publishedProof = vi.fn();
     const registered = deriveRegisteredPublicationInspectorPlatforms([
@@ -116,7 +128,11 @@ describe("publication Bridge v3 capability descriptors", () => {
         inspectPublication: inspector,
         provePublishedObservation: publishedProof,
       },
-      { platformId: "toutiao" },
+      {
+        platformId: "toutiao",
+        inspectPublication: inspector,
+        provePublishedObservation: publishedProof,
+      },
       { platformId: "sohu", inspectPublication: inspector },
       {
         platformId: "sohu",
@@ -134,7 +150,7 @@ describe("publication Bridge v3 capability descriptors", () => {
         provePublishedObservation: publishedProof,
       },
     ]);
-    expect(registered).toEqual(["zhihu", "sohu", "weixin"]);
+    expect(registered).toEqual(["zhihu", "toutiao", "sohu", "weixin"]);
 
     const info = buildPublicationBridgeInfoV3(
       registered,
@@ -143,14 +159,19 @@ describe("publication Bridge v3 capability descriptors", () => {
     expect(info).toEqual({
       contractVersion: "3.0",
       extensionVersion: extensionVersionFromManifest,
-      platforms: ["zhihu", "sohu", "weixin"].map((platform) => ({
+      platforms: ["zhihu", "toutiao", "sohu", "weixin"].map((platform) => ({
         contractVersion: "3.0",
         platform,
         adapterVersion: extensionVersionFromManifest,
         capabilities: ["publication_inspect"],
       })),
     });
-    expect(JSON.stringify(info)).not.toContain("toutiao");
+    expect(
+      info.platforms.find(({ platform }) => platform === "toutiao"),
+    ).toMatchObject({
+      platform: "toutiao",
+      capabilities: ["publication_inspect"],
+    });
   });
 
   it("strictly validates the background info payload", () => {
@@ -234,6 +255,191 @@ describe("publication Bridge v3 observation projection", () => {
       });
     },
   );
+
+  it.each([
+    {
+      label: "confirmed anonymous public access",
+      source: "PUBLIC_PAGE",
+      publicAccess: { status: "CONFIRMED" },
+    },
+    {
+      label: "anonymous HTTP 404",
+      source: "AUTHENTICATED_PUBLIC_PAGE",
+      publicAccess: {
+        status: "BLOCKED_BY_PLATFORM",
+        reasonCode: "TOUTIAO_ANONYMOUS_HTTP_404",
+      },
+    },
+    {
+      label: "anonymous soft 404",
+      source: "AUTHENTICATED_PUBLIC_PAGE",
+      publicAccess: {
+        status: "BLOCKED_BY_PLATFORM",
+        reasonCode: "TOUTIAO_ANONYMOUS_SOFT_404",
+      },
+    },
+  ] as const)(
+    "projects Toutiao $label evidence without conflating pgcId and itemId",
+    async ({ source, publicAccess }) => {
+      const itemId = "7522222222222222222";
+      const result = await runPublicationInspectionV3(
+        requests.toutiao,
+        {
+          inspectPublication: async () => [
+            {
+              observationKey: `toutiao:${itemId}:authenticated-published`,
+              platform: "toutiao",
+              externalAccountId: requests.toutiao.externalAccountId,
+              outcome: "PUBLISHED",
+              source,
+              platformPostId: requests.toutiao.draft.platformPostId,
+              canonicalUrl: `https://www.toutiao.com/article/${itemId}/`,
+              publishedAt,
+              publicAccess,
+              title: requests.toutiao.articleHint.title,
+              bodyText: "Authenticated Toutiao public article body",
+              bodyTruncated: false,
+              observedAt,
+              internalEvidence: {
+                publicItemId: itemId,
+              },
+            },
+          ],
+          provePublishedObservation: (_request, observation) => ({
+            observedAuthorExternalAccountId: observation.externalAccountId,
+            publicAccess,
+            bodyTruncated: false,
+          }),
+        },
+        extensionVersionFromManifest,
+      );
+
+      expect(result).toMatchObject({
+        contractVersion: "3.0",
+        requestId: requests.toutiao.requestId,
+        platform: "toutiao",
+        externalAccountId: requests.toutiao.externalAccountId,
+        ok: true,
+        observations: [
+          {
+            platform: "toutiao",
+            outcome: "PUBLISHED",
+            source,
+            platformPostId: requests.toutiao.draft.platformPostId,
+            canonicalUrl: `https://www.toutiao.com/article/${itemId}/`,
+            publicAccess,
+            observedAuthorExternalAccountId: requests.toutiao.externalAccountId,
+          },
+        ],
+      });
+      expect(result.ok && result.observations[0]).not.toHaveProperty(
+        "internalEvidence",
+      );
+      expect(result.ok && result.observations[0]).not.toHaveProperty(
+        "publicItemId",
+      );
+    },
+  );
+
+  it("fails closed on a Toutiao blocked-access reason outside its platform policy", async () => {
+    const provePublishedObservation = vi.fn();
+    const result = await runPublicationInspectionV3(
+      requests.toutiao,
+      {
+        inspectPublication: async () => [
+          {
+            observationKey: "toutiao:blocked-with-unknown-reason",
+            platform: "toutiao",
+            externalAccountId: requests.toutiao.externalAccountId,
+            outcome: "PUBLISHED",
+            source: "AUTHENTICATED_PUBLIC_PAGE",
+            platformPostId: requests.toutiao.draft.platformPostId,
+            canonicalUrl:
+              "https://www.toutiao.com/article/7522222222222222222/",
+            publishedAt,
+            publicAccess: {
+              status: "BLOCKED_BY_PLATFORM",
+              reasonCode: "TOUTIAO_UNVERIFIED_BLOCK",
+            },
+            title: requests.toutiao.articleHint.title,
+            bodyText: "Authenticated Toutiao public article body",
+            bodyTruncated: false,
+            observedAt,
+            internalEvidence: {
+              publicItemId: "7522222222222222222",
+            },
+          },
+        ],
+        provePublishedObservation,
+      },
+      extensionVersionFromManifest,
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      failure: {
+        stage: "PROTOCOL",
+        code: "INVALID_INSPECTION_RESULT",
+      },
+    });
+    expect(provePublishedObservation).not.toHaveBeenCalled();
+  });
+
+  it("requires complete internal scan evidence before projecting Toutiao NOT_FOUND", async () => {
+    const observation = {
+      observationKey: "toutiao:published-list:not-found",
+      platform: "toutiao" as const,
+      externalAccountId: requests.toutiao.externalAccountId,
+      outcome: "NOT_FOUND" as const,
+      source: "PUBLISHED_LIST" as const,
+      platformPostId: requests.toutiao.draft.platformPostId,
+      observedAt,
+    };
+    const provePublishedObservation = vi.fn();
+
+    const incomplete = await runPublicationInspectionV3(
+      requests.toutiao,
+      {
+        inspectPublication: async () => [observation],
+        provePublishedObservation,
+      },
+      extensionVersionFromManifest,
+    );
+    expect(incomplete).toMatchObject({
+      ok: false,
+      failure: {
+        stage: "PROTOCOL",
+        code: "INVALID_INSPECTION_RESULT",
+      },
+    });
+
+    const complete = await runPublicationInspectionV3(
+      requests.toutiao,
+      {
+        inspectPublication: async () => [
+          {
+            ...observation,
+            internalEvidence: { scanComplete: true as const },
+          },
+        ],
+        provePublishedObservation,
+      },
+      extensionVersionFromManifest,
+    );
+    expect(complete).toMatchObject({
+      ok: true,
+      observations: [
+        {
+          platform: "toutiao",
+          outcome: "NOT_FOUND",
+          platformPostId: requests.toutiao.draft.platformPostId,
+        },
+      ],
+    });
+    expect(complete.ok && complete.observations[0]).not.toHaveProperty(
+      "internalEvidence",
+    );
+  });
 
   it("rejects a WeChat PUBLISHED observation with a non-WeChat HTTPS URL", async () => {
     const result = await runPublicationInspectionV3(
@@ -432,10 +638,8 @@ describe("publication Bridge v3 observation projection", () => {
   });
 
   it("rejects PUBLISHED when bodyTruncated is not explicit", async () => {
-    const {
-      bodyTruncated: _bodyTruncated,
-      ...missingBodyTruncated
-    } = publishedObservations.sohu;
+    const { bodyTruncated: _bodyTruncated, ...missingBodyTruncated } =
+      publishedObservations.sohu;
     const result = await runPublicationInspectionV3(
       requests.sohu,
       {

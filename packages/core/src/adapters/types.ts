@@ -9,10 +9,12 @@ import type { RuntimeInterface } from '../runtime/interface'
 import type {
   OpenPublicationDraftRequest,
   OpenPublicationDraftResult,
-  PublicationInspectRequest,
-  PublicationObservation,
-  PublicationPublicAccess,
 } from '../publication-inspection/types'
+import type {
+  PublicationInspectionObservation,
+  PublicationInspectionPublishedProof,
+  PublicationInspectionRequest,
+} from '../publication-inspection/domain'
 
 /**
  * 输出格式类型
@@ -202,11 +204,7 @@ export interface AdapterOperationContext {
  * stricter bridge boundary. These values must come from platform evidence, not
  * from a bridge request fallback.
  */
-export interface PublicationPublishedProof {
-  observedAuthorExternalAccountId: string
-  publicAccess: PublicationPublicAccess
-  bodyTruncated: boolean
-}
+export type PublicationPublishedProof = PublicationInspectionPublishedProof
 
 /**
  * 平台适配器接口
@@ -241,17 +239,17 @@ export interface PlatformAdapter {
    * request or an unverified response shape.
    */
   inspectPublication?(
-    request: PublicationInspectRequest,
+    request: PublicationInspectionRequest,
     context?: AdapterOperationContext,
-  ): Promise<PublicationObservation[]>
+  ): Promise<PublicationInspectionObservation[]>
 
   /**
    * Attest the author and public-access facts for one PUBLISHED observation.
    * Bridges must fail closed when this capability is absent or returns null.
    */
   provePublishedObservation?(
-    request: PublicationInspectRequest,
-    observation: PublicationObservation,
+    request: PublicationInspectionRequest,
+    observation: PublicationInspectionObservation,
   ): PublicationPublishedProof | null
 
   /**

@@ -653,7 +653,12 @@ describe("ToutiaoAdapter", () => {
     });
 
     expect(result).toMatchObject({
-      success: false,
+      success: true,
+      outcome: "OUTCOME_UNKNOWN",
+      retryable: false,
+      draftOnly: true,
+      externalAccountId: "7390000000000000001",
+      errorCode: "TOUTIAO_DRAFT_SAVE_OUTCOME_UNKNOWN",
       error:
         "头条草稿可能已保存，但系统无法确认结果；请先打开头条草稿箱检查，暂时不要重复投递",
     });
@@ -784,6 +789,7 @@ describe("ToutiaoAdapter", () => {
     vi.spyOn(adapter, "checkAuth").mockResolvedValue({
       isAuthenticated: true,
       userId: "7390000000000000001",
+      username: "测试账号",
     });
 
     await expect(
@@ -866,8 +872,10 @@ describe("ToutiaoAdapter", () => {
     expect(executeScript).not.toHaveBeenCalled();
   });
 
-  it("does not expose online publication inspection in PR 1", () => {
+  it("exposes publication inspection and proof through the standard adapter surface", () => {
     const adapter = new ToutiaoAdapter();
-    expect(adapter.inspectPublication).toBeUndefined();
+    expect(adapter.inspectPublication).toBeTypeOf("function");
+    expect(adapter.provePublishedObservation).toBeTypeOf("function");
+    expect(adapter.meta.capabilities).toContain("account_binding");
   });
 });

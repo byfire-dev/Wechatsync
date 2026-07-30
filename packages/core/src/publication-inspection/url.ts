@@ -13,8 +13,10 @@ export interface ParsedPublicationUrl {
 const ZHIHU_ALLOWED_HOSTS = new Set(['www.zhihu.com', 'zhuanlan.zhihu.com'])
 const SOHU_ALLOWED_HOSTS = new Set(['mp.sohu.com', 'www.sohu.com'])
 const WEIXIN_ALLOWED_HOSTS = new Set(['mp.weixin.qq.com'])
+const TOUTIAO_ALLOWED_HOSTS = new Set(['mp.toutiao.com', 'www.toutiao.com'])
 const SOHU_DRAFT_PATH = '/mpfe/v4/contentManagement/news/addarticle'
 const WEIXIN_DRAFT_PATH = '/cgi-bin/appmsg'
+const TOUTIAO_DRAFT_PATH = '/profile_v4/graphic/publish'
 
 function safeUrl(href: string): URL | null {
   try {
@@ -207,6 +209,51 @@ function parseWeixin(url: URL): ParsedPublicationUrl {
   return { platform: 'weixin', surface: 'UNKNOWN' }
 }
 
+function parseToutiao(url: URL): ParsedPublicationUrl {
+  const pathname = cleanPath(url.pathname)
+  if (url.protocol !== 'https:' || url.port !== '' || url.hash !== '') {
+    return { platform: 'toutiao', surface: 'UNKNOWN' }
+  }
+
+  if (url.hostname === 'mp.toutiao.com' && pathname === TOUTIAO_DRAFT_PATH) {
+    const pgcIds = url.searchParams.getAll('pgc_id')
+    const fromValues = url.searchParams.getAll('from')
+    const pgcId =
+      pgcIds.length === 1 ? normalizePositiveDecimal(pgcIds[0]) : undefined
+    if (
+      !pgcId ||
+      fromValues.length > 1 ||
+      (fromValues.length === 1 && fromValues[0] !== 'edit')
+    ) {
+      return { platform: 'toutiao', surface: 'UNKNOWN' }
+    }
+    return {
+      platform: 'toutiao',
+      surface: 'DRAFT',
+      postId: pgcId,
+    }
+  }
+
+  if (url.hostname === 'www.toutiao.com' && url.search === '') {
+    const publicMatch = pathname.match(/^\/(article|item)\/([1-9]\d{0,31})$/)
+    if (publicMatch) {
+      const [, shape, publicItemId] = publicMatch
+      return {
+        platform: 'toutiao',
+        surface: 'PUBLISHED',
+        postId: publicItemId,
+        ...(shape === 'article'
+          ? {
+              canonicalUrl: `https://www.toutiao.com/article/${publicItemId}/`,
+            }
+          : {}),
+      }
+    }
+  }
+
+  return { platform: 'toutiao', surface: 'UNKNOWN' }
+}
+
 /**
  * Parse only URL shapes verified for an active publication inspector.
  * Paused platform vocabulary remains in the protocol, but its URLs are not
@@ -216,7 +263,12 @@ export function parsePublicationUrl(
   platform: PublicationPlatform,
   href: string,
 ): ParsedPublicationUrl | null {
-  if (platform !== 'zhihu' && platform !== 'sohu' && platform !== 'weixin') {
+  if (
+    platform !== 'zhihu' &&
+    platform !== 'sohu' &&
+    platform !== 'weixin' &&
+    platform !== 'toutiao'
+  ) {
     return null
   }
 
@@ -232,6 +284,11 @@ export function parsePublicationUrl(
   if (platform === 'sohu') {
     if (!SOHU_ALLOWED_HOSTS.has(url.hostname)) return null
     return parseSohu(url)
+  }
+
+  if (platform === 'toutiao') {
+    if (!TOUTIAO_ALLOWED_HOSTS.has(url.hostname)) return null
+    return parseToutiao(url)
   }
 
   if (!WEIXIN_ALLOWED_HOSTS.has(url.hostname)) return null
