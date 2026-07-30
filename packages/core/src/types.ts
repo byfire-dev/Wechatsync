@@ -22,12 +22,32 @@ export interface Article {
 /**
  * 同步结果
  */
+export type SyncResultOutcome =
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'OUTCOME_UNKNOWN'
+
 export interface SyncResult {
   platform: string
+  /**
+   * Legacy completion flag. A write request whose final outcome cannot be
+   * confirmed remains `true` so callers preserve evidence and do not submit
+   * it again; `outcome` is authoritative in that case.
+   */
   success: boolean
+  outcome?: SyncResultOutcome
+  retryable?: boolean
   postId?: string
   postUrl?: string
+  /** Stable platform account identity used for this operation. */
+  externalAccountId?: string
+  /** Account identity requested before the platform write. */
+  requestedExternalAccountId?: string
+  /** Account identity reported after the platform write, when available. */
+  observedExternalAccountId?: string
   draftOnly?: boolean  // 是否只保存了草稿
+  /** Stable, display-safe failure classification. */
+  errorCode?: string
   error?: string
   message?: string  // 额外提示信息
   timestamp: number
@@ -80,6 +100,7 @@ export type PlatformCapability =
   | 'article'      // 发布文章
   | 'draft'        // 草稿支持
   | 'image_upload' // 图片上传
+  | 'account_binding' // 内部能力：支持按稳定账号身份精确写入
   | 'categories'   // 分类
   | 'tags'         // 标签
   | 'cover'        // 封面图

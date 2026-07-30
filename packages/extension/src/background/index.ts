@@ -6,6 +6,7 @@ import {
   getAllPlatformMetas,
   cancelSync,
   getAdapter,
+  getRegisteredPublicationInspectorPlatforms,
   getPlatformPreprocessConfigs,
   type SyncDetailProgress,
 } from '../adapters'
@@ -26,6 +27,10 @@ import {
   trackGrowthMetrics,
 } from '../lib/analytics'
 import { checkSyncFrequency, recordSync } from '../lib/rate-limit'
+import {
+  isConfirmedSyncSuccess,
+  isSyncReviewRequired,
+} from '../lib/sync-outcome'
 import { checkForUpdates, isUpdateDismissed } from '../lib/version-check'
 import { fetchRemoteConfig, fetchConfigIfNeeded } from '../lib/remote-config'
 import {
@@ -39,9 +44,19 @@ import {
   validateOpenPublicationDraftPayload,
   validateLegacyMutationMessageSender,
 } from './bridge-v2'
+import {
+  buildPublicationBridgeInfoV3,
+  runPublicationInspectionV3,
+  validatePublicationBridgeInfoPayloadV3,
+  validatePublicationInspectPayloadV3,
+} from './bridge-v3'
 import { dispatchLegacyMagicCall } from '../bridge/legacy-magic-call'
 import { isLegacyMutationRuntimeMessage } from '../bridge/legacy-origin-policy'
-import { projectBridgeRuntimeError } from '../bridge'
+import {
+  projectBridgeRuntimeError,
+  routeAccountBindingsByCapability,
+  validatePlatformAccountBindings,
+} from '../bridge'
 
 const logger = createLogger('Background')
 
@@ -93,11 +108,16 @@ async function updateBadge(state: ActiveSyncState | null) {
     // 同步中不显示 badge，避免卡住后残留
     await chrome.action.setBadgeText({ text: '' })
   } else if (state.status === 'completed') {
-    const successCount = state.results.filter(r => r.success).length
+    const successCount = state.results.filter(isConfirmedSyncSuccess).length
+    const reviewRequiredCount =
+      state.results.filter(isSyncReviewRequired).length
     const total = state.selectedPlatforms.length
-    const failedCount = total - successCount
+    const failedCount = total - successCount - reviewRequiredCount
 
-    if (failedCount === 0) {
+    if (reviewRequiredCount > 0) {
+      await chrome.action.setBadgeText({ text: '?' })
+      await chrome.action.setBadgeBackgroundColor({ color: BADGE_COLORS.partial })
+    } else if (failedCount === 0) {
       await chrome.action.setBadgeText({ text: '✓' })
       await chrome.action.setBadgeBackgroundColor({ color: BADGE_COLORS.success })
     } else if (successCount === 0) {
@@ -146,12 +166,33 @@ type MessageAction =
     }
   | { type: 'BRIDGE_INSPECT_PUBLICATION'; requestId: string; payload: unknown }
   | {
+      type: 'BRIDGE_GET_PUBLICATION_INFO_V3'
+      requestId: string
+      payload: unknown
+    }
+  | {
+      type: 'BRIDGE_INSPECT_PUBLICATION_V3'
+      requestId: string
+      payload: unknown
+    }
+  | {
       type: 'BRIDGE_OPEN_PUBLICATION_DRAFT'
       requestId: string
       payload: unknown
     }
   | { type: 'CHECK_AUTH'; payload: { platformId: string } }
-  | { type: 'SYNC_ARTICLE'; payload: { article: any; platforms: string[]; allSelectedPlatforms?: string[]; skipHistory?: boolean; source?: string; syncId?: string } }
+  | {
+      type: 'SYNC_ARTICLE'
+      payload: {
+        article: any
+        platforms: unknown
+        accountBindings?: unknown
+        allSelectedPlatforms?: string[]
+        skipHistory?: boolean
+        source?: string
+        syncId?: string
+      }
+    }
   | { type: 'OPEN_SYNC_PAGE'; path?: string }
   | { type: 'TEST_CMS_CONNECTION'; payload: { type: CMSType; url: string; username: string; password: string } }
   | { type: 'SYNC_TO_CMS'; payload: { accountId: string; article: any } }
@@ -311,6 +352,55 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
       }
     }
 
+    case 'BRIDGE_GET_PUBLICATION_INFO_V3': {
+      const verifiedSender = validateBridgeMessageSender(sender || {})
+      if (!verifiedSender.success) {
+        return { error: verifiedSender.code }
+      }
+      if (
+        !validatePublicationBridgeInfoPayloadV3(
+          message.payload,
+          message.requestId,
+        )
+      ) {
+        return { error: 'INVALID_PAYLOAD' }
+      }
+
+      const extensionVersion = chrome.runtime.getManifest().version
+      const platforms = await getRegisteredPublicationInspectorPlatforms()
+      return {
+        publicationBridgeInfoV3: buildPublicationBridgeInfoV3(
+          platforms,
+          extensionVersion,
+        ),
+      }
+    }
+
+    case 'BRIDGE_INSPECT_PUBLICATION_V3': {
+      const verifiedSender = validateBridgeMessageSender(sender || {})
+      if (!verifiedSender.success) {
+        return { error: verifiedSender.code }
+      }
+
+      const validatedPayload = validatePublicationInspectPayloadV3(
+        message.payload,
+        message.requestId,
+      )
+      if (!validatedPayload.success) {
+        return { error: validatedPayload.code }
+      }
+
+      const extensionVersion = chrome.runtime.getManifest().version
+      const adapter = await getAdapter(validatedPayload.data.platform)
+      return {
+        publicationInspectResultV3: await runPublicationInspectionV3(
+          validatedPayload.data,
+          adapter,
+          extensionVersion,
+        ),
+      }
+    }
+
     case 'BRIDGE_OPEN_PUBLICATION_DRAFT': {
       const verifiedSender = validateBridgeMessageSender(sender || {})
       if (!verifiedSender.success) {
@@ -338,8 +428,28 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
     }
 
     case 'SYNC_ARTICLE': {
-      const { article, platforms, allSelectedPlatforms, skipHistory, source = 'popup', syncId: passedSyncId } = message.payload
+      const {
+        article,
+        platforms: platformValue,
+        accountBindings: bindingValue,
+        allSelectedPlatforms,
+        skipHistory,
+        source = 'popup',
+        syncId: passedSyncId,
+      } = message.payload
+      const validatedBindings = validatePlatformAccountBindings(
+        platformValue,
+        bindingValue,
+      )
+      if (!validatedBindings.success) {
+        return { error: validatedBindings.code }
+      }
+      const { platforms, accountBindings } = validatedBindings
       const allPlatformMetas = getAllPlatformMetas()
+      const capableAccountBindings = routeAccountBindingsByCapability(
+        accountBindings,
+        allPlatformMetas,
+      )
 
       // 使用传入的 syncId 或生成新的
       const syncId = passedSyncId || generateSyncId()
@@ -369,6 +479,10 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
       // 分离 DSL 平台和 CMS 账户
       const dslPlatformIds = platforms.filter((id: string) => !cmsAccountIds.has(id))
       const cmsPlatformIds = platforms.filter((id: string) => cmsAccountIds.has(id))
+      const dslPlatformSet = new Set(dslPlatformIds)
+      const dslAccountBindings = capableAccountBindings.filter((binding) =>
+        dslPlatformSet.has(binding.platform),
+      )
 
       // 如果没有 platformContents，请求 content script 预处理
       // 同源平台跳过预处理（如微信到微信，源内容已是目标格式）
@@ -461,7 +575,7 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
               payload: progress,
             })
           },
-        }, source)
+        }, source, { accountBindings: dslAccountBindings })
       }
 
       // 同步到 CMS 账户
@@ -1387,6 +1501,10 @@ interface SyncResult {
   platform: string
   platformName?: string
   success: boolean
+  outcome?: 'SUCCEEDED' | 'FAILED' | 'OUTCOME_UNKNOWN'
+  retryable?: boolean
+  requestedExternalAccountId?: string
+  observedExternalAccountId?: string
   postId?: string
   postUrl?: string
   url?: string

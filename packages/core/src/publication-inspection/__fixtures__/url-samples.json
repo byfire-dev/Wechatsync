@@ -1,5 +1,42 @@
 [
   {
+    "name": "toutiao canonical draft",
+    "platform": "toutiao",
+    "href": "https://mp.toutiao.com/profile_v4/graphic/publish?pgc_id=7444000000000000001",
+    "expected": {
+      "surface": "DRAFT",
+      "postId": "7444000000000000001"
+    }
+  },
+  {
+    "name": "toutiao observed edit draft",
+    "platform": "toutiao",
+    "href": "https://mp.toutiao.com/profile_v4/graphic/publish?from=edit&pgc_id=7444000000000000001",
+    "expected": {
+      "surface": "DRAFT",
+      "postId": "7444000000000000001"
+    }
+  },
+  {
+    "name": "toutiao managed item link",
+    "platform": "toutiao",
+    "href": "https://www.toutiao.com/item/7667071065847677450/",
+    "expected": {
+      "surface": "PUBLISHED",
+      "postId": "7667071065847677450"
+    }
+  },
+  {
+    "name": "toutiao canonical article",
+    "platform": "toutiao",
+    "href": "https://www.toutiao.com/article/7667071065847677450/",
+    "expected": {
+      "surface": "PUBLISHED",
+      "postId": "7667071065847677450",
+      "canonicalUrl": "https://www.toutiao.com/article/7667071065847677450/"
+    }
+  },
+  {
     "name": "zhihu article draft",
     "platform": "zhihu",
     "href": "https://zhuanlan.zhihu.com/p/2000000000000000001/edit",

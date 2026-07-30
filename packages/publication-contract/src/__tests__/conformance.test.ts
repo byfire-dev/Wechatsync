@@ -52,10 +52,13 @@ describe("publication contract conformance fixtures", () => {
     expect(PublicationBridgeInfoV3Schema.parse(value)).toEqual(value);
   });
 
-  it("accepts a strict v3 published observation envelope", () => {
-    const value = fixture("v3/zhihu-published.json");
-    expect(PublicationInspectResultV3Schema.parse(value)).toEqual(value);
-  });
+  it.each(["zhihu", "toutiao", "sohu", "weixin"])(
+    "accepts the strict v3 %s published fixture",
+    (platform) => {
+      const value = fixture(`v3/${platform}-published.json`);
+      expect(PublicationInspectResultV3Schema.parse(value)).toEqual(value);
+    },
+  );
 
   it("accepts a structured v3 failure envelope", () => {
     const value = fixture("v3/adapter-timeout.json");

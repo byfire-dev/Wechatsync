@@ -3,7 +3,7 @@
  */
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
-import type { PublishOptions } from '../types'
+import type { PublicationPublishedProof, PublishOptions } from '../types'
 import type {
   PublicationInspectRequest,
   PublicationObservation,
@@ -103,6 +103,45 @@ export class ZhihuAdapter extends CodeAdapter {
       checkAuth: () => this.checkAuth(),
       fetch: (url, options) => this.runtime.fetch(url, options),
     })
+  }
+
+  provePublishedObservation(
+    request: PublicationInspectRequest,
+    observation: PublicationObservation,
+  ): PublicationPublishedProof | null {
+    if (
+      request.platform !== 'zhihu' ||
+      observation.platform !== 'zhihu' ||
+      observation.externalAccountId !== request.externalAccountId ||
+      observation.outcome !== 'PUBLISHED' ||
+      !observation.platformPostId ||
+      !observation.canonicalUrl ||
+      !observation.publishedAt ||
+      !observation.title?.trim() ||
+      !observation.bodyText?.trim() ||
+      typeof observation.bodyTruncated !== 'boolean' ||
+      observation.errorCode !== undefined ||
+      observation.errorMessage !== undefined
+    ) {
+      return null
+    }
+
+    const publicAccess = observation.publicAccess
+    const hasMatchingPublicEvidence =
+      (observation.source === 'PUBLIC_PAGE' &&
+        publicAccess?.status === 'CONFIRMED') ||
+      (observation.source === 'AUTHENTICATED_PUBLIC_PAGE' &&
+        publicAccess?.status === 'BLOCKED_BY_PLATFORM' &&
+        publicAccess.reasonCode === 'ZHIHU_ANONYMOUS_HTTP_403')
+    if (!hasMatchingPublicEvidence || !publicAccess) return null
+
+    // inspectZhihuPublication emits PUBLISHED only after the public structured
+    // author ID has matched the account bound to the request.
+    return {
+      observedAuthorExternalAccountId: observation.externalAccountId,
+      publicAccess,
+      bodyTruncated: observation.bodyTruncated,
+    }
   }
 
   async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {

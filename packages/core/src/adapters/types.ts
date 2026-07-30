@@ -1,11 +1,20 @@
-import type { Article, AuthResult, SyncResult, PlatformMeta } from '../types'
+import type {
+  Article,
+  AuthProbeErrorCode,
+  AuthResult,
+  SyncResult,
+  PlatformMeta,
+} from '../types'
 import type { RuntimeInterface } from '../runtime/interface'
 import type {
   OpenPublicationDraftRequest,
   OpenPublicationDraftResult,
-  PublicationInspectRequest,
-  PublicationObservation,
 } from '../publication-inspection/types'
+import type {
+  PublicationInspectionObservation,
+  PublicationInspectionPublishedProof,
+  PublicationInspectionRequest,
+} from '../publication-inspection/domain'
 
 /**
  * 输出格式类型
@@ -133,6 +142,50 @@ export interface PublishOptions {
   draftOnly?: boolean
   /** 图片上传进度回调 */
   onImageProgress?: ImageProgressCallback
+  /**
+   * Exact platform account requested by the caller.
+   *
+   * Adapters supporting multiple accounts must re-probe the authenticated
+   * account set and verify this identity before performing any write.
+   */
+  accountBinding?: AdapterAccountBinding
+}
+
+export const ADAPTER_EXTERNAL_ACCOUNT_ID_MAX_LENGTH = 500
+
+/** The only account identity allowed to influence adapter writes. */
+export interface AdapterAccountBinding {
+  externalAccountId: string
+}
+
+/** One authenticated account exposed by a platform adapter. */
+export interface AdapterAccount {
+  externalAccountId: string
+  displayName: string
+  avatarUrl?: string
+}
+
+export type AdapterAccountProbe =
+  | {
+      status: 'AUTHENTICATED'
+      accounts: AdapterAccount[]
+    }
+  | {
+      status: 'NOT_AUTHENTICATED'
+      accounts: []
+    }
+  | {
+      status: 'PROBE_FAILED'
+      accounts: []
+      errorCode?: AuthProbeErrorCode
+    }
+
+/**
+ * Platform-qualified binding used by multi-platform orchestration. It is
+ * reduced to AdapterAccountBinding before entering one adapter.
+ */
+export interface PlatformAccountBinding extends AdapterAccountBinding {
+  platform: string
 }
 
 /**
@@ -145,6 +198,13 @@ export interface PublishOptions {
 export interface AdapterOperationContext {
   signal?: AbortSignal
 }
+
+/**
+ * Adapter-attested facts required before a PUBLISHED observation can cross a
+ * stricter bridge boundary. These values must come from platform evidence, not
+ * from a bridge request fallback.
+ */
+export type PublicationPublishedProof = PublicationInspectionPublishedProof
 
 /**
  * 平台适配器接口
@@ -162,6 +222,14 @@ export interface PlatformAdapter {
   /** 检查认证状态 */
   checkAuth(context?: AdapterOperationContext): Promise<AuthResult>
 
+  /**
+   * Enumerate authenticated accounts atomically. An adapter must return either
+   * the complete validated account set or a non-authenticated/failed result.
+   */
+  probeAccounts?(
+    context?: AdapterOperationContext,
+  ): Promise<AdapterAccountProbe>
+
   /** 发布文章 */
   publish(article: Article, options?: PublishOptions): Promise<SyncResult>
 
@@ -171,9 +239,18 @@ export interface PlatformAdapter {
    * request or an unverified response shape.
    */
   inspectPublication?(
-    request: PublicationInspectRequest,
+    request: PublicationInspectionRequest,
     context?: AdapterOperationContext,
-  ): Promise<PublicationObservation[]>
+  ): Promise<PublicationInspectionObservation[]>
+
+  /**
+   * Attest the author and public-access facts for one PUBLISHED observation.
+   * Bridges must fail closed when this capability is absent or returns null.
+   */
+  provePublishedObservation?(
+    request: PublicationInspectionRequest,
+    observation: PublicationInspectionObservation,
+  ): PublicationPublishedProof | null
 
   /**
    * Open an authenticated draft without exposing token-bearing editor URLs

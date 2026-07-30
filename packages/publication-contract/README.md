@@ -10,7 +10,8 @@ UI code.
   `@wechatsync/core/publication-inspection` re-exports this entry for backward
   compatibility.
 - `@wechatsync/publication-contract/v3` defines the next strict protocol. It is
-  additive and is not wired into the extension yet.
+  exposed additively by the extension through `getPublicationBridgeInfoV3` and
+  `inspectPublicationV3`; the Bridge v2 methods remain unchanged.
 
 ## V3 semantics
 
@@ -27,6 +28,9 @@ UI code.
   adapter-command, timeout, or unknown command failures.
 - Platform capability descriptors carry both `contractVersion` and
   `adapterVersion`; consumers must still apply their own rollout allowlist.
+- The extension derives descriptors from live registered inspectors. The
+  current v3 surface is Zhihu, Toutiao, Sohu, and WeChat. Bridge v2 remains
+  frozen and does not advertise Toutiao publication inspection.
 
 Golden JSON fixtures under `fixtures/` are part of the compatibility contract.
 Any producer or consumer implementation should parse the same fixtures in its

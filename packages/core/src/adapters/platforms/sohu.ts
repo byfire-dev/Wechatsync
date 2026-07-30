@@ -3,7 +3,18 @@
  */
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
-import type { PreprocessConfig, PublishOptions } from '../types'
+import type {
+  AdapterAccount,
+  AdapterAccountProbe,
+  PreprocessConfig,
+  PublicationPublishedProof,
+  PublishOptions,
+} from '../types'
+import {
+  adapterAccountSelectionErrorMessage,
+  normalizeAdapterAccountBinding,
+  resolveAdapterAccountBinding,
+} from '../account-binding'
 import type {
   PublicationInspectRequest,
   PublicationObservation,
@@ -12,12 +23,6 @@ import { inspectSohuPublication } from '../../publication-inspection/sohu'
 import { createLogger } from '../../lib/logger'
 
 const logger = createLogger('Sohu')
-
-interface SohuAccountInfo {
-  id: string
-  nickName: string
-  avatar: string
-}
 
 /**
  * 生成设备 ID (dv-id)
@@ -44,13 +49,43 @@ function normalizeSafePositiveIntegerId(value: unknown): string | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? value : null
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function normalizeDisplayName(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim()
+  return normalized.length > 0 && normalized.length <= 500
+    ? normalized
+    : fallback
+}
+
+function normalizeAvatarUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (normalized.length === 0 || normalized.length > 2_000) return undefined
+  try {
+    const url = new URL(normalized)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+      ? url.href
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export class SohuAdapter extends CodeAdapter {
   readonly meta: PlatformMeta = {
     id: 'sohu',
     name: '搜狐号',
     icon: 'https://mp.sohu.com/favicon.ico',
     homepage: 'https://mp.sohu.com/mpfe/v3/main/first/page?newsType=1',
-    capabilities: ['article', 'draft', 'image_upload'],
+    capabilities: ['article', 'draft', 'image_upload', 'account_binding'],
   }
 
   /** 预处理配置: 搜狐号将表格整体转为 SVG 图片，避免平台清洗 HTML 表格样式 */
@@ -60,7 +95,6 @@ export class SohuAdapter extends CodeAdapter {
     boldHeadingLevels: [3],
   }
 
-  private accountInfo: SohuAccountInfo | null = null
   private deviceId: string = generateDeviceId()
   private spCm: string = ''
 
@@ -76,91 +110,207 @@ export class SohuAdapter extends CodeAdapter {
     },
   ]
 
-  async checkAuth(): Promise<AuthResult> {
+  /**
+   * Atomically enumerate the complete authenticated Sohu sub-account set.
+   * A malformed row invalidates the complete probe so it cannot be mistaken
+   * for a safe single-account session.
+   */
+  async probeAccounts(): Promise<AdapterAccountProbe> {
     try {
-      // 使用 /account/list 获取所有子账号（搜狐号支持多个子账号）
       const response = await this.runtime.fetch(
         `https://mp.sohu.com/mpbp/bp/account/list?_=${Date.now()}`,
         {
           method: 'GET',
           credentials: 'include',
-        }
+        },
       )
-
-      const res = await response.json() as {
-        code: number
-        data?: {
-          data?: Array<{
-            accounts: Array<{
-              id: string | number
-              nickName: string
-              avatar: string
-            }>
-          }>
+      if (!response.ok) {
+        return {
+          status: 'PROBE_FAILED',
+          accounts: [],
+          errorCode: 'HTTP_ERROR',
         }
       }
 
-      logger.debug('checkAuth response:', res)
-
-      if (res.code !== 2000000 || !Array.isArray(res.data?.data)) {
-        return { isAuthenticated: false }
+      const res: unknown = await response.json()
+      if (
+        !isPlainRecord(res) ||
+        res.code !== 2000000 ||
+        !isPlainRecord(res.data) ||
+        !Array.isArray(res.data.data)
+      ) {
+        return {
+          status: 'PROBE_FAILED',
+          accounts: [],
+          errorCode: 'RESPONSE_SCHEMA_MISMATCH',
+        }
       }
 
-      // 收集所有子账号
-      const allAccounts: SohuAccountInfo[] = []
+      const accounts: AdapterAccount[] = []
+      const seenAccountIds = new Set<string>()
       for (const group of res.data.data) {
-        if (Array.isArray(group.accounts)) {
-          for (const account of group.accounts) {
-            const accountId = normalizeSafePositiveIntegerId(account.id)
-            if (!accountId) continue
-            allAccounts.push({ ...account, id: accountId })
+        if (!isPlainRecord(group) || !Array.isArray(group.accounts)) {
+          return {
+            status: 'PROBE_FAILED',
+            accounts: [],
+            errorCode: 'RESPONSE_SCHEMA_MISMATCH',
           }
         }
+        for (const candidate of group.accounts) {
+          if (!isPlainRecord(candidate)) {
+            return {
+              status: 'PROBE_FAILED',
+              accounts: [],
+              errorCode: 'RESPONSE_SCHEMA_MISMATCH',
+            }
+          }
+          const externalAccountId = normalizeSafePositiveIntegerId(candidate.id)
+          if (!externalAccountId || seenAccountIds.has(externalAccountId)) {
+            return {
+              status: 'PROBE_FAILED',
+              accounts: [],
+              errorCode: 'ACCOUNT_ID_MISSING',
+            }
+          }
+          seenAccountIds.add(externalAccountId)
+          const avatarUrl = normalizeAvatarUrl(candidate.avatar)
+          accounts.push({
+            externalAccountId,
+            displayName: normalizeDisplayName(
+              candidate.nickName,
+              externalAccountId,
+            ),
+            ...(avatarUrl ? { avatarUrl } : {}),
+          })
+        }
       }
 
-      if (allAccounts.length === 0) {
-        return { isAuthenticated: false }
+      if (accounts.length === 0) {
+        return { status: 'NOT_AUTHENTICATED', accounts: [] }
       }
 
-      // 默认使用第一个子账号
-      this.accountInfo = allAccounts[0]
-      logger.info(`Using account: ${this.accountInfo.nickName} (id: ${this.accountInfo.id})` +
-        (allAccounts.length > 1 ? `, ${allAccounts.length} sub-accounts available` : ''))
-
-      // 获取 mp-cv cookie 用于 sp-cm header
       await this.fetchSpCm()
-
-      // 如果有多个子账号，在用户名中标注
-      const displayName = allAccounts.length > 1
-        ? `${this.accountInfo.nickName} (共${allAccounts.length}个子账号)`
-        : this.accountInfo.nickName
-
+      logger.info('Authenticated Sohu account probe completed', {
+        accountCount: accounts.length,
+      })
+      return { status: 'AUTHENTICATED', accounts }
+    } catch {
+      logger.debug('Sohu account probe failed')
       return {
-        isAuthenticated: true,
-        userId: String(this.accountInfo.id),
-        username: displayName,
-        avatar: this.accountInfo.avatar,
+        status: 'PROBE_FAILED',
+        accounts: [],
+        errorCode: 'UNKNOWN_ERROR',
       }
-    } catch (error) {
-      logger.debug('checkAuth: not logged in -', error)
-      return { isAuthenticated: false, error: (error as Error).message }
+    }
+  }
+
+  /**
+   * Frozen compatibility projection for legacy/v2 account discovery.
+   */
+  async checkAuth(): Promise<AuthResult> {
+    const probe = await this.probeAccounts()
+    if (probe.status === 'NOT_AUTHENTICATED') {
+      return {
+        isAuthenticated: false,
+        probeStatus: 'NOT_AUTHENTICATED',
+        probeSource: 'EXTENSION',
+      }
+    }
+    if (probe.status !== 'AUTHENTICATED' || probe.accounts.length === 0) {
+      return {
+        isAuthenticated: false,
+        probeStatus: 'PROBE_FAILED',
+        probeSource: 'EXTENSION',
+        probeErrorCode:
+          probe.status === 'PROBE_FAILED'
+            ? probe.errorCode ?? 'UNKNOWN_ERROR'
+            : 'UNKNOWN_ERROR',
+      }
+    }
+
+    const primary = probe.accounts[0]
+    return {
+      isAuthenticated: true,
+      probeStatus: 'AUTHENTICATED',
+      probeSource: 'EXTENSION',
+      userId: primary.externalAccountId,
+      username:
+        probe.accounts.length > 1
+          ? `${primary.displayName} (共${probe.accounts.length}个子账号)`
+          : primary.displayName,
+      ...(primary.avatarUrl ? { avatar: primary.avatarUrl } : {}),
+    }
+  }
+
+  private authResultFromProbe(probe: AdapterAccountProbe): AuthResult {
+    if (probe.status === 'PROBE_FAILED') {
+      return { isAuthenticated: false, error: 'Account probe failed' }
+    }
+    if (probe.status !== 'AUTHENTICATED' || probe.accounts.length === 0) {
+      return { isAuthenticated: false }
+    }
+    const account = probe.accounts[0]
+    return {
+      isAuthenticated: true,
+      userId: account.externalAccountId,
+      username: account.displayName,
+      ...(account.avatarUrl ? { avatar: account.avatarUrl } : {}),
     }
   }
 
   async inspectPublication(
     request: PublicationInspectRequest,
   ): Promise<PublicationObservation[]> {
-    return this.withHeaderRules(this.HEADER_RULES, () =>
-      inspectSohuPublication(request, {
-        checkAuth: () => this.checkAuth(),
+    return this.withHeaderRules(this.HEADER_RULES, async () => {
+      const probe = await this.probeAccounts()
+      return inspectSohuPublication(request, {
+        checkAuth: async () => this.authResultFromProbe(probe),
+        hasAuthenticatedAccount: (externalAccountId) =>
+          probe.status === 'AUTHENTICATED' &&
+          probe.accounts.some(
+            (account) => account.externalAccountId === externalAccountId,
+          ),
         fetch: (url, options) => this.runtime.fetch(url, options),
         detailHeaders: () => ({
           'x-requested-with': 'XMLHttpRequest',
           'dv-id': this.deviceId,
           'sp-cm': this.spCm,
         }),
-      }),
-    )
+      })
+    })
+  }
+
+  provePublishedObservation(
+    request: PublicationInspectRequest,
+    observation: PublicationObservation,
+  ): PublicationPublishedProof | null {
+    if (
+      request.platform !== 'sohu' ||
+      observation.platform !== 'sohu' ||
+      observation.externalAccountId !== request.externalAccountId ||
+      observation.outcome !== 'PUBLISHED' ||
+      observation.source !== 'PUBLIC_PAGE' ||
+      !observation.platformPostId ||
+      !observation.canonicalUrl ||
+      !observation.publishedAt ||
+      !observation.title?.trim() ||
+      !observation.bodyText?.trim() ||
+      typeof observation.bodyTruncated !== 'boolean' ||
+      (observation.publicAccess !== undefined &&
+        observation.publicAccess.status !== 'CONFIRMED') ||
+      observation.errorCode !== undefined ||
+      observation.errorMessage !== undefined
+    ) {
+      return null
+    }
+
+    // The inspector reaches PUBLISHED only after the anonymous canonical URL
+    // proves both the stable post ID and the bound Sohu media ID.
+    return {
+      observedAuthorExternalAccountId: observation.externalAccountId,
+      publicAccess: { status: 'CONFIRMED' },
+      bodyTruncated: observation.bodyTruncated,
+    }
   }
 
   /**
@@ -188,16 +338,46 @@ export class SohuAdapter extends CodeAdapter {
   }
 
   async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {
+    const requestedBinding =
+      options?.accountBinding === undefined
+        ? undefined
+        : normalizeAdapterAccountBinding(options.accountBinding)
+    const requestedExternalAccountId = requestedBinding?.externalAccountId
+    let operationExternalAccountId = requestedExternalAccountId
+    let saveRequestStarted = false
+    let terminalSaveResult: SyncResult | undefined
+
+    const createUnknownSaveResult = (): SyncResult =>
+      this.createResult(true, {
+        ...(operationExternalAccountId
+          ? { externalAccountId: operationExternalAccountId }
+          : {}),
+        outcome: 'OUTCOME_UNKNOWN',
+        retryable: false,
+        draftOnly: options?.draftOnly ?? true,
+        errorCode: 'SOHU_DRAFT_SAVE_OUTCOME_UNKNOWN',
+        error:
+          '搜狐草稿保存请求已发出，但无法确认最终结果；请人工核验，勿重复提交',
+      })
+
     return this.withHeaderRules(this.HEADER_RULES, async () => {
       logger.info('Starting publish...')
 
-      // 1. 确保已登录
-      if (!this.accountInfo) {
-        const auth = await this.checkAuth()
-        if (!auth.isAuthenticated) {
-          throw new Error('请先登录搜狐号')
-        }
+      const selection = resolveAdapterAccountBinding(
+        await this.probeAccounts(),
+        options?.accountBinding,
+      )
+      if (!selection.ok) {
+        return this.createResult(false, {
+          ...(requestedExternalAccountId
+            ? { externalAccountId: requestedExternalAccountId }
+            : {}),
+          errorCode: selection.errorCode,
+          error: adapterAccountSelectionErrorMessage(selection.errorCode),
+        })
       }
+      const account = selection.account
+      operationExternalAccountId = account.externalAccountId
 
       // Use pre-processed HTML content directly
       let content = article.html || ''
@@ -205,7 +385,7 @@ export class SohuAdapter extends CodeAdapter {
       // Process images
       content = await this.processImages(
         content,
-        (src) => this.uploadImageByUrl(src),
+        (src) => this.uploadImageForAccount(src, account),
         {
           skipPatterns: ['sohu.com'],
           onProgress: options?.onImageProgress,
@@ -235,11 +415,12 @@ export class SohuAdapter extends CodeAdapter {
         visibleToLoginedUsers: 0,
         attrIds: [],
         auto: true,
-        accountId: Number(this.accountInfo!.id),
+        accountId: Number(account.externalAccountId),
       }
 
+      saveRequestStarted = true
       const response = await this.runtime.fetch(
-        `https://mp.sohu.com/mpbp/bp/news/v4/news/draft/v2?accountId=${this.accountInfo!.id}`,
+        `https://mp.sohu.com/mpbp/bp/news/v4/news/draft/v2?accountId=${account.externalAccountId}`,
         {
           method: 'POST',
           credentials: 'include',
@@ -254,41 +435,67 @@ export class SohuAdapter extends CodeAdapter {
       )
 
       const res = await response.json() as {
-        success: boolean
+        success?: unknown
         data?: string | number
         msg?: string
       }
 
       logger.debug(' Save response:', res)
 
-      if (!res.success) {
-        throw new Error(res.msg || '保存失败')
+      if (res?.success === false) {
+        terminalSaveResult = this.createResult(false, {
+          externalAccountId: account.externalAccountId,
+          errorCode: 'SOHU_DRAFT_SAVE_REJECTED',
+          error: res.msg || '保存失败',
+        })
+        return terminalSaveResult
+      }
+      if (res?.success !== true) {
+        terminalSaveResult = createUnknownSaveResult()
+        return terminalSaveResult
       }
 
       const postId = normalizeSafePositiveIntegerId(res.data)
       if (!postId) {
-        throw new Error('保存失败: 响应中的文章 ID 无效')
+        terminalSaveResult = createUnknownSaveResult()
+        return terminalSaveResult
       }
-      const draftUrl = `https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?spm=smmp.articlelist.0.0&contentStatus=2&id=${postId}&accountId=${this.accountInfo!.id}`
+      const draftUrl = `https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?spm=smmp.articlelist.0.0&contentStatus=2&id=${postId}&accountId=${account.externalAccountId}`
 
-      return this.createResult(true, {
+      terminalSaveResult = this.createResult(true, {
         postId: String(postId),
         postUrl: draftUrl,
+        externalAccountId: account.externalAccountId,
         draftOnly: options?.draftOnly ?? true,
       })
-    }).catch((error) => this.createResult(false, {
-      error: (error as Error).message,
-    }))
+      return terminalSaveResult
+    }).catch((error) => {
+      if (terminalSaveResult) return terminalSaveResult
+      if (saveRequestStarted) return createUnknownSaveResult()
+      return this.createResult(false, {
+        ...(operationExternalAccountId
+          ? { externalAccountId: operationExternalAccountId }
+          : {}),
+        error: (error as Error).message,
+      })
+    })
   }
 
   /**
    * 通过 URL 上传图片
    */
   protected async uploadImageByUrl(src: string): Promise<ImageUploadResult> {
-    if (!this.accountInfo) {
-      throw new Error('未登录')
+    const selection = resolveAdapterAccountBinding(await this.probeAccounts())
+    if (!selection.ok) {
+      throw new Error(adapterAccountSelectionErrorMessage(selection.errorCode))
     }
+    return this.uploadImageForAccount(src, selection.account)
+  }
 
+  private async uploadImageForAccount(
+    src: string,
+    account: AdapterAccount,
+  ): Promise<ImageUploadResult> {
     // 1. 下载图片
     const imageResponse = await fetch(src)
     if (!imageResponse.ok) {
@@ -300,10 +507,11 @@ export class SohuAdapter extends CodeAdapter {
     const formData = new FormData()
     const filename = imageBlob.type === 'image/svg+xml' ? 'table.svg' : 'image.jpg'
     formData.append('file', imageBlob, filename)
-    formData.append('accountId', this.accountInfo.id)
+    formData.append('accountId', account.externalAccountId)
 
     const uploadResponse = await this.runtime.fetch(
-      'https://mp.sohu.com/commons/front/outerUpload/image/file?accountId='+  this.accountInfo.id,
+      'https://mp.sohu.com/commons/front/outerUpload/image/file?accountId=' +
+        account.externalAccountId,
       {
         method: 'POST',
         credentials: 'include',

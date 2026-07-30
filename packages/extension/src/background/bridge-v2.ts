@@ -1,7 +1,6 @@
 import {
   OpenPublicationDraftRequestSchema,
   OpenPublicationDraftResultSchema,
-  parsePublicationUrl,
   PublicationInspectRequestSchema,
   PublicationObservationSchema,
   PublicationPlatformSchema,
@@ -27,6 +26,10 @@ import {
   normalizeBridgeRequestId,
   type GetAccountsV2Payload,
 } from '../bridge/protocol'
+import {
+  runInternalPublicationInspection,
+  type PublicationInspectorAdapter,
+} from './publication-inspection-runner'
 
 const BRIDGE_ORIGIN = DEFAULT_BRIDGE_ALLOWED_ORIGINS[0]
 const ACCOUNT_CAPABILITIES = {
@@ -50,17 +53,6 @@ const ACTIVE_INSPECTION_PLATFORMS = new Set<PublicationPlatform>([
   'weixin',
 ])
 const ACTIVE_DRAFT_OPEN_PLATFORMS = new Set<PublicationPlatform>(['weixin'])
-const EXACT_ARTICLE_LIFECYCLE_OUTCOMES = new Set<
-  PublicationObservation['outcome']
->([
-  'DRAFT_PRESENT',
-  'PENDING_REVIEW',
-  'REJECTED',
-  'SCHEDULED',
-  'PUBLISHED',
-  'NOT_FOUND',
-  'DELETED',
-])
 const GET_ACCOUNTS_KEYS = new Set(['platforms', 'forceRefresh'])
 const INSPECT_KEYS = new Set([
   'requestId',
@@ -603,134 +595,10 @@ export function createUnsupportedPublicationObservation(
   })
 }
 
-type PublicationInspectorAdapter = Pick<PlatformAdapter, 'inspectPublication'>
 type PublicationDraftOpenerAdapter = Pick<
   PlatformAdapter,
   'checkAuth' | 'openPublicationDraft'
 >
-
-interface PublicationIdentityPolicy {
-  platform: PublicationPlatform
-  resolveRequestPostId?(request: PublicationInspectRequest): string | null
-  requiresExactPostIdForAllOutcomes?: boolean
-  allowedArticleLifecycleOutcomes?: ReadonlySet<
-    PublicationObservation['outcome']
-  >
-  validateDraftIdentity(
-    request: PublicationInspectRequest,
-    identity: NonNullable<ReturnType<typeof parsePublicationUrl>>,
-  ): boolean
-  validatePublishedIdentity(
-    request: PublicationInspectRequest,
-    observation: PublicationObservation,
-    expectedPostId: string,
-    identity: NonNullable<ReturnType<typeof parsePublicationUrl>>,
-  ): boolean
-}
-
-const PUBLICATION_IDENTITY_POLICIES: Partial<
-  Record<PublicationPlatform, PublicationIdentityPolicy>
-> = {
-  zhihu: {
-    platform: 'zhihu',
-    validateDraftIdentity: () => true,
-    validatePublishedIdentity: (
-      _request,
-      observation,
-      expectedPostId,
-      identity,
-    ) =>
-      identity.postId === expectedPostId &&
-      identity.postId === observation.platformPostId,
-  },
-  sohu: {
-    platform: 'sohu',
-    validateDraftIdentity: (request, identity) =>
-      !identity.accountId || identity.accountId === request.externalAccountId,
-    validatePublishedIdentity: (
-      request,
-      observation,
-      expectedPostId,
-      identity,
-    ) => {
-      const expectedCanonicalUrl = `https://www.sohu.com/a/${expectedPostId}_${request.externalAccountId}`
-      return (
-        observation.source === 'PUBLIC_PAGE' &&
-        Boolean(observation.publishedAt) &&
-        identity.postId === expectedPostId &&
-        identity.postId === observation.platformPostId &&
-        identity.accountId === request.externalAccountId &&
-        identity.canonicalUrl === expectedCanonicalUrl
-      )
-    },
-  },
-  weixin: {
-    platform: 'weixin',
-    requiresExactPostIdForAllOutcomes: true,
-    resolveRequestPostId: (request) => {
-      const resolved = resolveWeixinAppMsgId(
-        request.draft.platformPostId,
-        request.draft.draftUrl,
-      )
-      return resolved.success ? resolved.appMsgId : null
-    },
-    allowedArticleLifecycleOutcomes: new Set(['DRAFT_PRESENT', 'PUBLISHED']),
-    validateDraftIdentity: () => true,
-    // The public URL's mid is a different identifier. The adapter preserves
-    // the requested appMsgId after an exact published-list match.
-    validatePublishedIdentity: (
-      _request,
-      observation,
-      expectedPostId,
-      identity,
-    ) =>
-      observation.source === 'PUBLIC_PAGE' &&
-      Boolean(observation.publishedAt) &&
-      typeof observation.title === 'string' &&
-      observation.title.trim().length > 0 &&
-      typeof observation.bodyText === 'string' &&
-      observation.bodyText.trim().length > 0 &&
-      typeof observation.bodyTruncated === 'boolean' &&
-      observation.errorCode === undefined &&
-      observation.errorMessage === undefined &&
-      observation.platformPostId === expectedPostId &&
-      identity.canonicalUrl === observation.canonicalUrl,
-  },
-}
-
-function resolveRequestPostId(
-  request: PublicationInspectRequest,
-  policy: PublicationIdentityPolicy,
-): string | null {
-  if (policy.resolveRequestPostId) {
-    return policy.resolveRequestPostId(request)
-  }
-
-  const explicitPostId = request.draft.platformPostId
-  let draftUrlPostId: string | undefined
-
-  if (request.draft.draftUrl) {
-    const parsedDraftUrl = parsePublicationUrl(
-      policy.platform,
-      request.draft.draftUrl,
-    )
-    if (
-      !parsedDraftUrl ||
-      parsedDraftUrl.surface !== 'DRAFT' ||
-      !parsedDraftUrl.postId ||
-      !policy.validateDraftIdentity(request, parsedDraftUrl)
-    ) {
-      return null
-    }
-    draftUrlPostId = parsedDraftUrl.postId
-  }
-
-  if (explicitPostId && draftUrlPostId && explicitPostId !== draftUrlPostId) {
-    return null
-  }
-
-  return explicitPostId ?? draftUrlPostId ?? null
-}
 
 function createInspectionFailure(
   request: PublicationInspectRequest,
@@ -751,101 +619,6 @@ function createInspectionFailure(
     errorCode,
     errorMessage,
   })
-}
-
-function normalizeAdapterObservations(
-  request: PublicationInspectRequest,
-  value: unknown,
-): PublicationObservation[] | null {
-  if (
-    !Array.isArray(value) ||
-    value.length === 0 ||
-    value.length > request.limit
-  ) {
-    return null
-  }
-
-  const seenKeys = new Set<string>()
-  const observations: PublicationObservation[] = []
-  const identityPolicy = PUBLICATION_IDENTITY_POLICIES[request.platform]
-  const expectedPostId = identityPolicy
-    ? resolveRequestPostId(request, identityPolicy)
-    : null
-
-  for (const candidate of value) {
-    const parsed = PublicationObservationSchema.safeParse(candidate)
-    if (
-      !parsed.success ||
-      parsed.data.platform !== request.platform ||
-      parsed.data.externalAccountId !== request.externalAccountId ||
-      seenKeys.has(parsed.data.observationKey)
-    ) {
-      return null
-    }
-
-    let normalized = parsed.data
-    if (
-      identityPolicy?.requiresExactPostIdForAllOutcomes &&
-      (!expectedPostId || normalized.platformPostId !== expectedPostId)
-    ) {
-      return null
-    }
-    if (
-      identityPolicy &&
-      EXACT_ARTICLE_LIFECYCLE_OUTCOMES.has(normalized.outcome) &&
-      (identityPolicy.allowedArticleLifecycleOutcomes?.has(
-        normalized.outcome,
-      ) === false ||
-        !expectedPostId ||
-        normalized.platformPostId !== expectedPostId)
-    ) {
-      return null
-    }
-
-    if (normalized.canonicalUrl) {
-      const canonical = parsePublicationUrl(
-        request.platform,
-        normalized.canonicalUrl,
-      )
-      if (
-        !canonical ||
-        canonical.surface !== 'PUBLISHED' ||
-        !canonical.canonicalUrl
-      ) {
-        return null
-      }
-      if (
-        identityPolicy &&
-        EXACT_ARTICLE_LIFECYCLE_OUTCOMES.has(normalized.outcome) &&
-        (!expectedPostId ||
-          !identityPolicy.validatePublishedIdentity(
-            request,
-            normalized,
-            expectedPostId,
-            canonical,
-          ))
-      ) {
-        return null
-      }
-      normalized = {
-        ...normalized,
-        canonicalUrl: canonical.canonicalUrl,
-      }
-    }
-
-    if (
-      identityPolicy &&
-      normalized.outcome === 'PUBLISHED' &&
-      (!expectedPostId || !normalized.canonicalUrl || !normalized.publishedAt)
-    ) {
-      return null
-    }
-
-    seenKeys.add(normalized.observationKey)
-    observations.push(normalized)
-  }
-
-  return observations
 }
 
 function withInspectionDeadline<T>(
@@ -971,45 +744,54 @@ export async function runPublicationInspection(
   adapter: PublicationInspectorAdapter | null,
   timeoutMs = INSPECTION_TIMEOUT_MS,
 ): Promise<PublicationObservation[]> {
-  if (
-    !ACTIVE_INSPECTION_PLATFORMS.has(request.platform) ||
-    !adapter?.inspectPublication
-  ) {
-    return [createUnsupportedPublicationObservation(request)]
-  }
+  const result = await runInternalPublicationInspection(request, adapter, {
+    activePlatforms: ACTIVE_INSPECTION_PLATFORMS,
+    timeoutMs,
+  })
 
-  try {
-    const value = await withInspectionDeadline(
-      (signal) => adapter.inspectPublication!(request, { signal }),
-      timeoutMs,
-    )
-    const observations = normalizeAdapterObservations(request, value)
-    if (!observations) {
-      return [
-        createInspectionFailure(
-          request,
-          'PARSE_ERROR',
-          'INVALID_INSPECTION_RESULT',
-          'The platform inspector returned an invalid result.',
-        ),
-      ]
+  if (!result.ok) {
+    if (result.code === 'PUBLICATION_INSPECTION_NOT_IMPLEMENTED') {
+      return [createUnsupportedPublicationObservation(request)]
     }
-    return observations
-  } catch (error) {
-    const timedOut =
-      error instanceof Error &&
-      error.message === 'PUBLICATION_INSPECTION_TIMEOUT'
+    const timedOut = result.code === 'PUBLICATION_INSPECTION_TIMEOUT'
     return [
       createInspectionFailure(
         request,
-        'FETCH_ERROR',
+        timedOut || result.code === 'PUBLICATION_INSPECTION_FAILED'
+          ? 'FETCH_ERROR'
+          : 'PARSE_ERROR',
         timedOut
           ? 'PUBLICATION_INSPECTION_TIMEOUT'
-          : 'PUBLICATION_INSPECTION_FAILED',
+          : result.code === 'PUBLICATION_INSPECTION_FAILED'
+            ? 'PUBLICATION_INSPECTION_FAILED'
+            : 'INVALID_INSPECTION_RESULT',
         timedOut
           ? 'The platform inspection timed out.'
-          : 'The platform inspection failed.',
+          : result.code === 'PUBLICATION_INSPECTION_FAILED'
+            ? 'The platform inspection failed.'
+            : 'The platform inspector returned an invalid result.',
       ),
     ]
   }
+
+  const observations = result.observations.map((observation) =>
+    PublicationObservationSchema.safeParse(observation),
+  )
+  if (observations.some((observation) => !observation.success)) {
+    return [
+      createInspectionFailure(
+        request,
+        'PARSE_ERROR',
+        'INVALID_INSPECTION_RESULT',
+        'The platform inspector returned an invalid result.',
+      ),
+    ]
+  }
+
+  return observations.map((observation) => {
+    if (!observation.success) {
+      throw new Error('unreachable invalid observation')
+    }
+    return observation.data
+  })
 }

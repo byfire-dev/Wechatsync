@@ -9,5 +9,8 @@ export * from './markdown-images'
 // 日志系统
 export * from './logger'
 
+// 安全 HTTP 重定向与限长响应读取
+export * from './safe-http'
+
 // AWS4 签名（用于字节跳动 ImageX 等）
 export * from './aws4'

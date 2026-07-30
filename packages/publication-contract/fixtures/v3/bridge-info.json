@@ -1,23 +1,29 @@
 {
   "contractVersion": "3.0",
-  "extensionVersion": "2.0.26",
+  "extensionVersion": "2.0.29",
   "platforms": [
     {
       "contractVersion": "3.0",
       "platform": "zhihu",
-      "adapterVersion": "2.0.26",
+      "adapterVersion": "2.0.29",
+      "capabilities": ["publication_inspect"]
+    },
+    {
+      "contractVersion": "3.0",
+      "platform": "toutiao",
+      "adapterVersion": "2.0.29",
       "capabilities": ["publication_inspect"]
     },
     {
       "contractVersion": "3.0",
       "platform": "sohu",
-      "adapterVersion": "2.0.26",
+      "adapterVersion": "2.0.29",
       "capabilities": ["publication_inspect"]
     },
     {
       "contractVersion": "3.0",
       "platform": "weixin",
-      "adapterVersion": "2.0.26",
+      "adapterVersion": "2.0.29",
       "capabilities": ["publication_inspect"]
     }
   ]

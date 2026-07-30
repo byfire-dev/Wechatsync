@@ -73,6 +73,43 @@ const mockAdapterRegistry = {
 
 // Mock @wechatsync/core 模块
 vi.mock('@wechatsync/core', () => ({
+  normalizeAdapterExternalAccountId: (value: unknown) => {
+    if (typeof value !== 'string') return null
+    const normalized = value.trim()
+    if (
+      normalized.length === 0 ||
+      normalized.length > 500 ||
+      /[\u0000-\u001f\u007f]/.test(normalized)
+    ) {
+      return null
+    }
+    return normalized
+  },
+  normalizeAdapterAccountBinding: (value: unknown) => {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      Array.isArray(value) ||
+      Object.getOwnPropertySymbols(value).length > 0 ||
+      Object.keys(value).length !== 1 ||
+      !Object.prototype.hasOwnProperty.call(value, 'externalAccountId')
+    ) {
+      return null
+    }
+    const externalAccountId = (
+      value as { externalAccountId?: unknown }
+    ).externalAccountId
+    if (typeof externalAccountId !== 'string') return null
+    const normalized = externalAccountId.trim()
+    if (
+      normalized.length === 0 ||
+      normalized.length > 500 ||
+      /[\u0000-\u001f\u007f]/.test(normalized)
+    ) {
+      return null
+    }
+    return { externalAccountId: normalized }
+  },
   adapterRegistry: {
     setRuntime: vi.fn((runtime: any) => {
       mockAdapterRegistry.runtime = runtime

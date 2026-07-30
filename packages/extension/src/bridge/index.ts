@@ -1,4 +1,7 @@
 export * from './protocol'
+export * from './protocol-v3'
+export * from './publication-capabilities-v3'
+export * from './account-bindings'
 export * from './legacy-account'
 export * from './legacy-magic-call'
 export * from './legacy-origin-policy'

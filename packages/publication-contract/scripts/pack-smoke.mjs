@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,12 +14,8 @@ const scratchDirectory = await mkdtemp(
 );
 const consumerDirectory = path.join(scratchDirectory, "consumer");
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-const tscCommand = path.join(
-  packageDirectory,
-  "node_modules",
-  ".bin",
-  process.platform === "win32" ? "tsc.cmd" : "tsc",
-);
+const require = createRequire(import.meta.url);
+const tscScript = require.resolve("typescript/bin/tsc");
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {
@@ -106,10 +103,10 @@ try {
       [
         "const { PublicationInspectResultV3Schema } = require('@wechatsync/publication-contract/v3')",
         "const { PublicationPlatformSchema } = require('@wechatsync/publication-contract/v2')",
-        "const fixture = require('@wechatsync/publication-contract/fixtures/v3/zhihu-published.json')",
+        "const fixture = require('@wechatsync/publication-contract/fixtures/v3/toutiao-published.json')",
         "if (PublicationPlatformSchema.parse('sohu') !== 'sohu') throw new Error('v2 CJS export failed')",
         "if (typeof PublicationInspectResultV3Schema.safeParse !== 'function') throw new Error('v3 CJS export failed')",
-        "if (fixture.contractVersion !== '3.0') throw new Error('fixture export failed')",
+        "if (!PublicationInspectResultV3Schema.safeParse(fixture).success) throw new Error('fixture export failed')",
       ].join(";"),
     ],
     consumerDirectory,
@@ -157,7 +154,11 @@ try {
     "utf8",
   );
 
-  run(tscCommand, ["--project", "tsconfig.json"], consumerDirectory);
+  run(
+    process.execPath,
+    [tscScript, "--project", "tsconfig.json"],
+    consumerDirectory,
+  );
 
   console.log(
     `Packed ESM/CJS runtime, types, and fixtures verified: ${tarballName}`,

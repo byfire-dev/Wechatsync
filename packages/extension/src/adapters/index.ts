@@ -3,15 +3,29 @@
  */
 import {
   adapterRegistry,
+  normalizeAdapterAccountBinding,
+  normalizeAdapterExternalAccountId,
   type PlatformAdapter,
+  type AdapterAccountBinding,
+  type PlatformAccountBinding,
   type PlatformMeta,
   type AuthProbeErrorCode,
   type AuthResult,
   type Article,
   type SyncResult,
 } from '@wechatsync/core'
+import {
+  PublicationPlatformV3Schema,
+  type PublicationPlatformV3,
+} from '@wechatsync/publication-contract/v3'
 import { createExtensionRuntime } from '../runtime/extension'
 import { createLogger } from '../lib/logger'
+import { deriveRegisteredPublicationInspectorPlatforms } from '../bridge/publication-capabilities-v3'
+import { isConfirmedSyncSuccess } from '../lib/sync-outcome'
+import {
+  INVALID_ACCOUNT_BINDINGS,
+  validatePlatformAccountBindings,
+} from '../bridge/account-bindings'
 import {
   trackSyncStart,
   trackPlatformSync,
@@ -172,6 +186,35 @@ export function getAllPlatformMetas() {
 }
 
 /**
+ * Derive the v3 publication capability surface from the adapters that are
+ * actually registered in this extension build. A platform is advertised only
+ * when its live adapter exposes both inspection and PUBLISHED proof.
+ */
+export async function getRegisteredPublicationInspectorPlatforms(): Promise<
+  PublicationPlatformV3[]
+> {
+  await initAdapters()
+
+  const candidates: Array<{
+    platformId: string
+    inspectPublication?: unknown
+    provePublishedObservation?: unknown
+  }> = []
+  for (const platformId of adapterRegistry.getRegisteredIds()) {
+    const platform = PublicationPlatformV3Schema.safeParse(platformId)
+    if (!platform.success) continue
+
+    const adapter = await adapterRegistry.get(platform.data)
+    candidates.push({
+      platformId: platform.data,
+      inspectPublication: adapter?.inspectPublication,
+      provePublishedObservation: adapter?.provePublishedObservation,
+    })
+  }
+  return deriveRegisteredPublicationInspectorPlatforms(candidates)
+}
+
+/**
  * 获取平台的预处理配置
  */
 export function getPlatformPreprocessConfig(platformId: string) {
@@ -192,6 +235,20 @@ const AUTH_CACHE_TTL_UNAUTHENTICATED = 30 * 1000 // 未登录：30 秒缓存（�
 const AUTH_CHECK_CONCURRENCY = 5 // 并行检查数量
 const AUTH_CHECK_TIMEOUT = 10 * 1000 // 单个平台认证检查超时：10 秒
 const PUBLISH_TIMEOUT = 10 * 60 * 1000 // 单个平台发布超时：10 分钟（包含图片上传）
+
+export const ACCOUNT_BINDING_SYNC_ERROR_CODES = {
+  UNSUPPORTED: 'ACCOUNT_BINDING_UNSUPPORTED',
+  PROBE_UNAVAILABLE: 'ACCOUNT_BINDING_PROBE_UNAVAILABLE',
+  RESULT_IDENTITY_MISSING: 'ACCOUNT_RESULT_IDENTITY_MISSING',
+  RESULT_IDENTITY_MISMATCH: 'ACCOUNT_RESULT_IDENTITY_MISMATCH',
+} as const
+
+export const PUBLISH_SYNC_ERROR_CODES = {
+  TIMEOUT_OUTCOME_UNKNOWN: 'PUBLISH_TIMEOUT_OUTCOME_UNKNOWN',
+} as const
+
+const PUBLISH_TIMEOUT_OUTCOME_UNKNOWN_MESSAGE =
+  'The publish operation timed out after a platform write may have started. Verify the platform before any retry.'
 
 class OperationTimeoutError extends Error {
   constructor(message: string) {
@@ -486,7 +543,13 @@ export type ImageProgressCallback = (platform: string, current: number, total: n
 /**
  * 同步阶段类型
  */
-export type SyncStage = 'starting' | 'uploading_images' | 'saving' | 'completed' | 'failed'
+export type SyncStage =
+  | 'starting'
+  | 'uploading_images'
+  | 'saving'
+  | 'completed'
+  | 'review_required'
+  | 'failed'
 
 /**
  * 详细同步进度类型
@@ -494,6 +557,7 @@ export type SyncStage = 'starting' | 'uploading_images' | 'saving' | 'completed'
 export interface SyncDetailProgress {
   platform: string
   platformName: string
+  externalAccountId?: string
   stage: SyncStage
   // 图片上传进度（uploading_images 阶段）
   imageProgress?: { current: number; total: number }
@@ -519,7 +583,10 @@ export interface SyncCallbacks {
 export async function syncToPlatform(
   platformId: string,
   article: Article,
-  options?: { draftOnly?: boolean },
+  options?: {
+    draftOnly?: boolean
+    accountBinding?: AdapterAccountBinding
+  },
   onImageProgress?: ImageProgressCallback
 ): Promise<SyncResult> {
   const adapter = await getAdapter(platformId)
@@ -528,6 +595,43 @@ export async function syncToPlatform(
       platform: platformId,
       success: false,
       error: 'Platform not found',
+      timestamp: Date.now(),
+    }
+  }
+
+  const accountBinding =
+    options?.accountBinding === undefined
+      ? undefined
+      : normalizeAdapterAccountBinding(options.accountBinding)
+  if (options?.accountBinding !== undefined && !accountBinding) {
+    return {
+      platform: platformId,
+      success: false,
+      errorCode: 'INVALID_ACCOUNT_BINDING',
+      error: 'Invalid account binding',
+      timestamp: Date.now(),
+    }
+  }
+  if (
+    accountBinding &&
+    !adapter.meta.capabilities.includes('account_binding')
+  ) {
+    return {
+      platform: platformId,
+      success: false,
+      externalAccountId: accountBinding.externalAccountId,
+      errorCode: ACCOUNT_BINDING_SYNC_ERROR_CODES.UNSUPPORTED,
+      error: 'Platform does not support exact account binding',
+      timestamp: Date.now(),
+    }
+  }
+  if (accountBinding && typeof adapter.probeAccounts !== 'function') {
+    return {
+      platform: platformId,
+      success: false,
+      externalAccountId: accountBinding.externalAccountId,
+      errorCode: ACCOUNT_BINDING_SYNC_ERROR_CODES.PROBE_UNAVAILABLE,
+      error: 'Platform account binding probe is unavailable',
       timestamp: Date.now(),
     }
   }
@@ -546,9 +650,10 @@ export async function syncToPlatform(
     }
 
     // 默认只保存草稿，带超时保护
-    return await withTimeout(
+    const result = await withTimeout(
       adapter.publish(platformArticle, {
         draftOnly: options?.draftOnly ?? true,
+        ...(accountBinding ? { accountBinding } : {}),
         onImageProgress: onImageProgress
           ? (current: number, total: number) => onImageProgress(platformId, current, total)
           : undefined,
@@ -556,10 +661,75 @@ export async function syncToPlatform(
       PUBLISH_TIMEOUT,
       `发布超时（${PUBLISH_TIMEOUT / 60000}分钟）`
     )
+    const normalizedResultExternalAccountId =
+      normalizeAdapterExternalAccountId(result.externalAccountId)
+    const {
+      externalAccountId: _untrustedResultExternalAccountId,
+      ...resultWithoutExternalAccountId
+    } = result
+    const normalizedResult: SyncResult = normalizedResultExternalAccountId
+      ? {
+          ...resultWithoutExternalAccountId,
+          externalAccountId: normalizedResultExternalAccountId,
+        }
+      : resultWithoutExternalAccountId
+    if (
+      accountBinding &&
+      normalizedResult.success &&
+      !normalizedResultExternalAccountId
+    ) {
+      return {
+        ...normalizedResult,
+        outcome: 'OUTCOME_UNKNOWN',
+        retryable: false,
+        requestedExternalAccountId: accountBinding.externalAccountId,
+        errorCode: ACCOUNT_BINDING_SYNC_ERROR_CODES.RESULT_IDENTITY_MISSING,
+        error:
+          'Platform reported a successful write, but the bound account identity could not be confirmed. Do not retry automatically.',
+      }
+    }
+    if (
+      accountBinding &&
+      normalizedResult.success &&
+      normalizedResultExternalAccountId !== null &&
+      normalizedResultExternalAccountId !== accountBinding.externalAccountId
+    ) {
+      return {
+        ...normalizedResult,
+        outcome: 'OUTCOME_UNKNOWN',
+        retryable: false,
+        requestedExternalAccountId: accountBinding.externalAccountId,
+        observedExternalAccountId: normalizedResultExternalAccountId,
+        errorCode: ACCOUNT_BINDING_SYNC_ERROR_CODES.RESULT_IDENTITY_MISMATCH,
+        error:
+          'Platform reported a successful write, but the observed account identity did not match the requested binding. Do not retry automatically.',
+      }
+    }
+    return normalizedResult
   } catch (error) {
+    if (error instanceof OperationTimeoutError) {
+      return {
+        platform: platformId,
+        success: true,
+        outcome: 'OUTCOME_UNKNOWN',
+        retryable: false,
+        ...(accountBinding
+          ? {
+              externalAccountId: accountBinding.externalAccountId,
+              requestedExternalAccountId: accountBinding.externalAccountId,
+            }
+          : {}),
+        errorCode: PUBLISH_SYNC_ERROR_CODES.TIMEOUT_OUTCOME_UNKNOWN,
+        error: PUBLISH_TIMEOUT_OUTCOME_UNKNOWN_MESSAGE,
+        timestamp: Date.now(),
+      }
+    }
     return {
       platform: platformId,
       success: false,
+      ...(accountBinding
+        ? { externalAccountId: accountBinding.externalAccountId }
+        : {}),
       error: (error as Error).message,
       timestamp: Date.now(),
     }
@@ -598,8 +768,29 @@ export async function syncToMultiplePlatforms(
   platformIds: string[],
   article: Article,
   callbacks?: SyncCallbacks,
-  source = 'popup' // 来源：popup, weixin, weixin-editor, mcp 等
+  source = 'popup', // 来源：popup, weixin, weixin-editor, mcp 等
+  options?: {
+    accountBindings?: readonly PlatformAccountBinding[]
+  },
 ): Promise<SyncResult[]> {
+  let accountBindings: PlatformAccountBinding[] = []
+  if (options?.accountBindings !== undefined) {
+    const validatedBindings = validatePlatformAccountBindings(
+      platformIds,
+      options.accountBindings,
+    )
+    if (!validatedBindings.success) {
+      throw new Error(INVALID_ACCOUNT_BINDINGS)
+    }
+    accountBindings = validatedBindings.accountBindings
+  }
+  const accountBindingByPlatform = new Map(
+    accountBindings.map((binding) => [
+      binding.platform,
+      { externalAccountId: binding.externalAccountId },
+    ]),
+  )
+
   // 创建新的取消控制器
   syncAbortController = new AbortController()
   const signal = syncAbortController.signal
@@ -628,11 +819,15 @@ export async function syncToMultiplePlatforms(
   // 同步单个平台并追踪
   const syncOne = async (platformId: string): Promise<SyncResult> => {
     const platformName = getPlatformName(platformId)
+    const accountBinding = accountBindingByPlatform.get(platformId)
 
     // 检查是否已取消
     if (signal.aborted) {
       const cancelledResult: SyncResult = {
         platform: platformId,
+        ...(accountBinding
+          ? { externalAccountId: accountBinding.externalAccountId }
+          : {}),
         success: false,
         error: '已取消',
         timestamp: Date.now(),
@@ -640,6 +835,9 @@ export async function syncToMultiplePlatforms(
       callbacks?.onDetailProgress?.({
         platform: platformId,
         platformName,
+        ...(accountBinding
+          ? { externalAccountId: accountBinding.externalAccountId }
+          : {}),
         stage: 'failed',
         result: cancelledResult,
         error: '已取消',
@@ -651,6 +849,9 @@ export async function syncToMultiplePlatforms(
     callbacks?.onDetailProgress?.({
       platform: platformId,
       platformName,
+      ...(accountBinding
+        ? { externalAccountId: accountBinding.externalAccountId }
+        : {}),
       stage: 'starting',
     })
 
@@ -663,6 +864,9 @@ export async function syncToMultiplePlatforms(
           callbacks?.onDetailProgress?.({
             platform: platformId,
             platformName,
+            ...(accountBinding
+              ? { externalAccountId: accountBinding.externalAccountId }
+              : {}),
             stage: 'uploading_images',
             imageProgress: { current, total },
           })
@@ -671,6 +875,9 @@ export async function syncToMultiplePlatforms(
             callbacks?.onDetailProgress?.({
               platform: platformId,
               platformName,
+              ...(accountBinding
+                ? { externalAccountId: accountBinding.externalAccountId }
+                : {}),
               stage: 'saving',
             })
           }
@@ -680,15 +887,25 @@ export async function syncToMultiplePlatforms(
     const result = await syncToPlatform(
       platformId,
       article,
-      undefined,
+      accountBinding ? { accountBinding } : undefined,
       wrappedImageProgress
     )
 
-    // 通知完成/失败
+    const terminalStage: SyncStage =
+      result.outcome === 'OUTCOME_UNKNOWN'
+        ? 'review_required'
+        : result.success
+          ? 'completed'
+          : 'failed'
+
+    // 通知完成/待核验/失败
     callbacks?.onDetailProgress?.({
       platform: platformId,
       platformName,
-      stage: result.success ? 'completed' : 'failed',
+      ...(accountBinding
+        ? { externalAccountId: accountBinding.externalAccountId }
+        : {}),
+      stage: terminalStage,
       result,
       error: result.error,
     })
@@ -697,10 +914,13 @@ export async function syncToMultiplePlatforms(
 
     // 追踪单个平台同步结果
     const platformDuration = Date.now() - platformStartTime
-    trackPlatformSync(source, platformId, result.success, {
+    const confirmedSuccess = isConfirmedSyncSuccess(result)
+    trackPlatformSync(source, platformId, confirmedSuccess, {
       draftOnly: result.draftOnly,
       errorType: result.error ? inferErrorType(result.error) : undefined,
       duration: platformDuration,
+      outcome:
+        result.outcome ?? (result.success ? 'SUCCEEDED' : 'FAILED'),
     }).catch(() => {})
 
     return result
@@ -713,13 +933,28 @@ export async function syncToMultiplePlatforms(
       // 剩余平台标记为已取消
       const remaining = platformIds.slice(i)
       for (const platformId of remaining) {
+        const platformName = getPlatformName(platformId)
+        const accountBinding = accountBindingByPlatform.get(platformId)
         const cancelledResult: SyncResult = {
           platform: platformId,
+          ...(accountBinding
+            ? { externalAccountId: accountBinding.externalAccountId }
+            : {}),
           success: false,
           error: '已取消',
           timestamp: Date.now(),
         }
         results.push(cancelledResult)
+        callbacks?.onDetailProgress?.({
+          platform: platformId,
+          platformName,
+          ...(accountBinding
+            ? { externalAccountId: accountBinding.externalAccountId }
+            : {}),
+          stage: 'failed',
+          result: cancelledResult,
+          error: '已取消',
+        })
         callbacks?.onResult?.(cancelledResult)
       }
       break
@@ -734,13 +969,21 @@ export async function syncToMultiplePlatforms(
   syncAbortController = null
 
   // 追踪同步完成
-  const successCount = results.filter(r => r.success).length
+  const successCount = results.filter(isConfirmedSyncSuccess).length
+  const reviewRequiredCount = results.filter(
+    r => r.outcome === 'OUTCOME_UNKNOWN'
+  ).length
   const cancelledCount = results.filter(r => r.error === '已取消').length
   trackSyncComplete({
     source,
     total: results.length,
     success: successCount,
-    failed: results.length - successCount - cancelledCount,
+    failed:
+      results.length -
+      successCount -
+      reviewRequiredCount -
+      cancelledCount,
+    reviewRequired: reviewRequiredCount,
     platforms: platformIds,
     duration: Date.now() - startTime,
   }).catch(() => {})
