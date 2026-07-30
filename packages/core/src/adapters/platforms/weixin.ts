@@ -23,12 +23,22 @@ import {
   parseWeixinPublishedListPayload,
   parseWeixinPublicArticleHtml,
   parseWeixinTempUrlPayload,
+  normalizeWeixinLongPublicArticleUrl,
   resolveWeixinAppMsgId,
   resolveWeixinTempUrl,
+  validateWeixinPublicPageResponse,
   WEIXIN_PUBLISHED_LIST_MAX_PAGES,
   WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
+  WEIXIN_PUBLIC_PAGE_MAX_BYTES,
 } from '../../publication-inspection/weixin'
 import { createLogger } from '../../lib/logger'
+import {
+  discardResponseBody,
+  fetchWithValidatedNoRedirects,
+  readBoundedResponseText,
+  type BoundedResponseTextErrorCode,
+  type SafeNoRedirectFetchErrorCode,
+} from '../../lib/safe-http'
 import juice from 'juice'
 
 const logger = createLogger('Weixin')
@@ -46,6 +56,41 @@ type WeixinPublishedLookup =
   | { kind: 'PUBLISHED'; observation: PublicationObservation }
   | { kind: 'REVIEW_REQUIRED'; observation: PublicationObservation }
   | { kind: 'FALLBACK_TO_DRAFT' }
+
+type WeixinPublicPageFetchResult =
+  | {
+      success: true
+      canonicalUrl: string
+      html: string
+    }
+  | {
+      success: false
+      errorCode: string
+      errorMessage: string
+    }
+
+function mapWeixinPublicFetchError(
+  errorCode: SafeNoRedirectFetchErrorCode,
+): string {
+  switch (errorCode) {
+    case 'SAFE_FETCH_INITIAL_URL_INVALID':
+      return 'WEIXIN_PUBLIC_CANDIDATE_URL_INVALID'
+    case 'SAFE_FETCH_REQUEST_FAILED':
+      return 'WEIXIN_PUBLIC_PAGE_FETCH_ERROR'
+    case 'SAFE_FETCH_REDIRECT_REJECTED':
+      return 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED'
+    case 'SAFE_FETCH_RESPONSE_URL_INVALID':
+      return 'WEIXIN_PUBLIC_RESPONSE_URL_INVALID'
+  }
+}
+
+function mapWeixinBodyReadError(
+  errorCode: BoundedResponseTextErrorCode,
+): string {
+  return errorCode === 'SAFE_RESPONSE_BODY_TOO_LARGE'
+    ? 'WEIXIN_PUBLIC_BODY_TOO_LARGE'
+    : 'WEIXIN_PUBLIC_BODY_READ_ERROR'
+}
 
 // 微信公众号的默认 CSS 样式
 const WEIXIN_CSS = `
@@ -103,6 +148,83 @@ export class WeixinAdapter extends CodeAdapter {
       resourceTypes: ['xmlhttprequest'],
     },
   ]
+
+  private async fetchPublicArticlePage(
+    candidateUrl: string,
+    signal?: AbortSignal,
+  ): Promise<WeixinPublicPageFetchResult> {
+    signal?.throwIfAborted()
+    const fetched = await fetchWithValidatedNoRedirects({
+      fetch: (url, options) => this.runtime.fetch(url, options),
+      initialUrl: candidateUrl,
+      validateUrl: normalizeWeixinLongPublicArticleUrl,
+      request: {
+        method: 'GET',
+        credentials: 'omit',
+        cache: 'no-store',
+        signal,
+        headers: {
+          Accept: 'text/html,application/xhtml+xml',
+        },
+      },
+    })
+    signal?.throwIfAborted()
+
+    if (!fetched.success) {
+      return {
+        success: false,
+        errorCode: mapWeixinPublicFetchError(fetched.errorCode),
+        errorMessage:
+          'The matched WeChat public article request could not be verified.',
+      }
+    }
+
+    const { response } = fetched
+    if (!response.ok) {
+      await discardResponseBody(response)
+      return {
+        success: false,
+        errorCode: 'WEIXIN_PUBLIC_PAGE_HTTP_ERROR',
+        errorMessage:
+          'The matched WeChat public article returned an unexpected HTTP status.',
+      }
+    }
+
+    const resolution = validateWeixinPublicPageResponse(candidateUrl, {
+      url: response.url,
+      redirected: response.redirected,
+      headers: response.headers,
+    })
+    if (!resolution.success) {
+      await discardResponseBody(response)
+      return {
+        success: false,
+        errorCode: resolution.errorCode,
+        errorMessage:
+          'The matched WeChat public article response could not be verified.',
+      }
+    }
+
+    const body = await readBoundedResponseText(
+      response,
+      WEIXIN_PUBLIC_PAGE_MAX_BYTES,
+    )
+    signal?.throwIfAborted()
+    if (!body.success) {
+      return {
+        success: false,
+        errorCode: mapWeixinBodyReadError(body.errorCode),
+        errorMessage:
+          'The matched WeChat public article body could not be read safely.',
+      }
+    }
+
+    return {
+      success: true,
+      canonicalUrl: resolution.canonicalUrl,
+      html: body.text,
+    }
+  }
 
   async checkAuth(context?: AdapterOperationContext): Promise<AuthResult> {
     const signal = context?.signal
@@ -265,69 +387,32 @@ export class WeixinAdapter extends CodeAdapter {
         continue
       }
 
-      let publicResponse: Response
-      try {
-        publicResponse = await this.runtime.fetch(lookup.canonicalUrl, {
-          method: 'GET',
-          credentials: 'omit',
-          redirect: 'follow',
-          signal,
-        })
-      } catch {
-        signal?.throwIfAborted()
+      const publicPage = await this.fetchPublicArticlePage(
+        lookup.canonicalUrl,
+        signal,
+      )
+      if (!publicPage.success) {
         return {
           kind: 'REVIEW_REQUIRED',
           observation: this.createInspectionError(
             request,
             'REVIEW_REQUIRED',
-            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
-            'The matched WeChat public article could not be verified.',
+            publicPage.errorCode,
+            publicPage.errorMessage,
             appMsgId,
             'PUBLIC_PAGE',
           ),
         }
       }
 
-      if (!publicResponse.ok) {
-        return {
-          kind: 'REVIEW_REQUIRED',
-          observation: this.createInspectionError(
-            request,
-            'REVIEW_REQUIRED',
-            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
-            'The matched WeChat public article could not be verified.',
-            appMsgId,
-            'PUBLIC_PAGE',
-          ),
-        }
-      }
-
-      let publicHtml: string
-      try {
-        publicHtml = await publicResponse.text()
-      } catch {
-        signal?.throwIfAborted()
-        return {
-          kind: 'REVIEW_REQUIRED',
-          observation: this.createInspectionError(
-            request,
-            'REVIEW_REQUIRED',
-            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
-            'The matched WeChat public article could not be verified.',
-            appMsgId,
-            'PUBLIC_PAGE',
-          ),
-        }
-      }
-
-      const article = parseWeixinPublicArticleHtml(publicHtml)
+      const article = parseWeixinPublicArticleHtml(publicPage.html)
       if (!article.success) {
         return {
           kind: 'REVIEW_REQUIRED',
           observation: this.createInspectionError(
             request,
             'REVIEW_REQUIRED',
-            'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
+            'WEIXIN_PUBLIC_PAGE_CONTENT_INVALID',
             'The matched WeChat public article could not be verified.',
             appMsgId,
             'PUBLIC_PAGE',
@@ -344,7 +429,7 @@ export class WeixinAdapter extends CodeAdapter {
           outcome: 'PUBLISHED',
           source: 'PUBLIC_PAGE',
           platformPostId: appMsgId,
-          canonicalUrl: lookup.canonicalUrl,
+          canonicalUrl: publicPage.canonicalUrl,
           title: article.title,
           publishedAt: lookup.publishedAt,
           bodyText: article.bodyText,
@@ -628,14 +713,24 @@ export class WeixinAdapter extends CodeAdapter {
     request: PublicationInspectRequest,
     observation: PublicationObservation,
   ): PublicationPublishedProof | null {
+    const appMsgIdResolution = resolveWeixinAppMsgId(
+      request.draft.platformPostId,
+      request.draft.draftUrl,
+    )
+    const normalizedCanonicalUrl = observation.canonicalUrl
+      ? normalizeWeixinLongPublicArticleUrl(observation.canonicalUrl)
+      : null
     if (
       request.platform !== 'weixin' ||
       observation.platform !== 'weixin' ||
       observation.externalAccountId !== request.externalAccountId ||
       observation.outcome !== 'PUBLISHED' ||
       observation.source !== 'PUBLIC_PAGE' ||
+      !appMsgIdResolution.success ||
       !observation.platformPostId ||
+      observation.platformPostId !== appMsgIdResolution.appMsgId ||
       !observation.canonicalUrl ||
+      normalizedCanonicalUrl !== observation.canonicalUrl ||
       !observation.publishedAt ||
       !observation.title?.trim() ||
       !observation.bodyText?.trim() ||

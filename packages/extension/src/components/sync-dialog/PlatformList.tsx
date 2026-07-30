@@ -1,5 +1,9 @@
-import { Check, X, Loader2, ExternalLink, ChevronRight } from 'lucide-react'
+import { Check, X, Loader2, ExternalLink, ChevronRight, AlertTriangle } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import {
+  isConfirmedSyncSuccess,
+  isSyncReviewRequired,
+} from '@/lib/sync-outcome'
 import type { Platform, SyncResult, PlatformProgress, DialogStatus } from './types'
 
 interface PlatformListProps {
@@ -30,7 +34,8 @@ export function PlatformList({
   const authenticatedPlatforms = platforms.filter(p => p.isAuthenticated)
   const unauthenticatedPlatforms = platforms.filter(p => !p.isAuthenticated)
   const selectedCount = selected.size
-  const successCount = results.filter(r => r.success).length
+  const successCount = results.filter(isConfirmedSyncSuccess).length
+  const reviewRequiredCount = results.filter(isSyncReviewRequired).length
   const failedCount = results.filter(r => !r.success).length
 
   // Idle: show all (authenticated first), syncing/completed: only selected
@@ -85,6 +90,11 @@ export function PlatformList({
               {failedCount > 0 && (
                 <span className="inline-flex items-center gap-0.5 text-xs text-red-500">
                   <X className="w-3 h-3" />{failedCount}
+                </span>
+              )}
+              {reviewRequiredCount > 0 && (
+                <span className="inline-flex items-center gap-0.5 text-xs text-amber-600">
+                  <AlertTriangle className="w-3 h-3" />{reviewRequiredCount}
                 </span>
               )}
             </div>
@@ -176,7 +186,8 @@ function PlatformRow({
         isIdle && platform.isAuthenticated && 'cursor-pointer hover:bg-muted/60',
         isIdle && !platform.isAuthenticated && 'cursor-pointer opacity-50 hover:opacity-70',
         isIdle && isSelected && 'bg-primary/5',
-        isDone && result?.success && 'bg-green-50 dark:bg-green-950/20',
+        isDone && result && isSyncReviewRequired(result) && 'bg-amber-50 dark:bg-amber-950/20',
+        isDone && result?.success && !isSyncReviewRequired(result) && 'bg-green-50 dark:bg-green-950/20',
         isDone && result && !result.success && 'bg-red-50 dark:bg-red-950/20',
       )}
     >
@@ -234,6 +245,13 @@ function RowIndicator({
   result: SyncResult | null
 }) {
   if (result) {
+    if (isSyncReviewRequired(result)) {
+      return (
+        <div className="w-5 h-5 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center flex-shrink-0">
+          <AlertTriangle className="w-3 h-3 text-amber-600 dark:text-amber-400" />
+        </div>
+      )
+    }
     return result.success ? (
       <div className="w-5 h-5 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center flex-shrink-0">
         <Check className="w-3 h-3 text-green-600 dark:text-green-400" />
@@ -285,6 +303,16 @@ function RowInfo({
 }) {
   // Done
   if (result) {
+    if (isSyncReviewRequired(result)) {
+      return (
+        <span
+          className="text-xs text-amber-600 dark:text-amber-400 truncate max-w-[160px] flex-shrink-0"
+          title={result.error}
+        >
+          待人工核验，勿重复提交
+        </span>
+      )
+    }
     if (result.success && result.postUrl) {
       return (
         <span className="flex items-center gap-1 flex-shrink-0">
@@ -333,6 +361,7 @@ function RowInfo({
         : '上传图片',
       saving: '保存中',
       completed: '完成',
+      review_required: '待人工核验',
       failed: '失败',
     }[progress.stage]
 

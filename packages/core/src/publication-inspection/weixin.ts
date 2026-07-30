@@ -6,6 +6,8 @@ import { parsePublicationUrl } from './url'
 export const WEIXIN_DRAFT_BODY_TEXT_LIMIT = 50_000
 export const WEIXIN_PUBLISHED_LIST_PAGE_SIZE = 10
 export const WEIXIN_PUBLISHED_LIST_MAX_PAGES = 5
+export const WEIXIN_PUBLIC_PAGE_MAX_BYTES = 2 * 1024 * 1024
+export const WEIXIN_PUBLIC_PAGE_MAX_REDIRECTS = 0
 
 export type WeixinAppMsgIdResolution =
   | { success: true; appMsgId: string }
@@ -59,6 +61,37 @@ export type WeixinPublishedListLookupResult =
       errorCode:
         | 'WEIXIN_PUBLISHED_LIST_RESPONSE_INVALID'
         | 'WEIXIN_PUBLISHED_LIST_API_ERROR'
+    }
+
+export type WeixinPublicPageResponseErrorCode =
+  | 'WEIXIN_PUBLIC_CANDIDATE_URL_INVALID'
+  | 'WEIXIN_PUBLIC_RESPONSE_URL_INVALID'
+  | 'WEIXIN_PUBLIC_RESPONSE_IDENTITY_MISMATCH'
+  | 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED'
+  | 'WEIXIN_PUBLIC_UNEXPECTED_CONTENT_TYPE'
+
+export type WeixinPublicPageResponseResolution =
+  | {
+      success: true
+      canonicalUrl: string
+    }
+  | {
+      success: false
+      errorCode: WeixinPublicPageResponseErrorCode
+    }
+
+type WeixinPublicArticleIdentity =
+  | {
+      kind: 'LONG'
+      accountId: string
+      publicMid: string
+      itemIndex: string
+      canonicalUrl: string
+    }
+  | {
+      kind: 'SHORT'
+      slug: string
+      canonicalUrl: string
     }
 
 export type WeixinTempUrlShape =
@@ -249,7 +282,7 @@ function collectArticleItems(
   return []
 }
 
-function resolvePublicArticleUrl(
+function resolveLongPublicArticleUrl(
   articleItem: Record<string, unknown>,
 ): string | undefined {
   for (const field of ['content_url', 'url', 'link']) {
@@ -273,16 +306,170 @@ function resolvePublicArticleUrl(
     } catch {
       continue
     }
-    const parsed = parsePublicationUrl('weixin', trustedCandidate)
-    if (
-      parsed?.surface === 'PUBLISHED' &&
-      parsed.canonicalUrl &&
-      new URL(parsed.canonicalUrl).pathname.startsWith('/s')
-    ) {
-      return parsed.canonicalUrl
-    }
+    const normalized = normalizeWeixinLongPublicArticleUrl(trustedCandidate)
+    if (normalized) return normalized
   }
   return undefined
+}
+
+function parseWeixinPublicArticleIdentity(
+  value: string,
+): WeixinPublicArticleIdentity | null {
+  try {
+    const url = new URL(value)
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'mp.weixin.qq.com' ||
+      url.port !== '' ||
+      url.username !== '' ||
+      url.password !== ''
+    ) {
+      return null
+    }
+
+    const parsed = parsePublicationUrl('weixin', url.href)
+    if (parsed?.surface !== 'PUBLISHED' || !parsed.canonicalUrl) {
+      return null
+    }
+
+    const canonical = new URL(parsed.canonicalUrl)
+    if (canonical.pathname === '/s') {
+      const accountId = parsed.accountId
+      const publicMid = parsed.postId
+      const itemIndex = canonical.searchParams.get('idx')
+      if (!accountId || !publicMid || !itemIndex) return null
+      return {
+        kind: 'LONG',
+        accountId,
+        publicMid,
+        itemIndex,
+        canonicalUrl: parsed.canonicalUrl,
+      }
+    }
+
+    const shortLinkMatch = canonical.pathname.match(
+      /^\/s\/([A-Za-z0-9_-]{8,128})$/,
+    )
+    if (!shortLinkMatch) return null
+    return {
+      kind: 'SHORT',
+      slug: shortLinkMatch[1],
+      canonicalUrl: parsed.canonicalUrl,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Normalize only anonymous WeChat article URLs that are safe request targets.
+ *
+ * This is intentionally stricter than a host allowlist: every network hop
+ * must also retain a verified public-article path and identity shape.
+ */
+export function normalizeWeixinPublicArticleUrl(value: string): string | null {
+  return parseWeixinPublicArticleIdentity(value)?.canonicalUrl ?? null
+}
+
+/**
+ * Normalize a public URL only when the platform returned its complete identity.
+ *
+ * Short links cannot be resolved safely in an MV3 service worker: Fetch's
+ * manual redirect response hides Location, while automatic following would
+ * send the next request before application code validates it.
+ */
+export function normalizeWeixinLongPublicArticleUrl(
+  value: string,
+): string | null {
+  const identity = parseWeixinPublicArticleIdentity(value)
+  return identity?.kind === 'LONG' ? identity.canonicalUrl : null
+}
+
+function sameWeixinPublicArticleIdentity(
+  left: WeixinPublicArticleIdentity,
+  right: WeixinPublicArticleIdentity,
+): boolean {
+  if (left.kind !== right.kind) return false
+  if (left.kind === 'SHORT' && right.kind === 'SHORT') {
+    return left.slug === right.slug
+  }
+  if (left.kind === 'LONG' && right.kind === 'LONG') {
+    return (
+      left.accountId === right.accountId &&
+      left.publicMid === right.publicMid &&
+      left.itemIndex === right.itemIndex
+    )
+  }
+  return false
+}
+
+function weixinPublicContentTypeIsHtml(headers: Headers): boolean {
+  try {
+    const contentType = headers.get('content-type')
+    if (!contentType) return false
+    const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase()
+    return mediaType === 'text/html' || mediaType === 'application/xhtml+xml'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Validate the final anonymous public-page response before its body is read.
+ *
+ * Public-page inspection accepts only the complete long identity returned by
+ * the authenticated published-list API. Any redirect or response URL change is
+ * rejected before the body is read.
+ */
+export function validateWeixinPublicPageResponse(
+  candidateUrl: string,
+  response: Pick<Response, 'url' | 'redirected' | 'headers'>,
+): WeixinPublicPageResponseResolution {
+  const candidate = parseWeixinPublicArticleIdentity(candidateUrl)
+  if (candidate?.kind !== 'LONG') {
+    return {
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_CANDIDATE_URL_INVALID',
+    }
+  }
+
+  const observed = parseWeixinPublicArticleIdentity(response.url)
+  if (!observed) {
+    return {
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_RESPONSE_URL_INVALID',
+    }
+  }
+
+  if (response.redirected) {
+    return {
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED',
+    }
+  }
+
+  if (
+    observed.kind !== 'LONG' ||
+    !sameWeixinPublicArticleIdentity(candidate, observed) ||
+    candidate.canonicalUrl !== observed.canonicalUrl
+  ) {
+    return {
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_RESPONSE_IDENTITY_MISMATCH',
+    }
+  }
+
+  if (!weixinPublicContentTypeIsHtml(response.headers)) {
+    return {
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_UNEXPECTED_CONTENT_TYPE',
+    }
+  }
+
+  return {
+    success: true,
+    canonicalUrl: observed.canonicalUrl,
+  }
 }
 
 export function normalizeWeixinAppMsgId(value: unknown): string | null {
@@ -519,7 +706,7 @@ export function parseWeixinPublishedListPayload(
 
     let matchedThisRecord = false
     for (const articleItem of collectArticleItems(sourceContainers)) {
-      const canonicalUrl = resolvePublicArticleUrl(articleItem)
+      const canonicalUrl = resolveLongPublicArticleUrl(articleItem)
       if (!canonicalUrl) continue
       matchedThisRecord = true
       publishedMatches.set(`${canonicalUrl}\n${publishedAt}`, {

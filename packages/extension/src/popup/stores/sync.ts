@@ -69,6 +69,8 @@ interface SyncResult {
   platform: string
   platformName?: string
   success: boolean
+  outcome?: 'SUCCEEDED' | 'FAILED' | 'OUTCOME_UNKNOWN'
+  retryable?: boolean
   postUrl?: string
   draftOnly?: boolean
   error?: string
@@ -81,7 +83,13 @@ interface ImageProgress {
 }
 
 // 同步阶段类型
-type SyncStage = 'starting' | 'uploading_images' | 'saving' | 'completed' | 'failed'
+type SyncStage =
+  | 'starting'
+  | 'uploading_images'
+  | 'saving'
+  | 'completed'
+  | 'review_required'
+  | 'failed'
 
 // 平台同步详细进度
 interface PlatformProgress {

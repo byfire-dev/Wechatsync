@@ -126,6 +126,7 @@ export async function trackPlatformSync(
     draftOnly?: boolean
     errorType?: string
     duration?: number
+    outcome?: 'SUCCEEDED' | 'FAILED' | 'OUTCOME_UNKNOWN'
   } = {}
 ): Promise<void> {
   // 响应时间分段（用于平台健康度分析）
@@ -141,6 +142,7 @@ export async function trackPlatformSync(
     source,
     target: targetPlatform,
     success: success ? 'true' : 'false',
+    outcome: options.outcome || (success ? 'SUCCEEDED' : 'FAILED'),
     draft_only: options.draftOnly ? 'true' : 'false',
     error_type: options.errorType || '',
     duration_ms: duration,
@@ -157,6 +159,7 @@ export async function trackSyncComplete(results: {
   total: number
   success: number
   failed: number
+  reviewRequired?: number
   platforms: string[]
   duration: number
 }): Promise<void> {
@@ -165,6 +168,7 @@ export async function trackSyncComplete(results: {
     total_platforms: results.total,
     success_count: results.success,
     failed_count: results.failed,
+    review_required_count: results.reviewRequired || 0,
     success_rate: results.total > 0 ? Math.round((results.success / results.total) * 100) : 0,
     targets: results.platforms.slice(0, 10).join(','),
     duration_ms: results.duration,

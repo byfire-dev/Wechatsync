@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 import { trackPageView, trackFeatureDiscovery } from '../../lib/analytics'
 import { createLogger } from '../../lib/logger'
 import { getCachedUpdateInfo, dismissUpdate, type UpdateCheckResult } from '../../lib/version-check'
+import { isConfirmedSyncSuccess } from '../../lib/sync-outcome'
 
 const logger = createLogger('HomeNew')
 
@@ -116,7 +117,7 @@ export function HomeNew() {
     startSync()
   }
 
-  const successCount = results.filter(r => r.success).length
+  const successCount = results.filter(isConfirmedSyncSuccess).length
 
   return (
     <div className="flex flex-col h-[500px]">

@@ -18,6 +18,11 @@ const MAX_BODY_TEXT_LENGTH = 50_000
 
 export interface SohuInspectionDependencies {
   checkAuth(): Promise<AuthResult>
+  /**
+   * Multi-account adapters may prove membership in the authenticated account
+   * set without changing the legacy checkAuth projection.
+   */
+  hasAuthenticatedAccount?: (externalAccountId: string) => boolean
   fetch(url: string, options?: RequestInit): Promise<Response>
   detailHeaders?: () => Record<string, string>
   now?: () => string
@@ -963,7 +968,10 @@ export async function inspectSohuPublication(
     ]
   }
 
-  if (auth.userId !== accountId) {
+  const hasAuthenticatedAccount = dependencies.hasAuthenticatedAccount
+    ? dependencies.hasAuthenticatedAccount(accountId)
+    : auth.userId === accountId
+  if (!hasAuthenticatedAccount) {
     return [
       createObservation(request, observedAt, {
         outcome: 'ACCOUNT_MISMATCH',

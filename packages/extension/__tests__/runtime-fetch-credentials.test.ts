@@ -118,4 +118,96 @@ describe('ExtensionRuntime.fetch credentials', () => {
     await expect(bodyRead).rejects.toMatchObject({ name: 'AbortError' })
     expect(runtimeSignal?.aborted).toBe(true)
   })
+
+  it('cleans the abort scope when a streamed response body is cancelled', async () => {
+    let runtimeSignal: AbortSignal | undefined
+    const cancelBody = vi.fn()
+    const fetchMock = vi.fn(
+      async (_url: string, options?: RequestInit): Promise<Response> => {
+        runtimeSignal = options?.signal ?? undefined
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            cancel: cancelBody,
+          }),
+        )
+      },
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const callerController = new AbortController()
+    const response = await new ExtensionRuntime({ timeout: 10_000 }).fetch(
+      'https://example.com/rejected-metadata',
+      { signal: callerController.signal },
+    )
+
+    await response.body?.cancel()
+    callerController.abort()
+
+    expect(cancelBody).toHaveBeenCalledTimes(1)
+    expect(runtimeSignal?.aborted).toBe(false)
+  })
+
+  it('cleans the abort scope when a stream reader reaches EOF', async () => {
+    let runtimeSignal: AbortSignal | undefined
+    const fetchMock = vi.fn(
+      async (_url: string, options?: RequestInit): Promise<Response> => {
+        runtimeSignal = options?.signal ?? undefined
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('bounded'))
+              controller.close()
+            },
+          }),
+        )
+      },
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const callerController = new AbortController()
+    const response = await new ExtensionRuntime({ timeout: 10_000 }).fetch(
+      'https://example.com/streamed',
+      { signal: callerController.signal },
+    )
+
+    const reader = response.body?.getReader()
+    await expect(reader?.read()).resolves.toMatchObject({ done: false })
+    await expect(reader?.read()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    })
+    callerController.abort()
+
+    expect(runtimeSignal?.aborted).toBe(false)
+  })
+
+  it('keeps external cancellation active during a pending stream read', async () => {
+    let runtimeSignal: AbortSignal | undefined
+    const fetchMock = vi.fn(
+      async (_url: string, options?: RequestInit): Promise<Response> => {
+        runtimeSignal = options?.signal ?? undefined
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              runtimeSignal?.addEventListener(
+                'abort',
+                () => controller.error(runtimeSignal?.reason),
+                { once: true },
+              )
+            },
+          }),
+        )
+      },
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const callerController = new AbortController()
+    const response = await new ExtensionRuntime({ timeout: 10_000 }).fetch(
+      'https://example.com/pending-stream',
+      { signal: callerController.signal },
+    )
+    const bodyRead = response.body?.getReader().read()
+
+    callerController.abort()
+
+    await expect(bodyRead).rejects.toMatchObject({ name: 'AbortError' })
+    expect(runtimeSignal?.aborted).toBe(true)
+  })
 })

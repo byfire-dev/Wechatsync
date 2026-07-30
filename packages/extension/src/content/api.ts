@@ -34,7 +34,9 @@ import {
   createBridgeSuccessResponse,
   createPublicationBridgeErrorResponseV3,
   createPublicationBridgeSuccessResponseV3,
+  deriveLegacySyncTargets,
   isLegacyMutationMethod,
+  INVALID_ACCOUNT_BINDINGS,
   LEGACY_API_ORIGIN_NOT_ALLOWED,
   projectBridgeRuntimeError,
   parseLegacyPageActionEvent,
@@ -50,7 +52,13 @@ import {
 } from '../bridge'
 import { projectLegacyAccounts } from '../bridge/legacy-account'
 import { LEGACY_MAGIC_CALL_METHOD_NOT_ALLOWED } from '../bridge/legacy-magic-call'
-import { toLegacyEditResponse } from '../bridge/sync-result'
+import {
+  getLegacySyncResultRoutingAccountId,
+  LEGACY_OUTCOME_UNKNOWN_MESSAGE,
+  toLegacyEditResponse,
+  toLegacySyncAccountUpdate,
+  toLegacyTerminalDetailAccountUpdate,
+} from '../bridge/sync-result'
 
 const logger = createLogger('Wechatsync')
 
@@ -82,14 +90,29 @@ interface AccountStatus {
   icon?: string;
   avatar?: string;
   uid?: string;
+  externalAccountId?: string;
+  requestedExternalAccountId?: string;
+  observedExternalAccountId?: string;
   home?: string;
   supportTypes?: string[];
   status: 'pending' | 'uploading' | 'done' | 'failed';
+  outcome?: 'SUCCEEDED' | 'FAILED' | 'OUTCOME_UNKNOWN';
+  retryable?: boolean;
   msg?: string;
   error?: string;
   editResp?: { draftLink?: string; postId?: string } | null;
 }
 let currentAccounts: AccountStatus[] = [];
+
+function failCurrentAccounts(error: string) {
+  currentAccounts = currentAccounts.map((account) => ({
+    ...account,
+    status: 'failed',
+    msg: undefined,
+    error,
+  }))
+  sendTaskUpdate({ accounts: currentAccounts })
+}
 
 /**
  * 发送消息到页面
@@ -381,13 +404,17 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     if (message.type === 'SYNC_PROGRESS') {
       const result = message.result || message.payload?.result;
       if (result) {
+        const routingExternalAccountId =
+          getLegacySyncResultRoutingAccountId(result);
         // 更新对应账户的状态
-        const account = currentAccounts.find(a => a.type === result.platform);
+        const account = currentAccounts.find(
+          (candidate) =>
+            candidate.type === result.platform &&
+            (routingExternalAccountId === undefined ||
+              candidate.externalAccountId === routingExternalAccountId),
+        );
         if (account) {
-          account.status = result.success ? 'done' : 'failed';
-          account.error = result.error;
-          account.msg = undefined;
-          account.editResp = toLegacyEditResponse(result);
+          Object.assign(account, toLegacySyncAccountUpdate(result));
         }
         // 发送完整的账户状态列表
         sendTaskUpdate({ accounts: currentAccounts });
@@ -398,12 +425,39 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     if (message.type === 'SYNC_DETAIL_PROGRESS') {
       const progress = message.payload || message;
       // 更新对应账户的状态
-      const account = currentAccounts.find(a => a.type === progress.platform);
+      const account = currentAccounts.find(
+        (candidate) =>
+          candidate.type === progress.platform &&
+          (typeof progress.externalAccountId !== 'string' ||
+            candidate.externalAccountId === progress.externalAccountId),
+      );
       if (account) {
-        account.status = 'uploading';
-        account.msg = progress.stage === 'uploading_images'
-          ? `上传图片 ${progress.imageProgress?.current}/${progress.imageProgress?.total}`
-          : progress.stage === 'saving' ? '保存中...' : progress.stage;
+        const terminalUpdate = toLegacyTerminalDetailAccountUpdate(progress)
+        if (terminalUpdate) {
+          Object.assign(account, terminalUpdate)
+        } else if (progress.stage === 'review_required') {
+          account.status = 'done';
+          account.outcome = 'OUTCOME_UNKNOWN';
+          account.retryable = false;
+          account.msg = LEGACY_OUTCOME_UNKNOWN_MESSAGE;
+          account.error = progress.error;
+          account.editResp = toLegacyEditResponse(progress.result);
+        } else if (progress.stage === 'completed') {
+          account.status = 'done';
+          account.msg = undefined;
+          account.error = progress.error;
+          account.editResp = toLegacyEditResponse(progress.result);
+        } else if (progress.stage === 'failed') {
+          account.status = 'failed';
+          account.msg = undefined;
+          account.error = progress.error;
+          account.editResp = null;
+        } else {
+          account.status = 'uploading';
+          account.msg = progress.stage === 'uploading_images'
+            ? `上传图片 ${progress.imageProgress?.current}/${progress.imageProgress?.total}`
+            : progress.stage === 'saving' ? '保存中...' : progress.stage;
+        }
       }
       // 发送完整的账户状态列表
       sendTaskUpdate({ accounts: currentAccounts });
@@ -465,7 +519,38 @@ window.addEventListener('message', async (evt) => {
     if (action.method === 'addTask') {
       const { task } = action;
       const { post, accounts } = task;
-      const platforms = accounts.map((a: any) => a.type);
+      const targets = deriveLegacySyncTargets(accounts);
+      if (!targets.success) {
+        currentAccounts = Array.isArray(accounts)
+          ? accounts.flatMap((account: unknown) => {
+              if (
+                typeof account !== 'object' ||
+                account === null ||
+                Array.isArray(account) ||
+                typeof (account as Record<string, unknown>).type !== 'string'
+              ) {
+                return []
+              }
+              const candidate = account as Record<string, unknown>
+              return [{
+                type: candidate.type as string,
+                title:
+                  typeof candidate.title === 'string'
+                    ? candidate.title
+                    : candidate.type as string,
+                status: 'failed' as const,
+                error: INVALID_ACCOUNT_BINDINGS,
+                editResp: null,
+              }]
+            })
+          : []
+        sendTaskUpdate({ accounts: currentAccounts })
+        return
+      }
+      const { platforms, accountBindings } = targets;
+      const bindingsByPlatform = new Map(
+        accountBindings.map((binding) => [binding.platform, binding]),
+      )
 
       // 生成 syncId 用于追踪进度
       currentSyncId = `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -478,6 +563,12 @@ window.addEventListener('message', async (evt) => {
         icon: a.icon,
         avatar: a.avatar,
         uid: a.uid,
+        ...(bindingsByPlatform.has(a.type)
+          ? {
+              externalAccountId:
+                bindingsByPlatform.get(a.type)!.externalAccountId,
+            }
+          : {}),
         home: a.home,
         supportTypes: a.supportTypes,
         status: 'uploading' as const,
@@ -504,12 +595,25 @@ window.addEventListener('message', async (evt) => {
             cover: post.thumb,
           },
           platforms,
+          ...(accountBindings.length > 0 ? { accountBindings } : {}),
           source: 'legacy-api',
           syncId: currentSyncId,
         },
       }, (resp) => {
         if (chrome.runtime.lastError) {
           logger.error('addTask error:', chrome.runtime.lastError);
+          failCurrentAccounts('SYNC_RUNTIME_ERROR')
+          currentSyncId = null
+          return
+        }
+        if (resp?.error) {
+          logger.error('addTask rejected:', resp.error)
+          failCurrentAccounts(
+            typeof resp.error === 'string'
+              ? resp.error
+              : INVALID_ACCOUNT_BINDINGS,
+          )
+          currentSyncId = null
         }
       });
     }

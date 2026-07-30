@@ -103,7 +103,7 @@ const publishedProofAdapters = {
 
 describe("publication Bridge v3 capability descriptors", () => {
   it("keeps the extension package and manifest on the v3 release version", () => {
-    expect(extensionPackage.version).toBe("2.0.27");
+    expect(extensionPackage.version).toBe("2.0.28");
     expect(manifest.version).toBe(extensionPackage.version);
   });
 
@@ -234,6 +234,31 @@ describe("publication Bridge v3 observation projection", () => {
       });
     },
   );
+
+  it("rejects a WeChat PUBLISHED observation with a non-WeChat HTTPS URL", async () => {
+    const result = await runPublicationInspectionV3(
+      requests.weixin,
+      {
+        inspectPublication: async () => [
+          {
+            ...publishedObservations.weixin,
+            canonicalUrl: "https://example.com/ordinary-public-page",
+          },
+        ],
+        provePublishedObservation:
+          publishedProofAdapters.weixin.provePublishedObservation,
+      },
+      extensionVersionFromManifest,
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      failure: {
+        stage: "PROTOCOL",
+        code: "INVALID_INSPECTION_RESULT",
+      },
+    });
+  });
 
   it("keeps evidence errors in an ok:true result for persistence", async () => {
     const result = await runPublicationInspectionV3(
