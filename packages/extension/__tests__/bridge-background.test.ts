@@ -589,11 +589,14 @@ describe('Bridge v2 unsupported inspection prototype', () => {
     if (!request.success) return
 
     const inspectPublication = vi.fn().mockResolvedValue([])
+    const provePublishedObservation = vi.fn()
     const observations = await runPublicationInspection(request.data, {
       inspectPublication,
+      provePublishedObservation,
     })
 
     expect(inspectPublication).not.toHaveBeenCalled()
+    expect(provePublishedObservation).not.toHaveBeenCalled()
     expect(observations).toHaveLength(1)
     expect(observations[0]).toMatchObject({
       platform: 'toutiao',

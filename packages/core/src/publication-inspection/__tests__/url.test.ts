@@ -112,10 +112,25 @@ describe('parsePublicationUrl', () => {
     ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
   })
 
-  it('keeps unimplemented platforms outside identity inference', () => {
+  it('rejects ambiguous or untrusted Toutiao identities', () => {
     expect(
-      parsePublicationUrl('toutiao', 'https://www.toutiao.com/item/1'),
+      parsePublicationUrl(
+        'toutiao',
+        'https://attacker.example/article/7667071065847677450/',
+      ),
     ).toBeNull()
+    expect(
+      parsePublicationUrl(
+        'toutiao',
+        'https://mp.toutiao.com/profile_v4/graphic/publish?pgc_id=1&pgc_id=2',
+      ),
+    ).toEqual({ platform: 'toutiao', surface: 'UNKNOWN' })
+    expect(
+      parsePublicationUrl(
+        'toutiao',
+        'https://www.toutiao.com/article/7667071065847677450/?from=item',
+      ),
+    ).toEqual({ platform: 'toutiao', surface: 'UNKNOWN' })
   })
 
   it('does not guess unknown Zhihu URL shapes', () => {
