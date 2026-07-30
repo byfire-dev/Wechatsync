@@ -19,21 +19,34 @@ import type {
   SyncerAccountV2,
   SyncerAccountsV2Detailed,
 } from '@wechatsync/core/publication-inspection'
+import {
+  PublicationBridgeInfoV3Schema,
+  PublicationInspectRequestV3Schema,
+  PublicationInspectResultV3Schema,
+  type PublicationBridgeInfoV3,
+  type PublicationInspectResultV3,
+} from '@wechatsync/publication-contract/v3'
 import { createLogger } from '../lib/logger'
 import {
   BRIDGE_API_VERSION,
   BRIDGE_NAMESPACE,
   createBridgeErrorResponse,
   createBridgeSuccessResponse,
+  createPublicationBridgeErrorResponseV3,
+  createPublicationBridgeSuccessResponseV3,
   isLegacyMutationMethod,
   LEGACY_API_ORIGIN_NOT_ALLOWED,
   projectBridgeRuntimeError,
   parseLegacyPageActionEvent,
   parseBridgeRequestEvent,
+  parsePublicationBridgeRequestEventV3,
   validateLegacyMutationPageEvent,
   type BridgeErrorResponse,
   type BridgeRequest,
   type BridgeResponse,
+  type PublicationBridgeErrorResponseV3,
+  type PublicationBridgeRequestV3,
+  type PublicationBridgeResponseV3,
 } from '../bridge'
 import { projectLegacyAccounts } from '../bridge/legacy-account'
 import { LEGACY_MAGIC_CALL_METHOD_NOT_ALLOWED } from '../bridge/legacy-magic-call'
@@ -53,6 +66,8 @@ interface BridgeRuntimeResponse {
   detailedAccounts?: SyncerAccountsV2Detailed
   draftOpenResult?: OpenPublicationDraftResult
   observations?: PublicationObservation[]
+  publicationBridgeInfoV3?: PublicationBridgeInfoV3
+  publicationInspectResultV3?: PublicationInspectResultV3
   error?: string
 }
 
@@ -107,7 +122,10 @@ function sendConsoleLog(args: unknown) {
   }), window.location.origin);
 }
 
-function postBridgeResponse(response: BridgeResponse, targetOrigin: string) {
+function postBridgeResponse(
+  response: BridgeResponse | PublicationBridgeResponseV3,
+  targetOrigin: string,
+) {
   window.postMessage(response, targetOrigin)
 }
 
@@ -126,6 +144,18 @@ function createBridgeFailure(
       return createBridgeErrorResponse(request, { code, message })
     case 'openPublicationDraft':
       return createBridgeErrorResponse(request, { code, message })
+  }
+}
+
+function createPublicationBridgeFailureV3(
+  request: PublicationBridgeRequestV3,
+  code: string,
+  message: string,
+): PublicationBridgeErrorResponseV3 {
+  switch (request.method) {
+    case 'getPublicationBridgeInfoV3':
+    case 'inspectPublicationV3':
+      return createPublicationBridgeErrorResponseV3(request, { code, message })
   }
 }
 
@@ -257,8 +287,66 @@ async function handleBridgeRequest(evt: MessageEvent): Promise<void> {
   }
 }
 
+async function handlePublicationBridgeRequestV3(
+  evt: MessageEvent,
+): Promise<void> {
+  if (window.top !== window) return
+
+  const parsed = parsePublicationBridgeRequestEventV3(evt, window)
+  if (!parsed.success) return
+  const request = parsed.data
+
+  try {
+    switch (request.method) {
+      case 'getPublicationBridgeInfoV3': {
+        const response = await sendBridgeRuntimeMessage({
+          type: 'BRIDGE_GET_PUBLICATION_INFO_V3',
+          requestId: request.requestId,
+          payload: request.payload,
+        })
+        const bridgeInfo = PublicationBridgeInfoV3Schema.parse(
+          response.publicationBridgeInfoV3,
+        )
+        postBridgeResponse(
+          createPublicationBridgeSuccessResponseV3(request, bridgeInfo),
+          evt.origin,
+        )
+        return
+      }
+
+      case 'inspectPublicationV3': {
+        const payload = PublicationInspectRequestV3Schema.parse(request.payload)
+        const response = await sendBridgeRuntimeMessage({
+          type: 'BRIDGE_INSPECT_PUBLICATION_V3',
+          requestId: request.requestId,
+          payload,
+        })
+        const result = PublicationInspectResultV3Schema.parse(
+          response.publicationInspectResultV3,
+        )
+        postBridgeResponse(
+          createPublicationBridgeSuccessResponseV3(request, result),
+          evt.origin,
+        )
+        return
+      }
+    }
+  } catch (error) {
+    const failure = projectBridgeRuntimeError(error)
+    postBridgeResponse(
+      createPublicationBridgeFailureV3(
+        request,
+        failure.code,
+        failure.message,
+      ),
+      evt.origin,
+    )
+  }
+}
+
 window.addEventListener('message', (evt) => {
   void handleBridgeRequest(evt)
+  void handlePublicationBridgeRequestV3(evt)
 })
 
 /**

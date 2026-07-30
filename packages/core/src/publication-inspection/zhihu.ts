@@ -658,7 +658,7 @@ function inspectPublishedPage(
     title: decision.evidence.title,
     publishedAt: decision.evidence.publishedAt,
     bodyText: decision.evidence.bodyText,
-    ...(decision.evidence.bodyTruncated ? { bodyTruncated: true } : {}),
+    bodyTruncated: decision.evidence.bodyTruncated,
     publicAccess:
       source === 'PUBLIC_PAGE'
         ? { status: 'CONFIRMED' }

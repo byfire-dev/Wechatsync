@@ -430,6 +430,7 @@ describe('Sohu exact-ID publication inspector', () => {
         title: '公开页修改后的标题',
         publishedAt: PUBLISHED_AT,
         bodyText: '第一段\n第二段 & 证据',
+        bodyTruncated: false,
       },
     ])
   })
