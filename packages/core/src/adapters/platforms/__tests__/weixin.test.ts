@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RuntimeInterface } from '../../../runtime/interface'
-import type { PublicationInspectRequest } from '../../../publication-inspection/types'
-import { normalizeWeixinAppMsgId } from '../../../publication-inspection/weixin'
+import type {
+  PublicationInspectRequest,
+  PublicationObservation,
+} from '../../../publication-inspection/types'
+import {
+  normalizeWeixinAppMsgId,
+  WEIXIN_PUBLIC_PAGE_MAX_BYTES,
+} from '../../../publication-inspection/weixin'
 import { WeixinAdapter } from '../weixin'
 
 const ACCOUNT_ID = 'gh_test_account'
@@ -96,6 +102,65 @@ function jsonResponse(value: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(value), {
     headers: { 'Content-Type': 'application/json' },
     ...init,
+  })
+}
+
+function publicHtmlResponse(
+  body: BodyInit | null,
+  url: string,
+  options: {
+    redirected?: boolean
+    contentType?: string
+    status?: number
+  } = {},
+): Response {
+  const response = new Response(body, {
+    status: options.status,
+    headers: {
+      'Content-Type': options.contentType ?? 'text/html; charset=utf-8',
+    },
+  })
+  Object.defineProperties(response, {
+    url: { value: url },
+    redirected: { value: options.redirected ?? false },
+  })
+  return response
+}
+
+function opaqueRedirectResponse(): Response {
+  const response = new Response(null)
+  Object.defineProperties(response, {
+    type: { value: 'opaqueredirect' },
+    status: { value: 0 },
+    url: { value: '' },
+    redirected: { value: false },
+  })
+  return response
+}
+
+function publishedListResponse(publicUrl: string, appMsgId = '9001') {
+  return jsonResponse({
+    base_resp: { ret: 0 },
+    publish_page: JSON.stringify({
+      total_count: 1,
+      publish_list: [
+        {
+          publish_info: JSON.stringify({
+            publish_info: {
+              draft_msgid: appMsgId,
+              publish_status: 200,
+              create_time: 1_720_000_000,
+            },
+            appmsgex: [
+              {
+                itemidx: 1,
+                content_url: publicUrl,
+              },
+            ],
+          }),
+        },
+      ],
+    }),
   })
 }
 
@@ -474,9 +539,10 @@ describe('WeixinAdapter publication inspection', () => {
         })
       }
       if (url === publicUrl) {
-        return new Response(
+        return publicHtmlResponse(
           '<h1 id="activity-name">Published title</h1>' +
             '<section id="js_content"><p>Published body</p></section>',
+          publicUrl,
         )
       }
       throw new Error('Draft fallback must not run')
@@ -515,8 +581,199 @@ describe('WeixinAdapter publication inspection', () => {
     })
     expect(calls.find(({ url }) => url === publicUrl)?.options).toMatchObject({
       credentials: 'omit',
-      redirect: 'follow',
+      redirect: 'error',
+      cache: 'no-store',
+      headers: {
+        Accept: 'text/html,application/xhtml+xml',
+      },
     })
+  })
+
+  it('requires review for a published-list short URL without requesting it', async () => {
+    const shortUrl = 'https://mp.weixin.qq.com/s/ShortAbC_123'
+    const calls: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      calls.push(url)
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        return publishedListResponse(shortUrl)
+      }
+      throw new Error('A short public URL must not be requested')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      source: 'PUBLISHED_LIST',
+      platformPostId: '9001',
+      errorCode: 'WEIXIN_PUBLISHED_EVIDENCE_INCOMPLETE',
+    })
+    expect(calls).toEqual([
+      'https://mp.weixin.qq.com/',
+      expect.stringContaining('/cgi-bin/appmsgpublish?'),
+    ])
+    expect(JSON.stringify(observations)).not.toContain(shortUrl)
+  })
+
+  it('fails closed if a runtime exposes an opaque manual redirect response', async () => {
+    const publicUrl =
+      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicRequests: RequestInit[] = []
+    const { runtime } = createInspectionRuntime(async (url, options) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        return publishedListResponse(publicUrl)
+      }
+      if (url === publicUrl) {
+        publicRequests.push(options ?? {})
+        return opaqueRedirectResponse()
+      }
+      throw new Error('No redirect target may be requested')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9001',
+      errorCode: 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED',
+    })
+    expect(publicRequests).toHaveLength(1)
+    expect(publicRequests[0]).toMatchObject({ redirect: 'error' })
+  })
+
+  it('cancels the body when public response metadata is rejected', async () => {
+    const publicUrl =
+      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const cancelBody = vi.fn()
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        return publishedListResponse(publicUrl)
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          new ReadableStream<Uint8Array>({ cancel: cancelBody }),
+          publicUrl,
+          { contentType: 'application/json' },
+        )
+      }
+      throw new Error('Draft fallback must not run')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      errorCode: 'WEIXIN_PUBLIC_UNEXPECTED_CONTENT_TYPE',
+    })
+    expect(cancelBody).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops a chunked public body at the decoded byte limit', async () => {
+    const publicUrl =
+      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const cancelBody = vi.fn()
+    const chunks = [
+      new Uint8Array(WEIXIN_PUBLIC_PAGE_MAX_BYTES),
+      new Uint8Array([1]),
+      new Uint8Array([2]),
+    ]
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        return publishedListResponse(publicUrl)
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              const chunk = chunks.shift()
+              if (chunk) controller.enqueue(chunk)
+            },
+            cancel: cancelBody,
+          }),
+          publicUrl,
+        )
+      }
+      throw new Error('Draft fallback must not run')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      errorCode: 'WEIXIN_PUBLIC_BODY_TOO_LARGE',
+    })
+    expect(cancelBody).toHaveBeenCalledTimes(1)
+  })
+
+  it('revalidates the canonical public URL and exact appMsgId in published proof', () => {
+    const adapter = new WeixinAdapter()
+    const validObservation: PublicationObservation = {
+      observationKey: 'weixin:proof:published',
+      platform: 'weixin',
+      externalAccountId: ACCOUNT_ID,
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9001',
+      canonicalUrl:
+        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1',
+      title: 'Published title',
+      publishedAt: '2024-07-03T09:46:40.000Z',
+      bodyText: 'Published body',
+      bodyTruncated: false,
+      observedAt: '2024-07-03T09:47:00.000Z',
+    }
+
+    expect(
+      adapter.provePublishedObservation(INSPECT_REQUEST, validObservation),
+    ).toEqual({
+      observedAuthorExternalAccountId: ACCOUNT_ID,
+      publicAccess: { status: 'CONFIRMED' },
+      bodyTruncated: false,
+    })
+
+    for (const invalidObservation of [
+      {
+        ...validObservation,
+        canonicalUrl: 'https://attacker.example/public-article',
+      },
+      {
+        ...validObservation,
+        canonicalUrl: `${validObservation.canonicalUrl}&tracking=not-canonical`,
+      },
+      {
+        ...validObservation,
+        canonicalUrl: 'https://mp.weixin.qq.com/s/ShortAbC_123',
+      },
+      {
+        ...validObservation,
+        platformPostId: '9002',
+      },
+    ]) {
+      expect(
+        adapter.provePublishedObservation(INSPECT_REQUEST, invalidObservation),
+      ).toBeNull()
+    }
   })
 
   it('returns REVIEW_REQUIRED for an exact but incomplete published record', async () => {
@@ -599,7 +856,7 @@ describe('WeixinAdapter publication inspection', () => {
         })
       }
       if (url === publicUrl) {
-        return new Response('<main>not an article</main>')
+        return publicHtmlResponse('<main>not an article</main>', publicUrl)
       }
       throw new Error('Unexpected request')
     })
@@ -612,7 +869,7 @@ describe('WeixinAdapter publication inspection', () => {
       outcome: 'REVIEW_REQUIRED',
       source: 'PUBLIC_PAGE',
       platformPostId: '9001',
-      errorCode: 'WEIXIN_PUBLIC_PAGE_REVIEW_REQUIRED',
+      errorCode: 'WEIXIN_PUBLIC_PAGE_CONTENT_INVALID',
     })
     expect(JSON.stringify(observations)).not.toContain('mid=777')
     expect(JSON.stringify(observations)).not.toContain('MzA0000000000')

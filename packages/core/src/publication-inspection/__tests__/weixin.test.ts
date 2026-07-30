@@ -8,14 +8,39 @@ import {
   buildWeixinTempUrlRequest,
   classifyWeixinTempUrl,
   normalizeWeixinAppMsgId,
+  normalizeWeixinLongPublicArticleUrl,
+  normalizeWeixinPublicArticleUrl,
   parseWeixinDraftHtml,
   parseWeixinPublishedListPayload,
   parseWeixinPublicArticleHtml,
   parseWeixinTempUrlPayload,
   resolveWeixinAppMsgId,
   resolveWeixinTempUrl,
+  validateWeixinPublicPageResponse,
   validateWeixinTempUrl,
+  WEIXIN_PUBLIC_PAGE_MAX_REDIRECTS,
 } from '../weixin'
+
+const WEIXIN_LONG_A =
+  'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+const WEIXIN_LONG_A_WITH_SN = `${WEIXIN_LONG_A}&sn=0123456789abcdef0123456789abcdef`
+const WEIXIN_LONG_B =
+  'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=778&idx=1'
+const WEIXIN_SHORT_A = 'https://mp.weixin.qq.com/s/ShortAbC_123'
+
+function publicResponseMetadata(
+  url: string,
+  redirected = false,
+  contentType: string | null = 'text/html; charset=utf-8',
+): Pick<Response, 'url' | 'redirected' | 'headers'> {
+  return {
+    url,
+    redirected,
+    headers: new Headers(
+      contentType === null ? {} : { 'Content-Type': contentType },
+    ),
+  }
+}
 
 describe('WeChat publication-inspection helpers', () => {
   it.each([
@@ -260,7 +285,7 @@ describe('WeChat publication-inspection helpers', () => {
     })
   })
 
-  it('matches a mass-send record by copy_appmsg_id and sent_result', () => {
+  it('requires review when a mass-send record exposes only a short URL', () => {
     const result = parseWeixinPublishedListPayload(
       massSendPublishedListFixture,
       '900000001',
@@ -270,9 +295,7 @@ describe('WeChat publication-inspection helpers', () => {
 
     expect(result).toEqual({
       success: true,
-      match: 'PUBLISHED',
-      canonicalUrl: 'https://mp.weixin.qq.com/s/AbCdEfGh1234',
-      publishedAt: '2024-07-03T09:46:40.000Z',
+      match: 'REVIEW_REQUIRED',
     })
   })
 
@@ -549,6 +572,172 @@ describe('WeChat publication-inspection helpers', () => {
     ).toEqual({
       success: true,
       shape: 'SAFE_ABSOLUTE_HTTPS',
+    })
+  })
+
+  it.each([
+    'http://mp.weixin.qq.com/s/ShortAbC_123',
+    'https://attacker.example/s/ShortAbC_123',
+    'https://mp.weixin.qq.com.attacker.example/s/ShortAbC_123',
+    'https://user:password@mp.weixin.qq.com/s/ShortAbC_123',
+    'https://mp.weixin.qq.com:444/s/ShortAbC_123',
+    'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9001',
+  ])('rejects an unsafe public-page request target: %s', (url) => {
+    expect(normalizeWeixinPublicArticleUrl(url)).toBeNull()
+    expect(normalizeWeixinLongPublicArticleUrl(url)).toBeNull()
+  })
+
+  it('accepts short URLs for classification but never as public-page request targets', () => {
+    expect(normalizeWeixinPublicArticleUrl(WEIXIN_SHORT_A)).toBe(WEIXIN_SHORT_A)
+    expect(normalizeWeixinLongPublicArticleUrl(WEIXIN_SHORT_A)).toBeNull()
+    expect(normalizeWeixinLongPublicArticleUrl(WEIXIN_LONG_A)).toBe(
+      WEIXIN_LONG_A,
+    )
+    expect(WEIXIN_PUBLIC_PAGE_MAX_REDIRECTS).toBe(0)
+  })
+
+  it.each([
+    {
+      name: 'the same long URL',
+      candidate: WEIXIN_LONG_A,
+      responseUrl: WEIXIN_LONG_A,
+      redirected: false,
+      expectedCanonical: WEIXIN_LONG_A,
+    },
+    {
+      name: 'an explicit default HTTPS port normalized by URL semantics',
+      candidate: WEIXIN_LONG_A.replace(
+        'mp.weixin.qq.com',
+        'mp.weixin.qq.com:443',
+      ),
+      responseUrl: WEIXIN_LONG_A,
+      redirected: false,
+      expectedCanonical: WEIXIN_LONG_A,
+    },
+  ])(
+    'accepts $name and returns the final canonical URL',
+    ({ candidate, responseUrl, redirected, expectedCanonical }) => {
+      expect(
+        validateWeixinPublicPageResponse(
+          candidate,
+          publicResponseMetadata(responseUrl, redirected),
+        ),
+      ).toEqual({
+        success: true,
+        canonicalUrl: expectedCanonical,
+      })
+    },
+  )
+
+  it.each([
+    {
+      name: 'a canonical change for the same long identity',
+      candidate: WEIXIN_LONG_A,
+      responseUrl: WEIXIN_LONG_A_WITH_SN,
+      redirected: false,
+      errorCode: 'WEIXIN_PUBLIC_RESPONSE_IDENTITY_MISMATCH',
+    },
+    {
+      name: 'a different long identity',
+      candidate: WEIXIN_LONG_A,
+      responseUrl: WEIXIN_LONG_B,
+      redirected: true,
+      errorCode: 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED',
+    },
+    {
+      name: 'a redirected response even when the URL is unchanged',
+      candidate: WEIXIN_LONG_A,
+      responseUrl: WEIXIN_LONG_A,
+      redirected: true,
+      errorCode: 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED',
+    },
+  ] as const)(
+    'rejects $name',
+    ({ candidate, responseUrl, redirected, errorCode }) => {
+      expect(
+        validateWeixinPublicPageResponse(
+          candidate,
+          publicResponseMetadata(responseUrl, redirected),
+        ),
+      ).toEqual({ success: false, errorCode })
+    },
+  )
+
+  it.each([
+    'http://mp.weixin.qq.com/s/ShortAbC_123?secret=candidate',
+    'https://attacker.example/s/ShortAbC_123?secret=candidate',
+    'https://mp.weixin.qq.com.attacker.example/s/ShortAbC_123?secret=candidate',
+    'https://user:password@mp.weixin.qq.com/s/ShortAbC_123?secret=candidate',
+    'https://mp.weixin.qq.com:444/s/ShortAbC_123?secret=candidate',
+    'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9001',
+    'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777',
+    'not-a-url-secret-candidate',
+  ])(
+    'rejects an invalid public candidate URL without leaking it: %s',
+    (url) => {
+      const result = validateWeixinPublicPageResponse(
+        url,
+        publicResponseMetadata(WEIXIN_SHORT_A),
+      )
+      expect(result).toEqual({
+        success: false,
+        errorCode: 'WEIXIN_PUBLIC_CANDIDATE_URL_INVALID',
+      })
+      expect(JSON.stringify(result)).not.toContain('secret')
+      expect(JSON.stringify(result)).not.toContain('attacker.example')
+    },
+  )
+
+  it.each([
+    '',
+    'http://mp.weixin.qq.com/s/ShortAbC_123?secret=response',
+    'https://attacker.example/s/ShortAbC_123?secret=response',
+    'https://mp.weixin.qq.com.attacker.example/s/ShortAbC_123?secret=response',
+    'https://user:password@mp.weixin.qq.com/s/ShortAbC_123?secret=response',
+    'https://mp.weixin.qq.com:444/s/ShortAbC_123?secret=response',
+    'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9001',
+    'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777',
+  ])('rejects an invalid final response URL without leaking it: %s', (url) => {
+    const result = validateWeixinPublicPageResponse(
+      WEIXIN_LONG_A,
+      publicResponseMetadata(url),
+    )
+    expect(result).toEqual({
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_RESPONSE_URL_INVALID',
+    })
+    expect(JSON.stringify(result)).not.toContain('secret')
+    expect(JSON.stringify(result)).not.toContain('attacker.example')
+  })
+
+  it.each([
+    'text/html',
+    'text/html; charset=UTF-8',
+    'application/xhtml+xml',
+    'application/xhtml+xml; charset=utf-8',
+  ])('accepts the public HTML content type %s', (contentType) => {
+    expect(
+      validateWeixinPublicPageResponse(
+        WEIXIN_LONG_A,
+        publicResponseMetadata(WEIXIN_LONG_A, false, contentType),
+      ),
+    ).toEqual({ success: true, canonicalUrl: WEIXIN_LONG_A })
+  })
+
+  it.each([
+    'application/json',
+    'text/plain; charset=utf-8',
+    'text/htmlx',
+    null,
+  ])('rejects the unexpected public content type %s', (contentType) => {
+    expect(
+      validateWeixinPublicPageResponse(
+        WEIXIN_LONG_A,
+        publicResponseMetadata(WEIXIN_LONG_A, false, contentType),
+      ),
+    ).toEqual({
+      success: false,
+      errorCode: 'WEIXIN_PUBLIC_UNEXPECTED_CONTENT_TYPE',
     })
   })
 

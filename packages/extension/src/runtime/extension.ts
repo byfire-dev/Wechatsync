@@ -15,6 +15,140 @@ const RESPONSE_BODY_READERS = new Set<PropertyKey>([
   "text",
 ]);
 
+function throwBodyReadError(
+  error: unknown,
+  abortSource: () => "external" | "timeout" | null,
+  timeout: number,
+  url: string,
+): never {
+  if (abortSource() === "timeout") {
+    throw new Error(`请求超时（${timeout / 1000}秒）: ${url}`);
+  }
+  throw error;
+}
+
+function invokeAsPromise<T>(
+  method: Function,
+  target: object,
+  args: unknown[],
+): Promise<T> {
+  try {
+    return Promise.resolve(Reflect.apply(method, target, args) as T);
+  } catch (error) {
+    return Promise.reject<T>(error);
+  }
+}
+
+function keepAbortScopeThroughReader<
+  T extends
+    | ReadableStreamDefaultReader<Uint8Array>
+    | ReadableStreamBYOBReader,
+>(
+  reader: T,
+  cleanup: () => void,
+  abortSource: () => "external" | "timeout" | null,
+  timeout: number,
+  url: string,
+): T {
+  return new Proxy(reader, {
+    get(target, property) {
+      if (property === "closed") {
+        let closed: unknown;
+        try {
+          closed = Reflect.get(target, property, target);
+        } catch (error) {
+          cleanup();
+          return Promise.reject(error).catch((caughtError) =>
+            throwBodyReadError(caughtError, abortSource, timeout, url),
+          );
+        }
+        return Promise.resolve(closed)
+          .catch((error) =>
+            throwBodyReadError(error, abortSource, timeout, url),
+          )
+          .finally(cleanup);
+      }
+
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+
+      if (property === "read") {
+        return (...args: unknown[]) =>
+          invokeAsPromise<ReadableStreamReadResult<Uint8Array>>(
+            value,
+            target,
+            args,
+          )
+            .then((result) => {
+              if (result.done) cleanup();
+              return result;
+            })
+            .catch((error) => {
+              cleanup();
+              return throwBodyReadError(error, abortSource, timeout, url);
+            });
+      }
+
+      if (property === "cancel") {
+        return (...args: unknown[]) =>
+          invokeAsPromise(value, target, args)
+            .catch((error) =>
+              throwBodyReadError(error, abortSource, timeout, url),
+            )
+            .finally(cleanup);
+      }
+
+      return value.bind(target);
+    },
+  });
+}
+
+function keepAbortScopeThroughStream(
+  body: ReadableStream<Uint8Array>,
+  cleanup: () => void,
+  abortSource: () => "external" | "timeout" | null,
+  timeout: number,
+  url: string,
+): ReadableStream<Uint8Array> {
+  return new Proxy(body, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== "function") return value;
+
+      if (property === "getReader") {
+        return (...args: unknown[]) => {
+          try {
+            const reader = Reflect.apply(value, target, args) as
+              | ReadableStreamDefaultReader<Uint8Array>
+              | ReadableStreamBYOBReader;
+            return keepAbortScopeThroughReader(
+              reader,
+              cleanup,
+              abortSource,
+              timeout,
+              url,
+            );
+          } catch (error) {
+            cleanup();
+            return throwBodyReadError(error, abortSource, timeout, url);
+          }
+        };
+      }
+
+      if (property === "cancel" || property === "pipeTo") {
+        return (...args: unknown[]) =>
+          invokeAsPromise(value, target, args)
+            .catch((error) =>
+              throwBodyReadError(error, abortSource, timeout, url),
+            )
+            .finally(cleanup);
+      }
+
+      return value.bind(target);
+    },
+  });
+}
+
 function keepAbortScopeThroughBody(
   response: Response,
   cleanup: () => void,
@@ -27,20 +161,27 @@ function keepAbortScopeThroughBody(
     return response;
   }
 
+  const body = keepAbortScopeThroughStream(
+    response.body,
+    cleanup,
+    abortSource,
+    timeout,
+    url,
+  );
+
   return new Proxy(response, {
     get(target, property) {
+      if (property === "body") return body;
+
       const value = Reflect.get(target, property, target);
       if (typeof value !== "function") return value;
       if (!RESPONSE_BODY_READERS.has(property)) return value.bind(target);
 
       return (...args: unknown[]) =>
-        Promise.resolve(Reflect.apply(value, target, args))
-          .catch((error) => {
-            if (abortSource() === "timeout") {
-              throw new Error(`请求超时（${timeout / 1000}秒）: ${url}`);
-            }
-            throw error;
-          })
+        invokeAsPromise(value, target, args)
+          .catch((error) =>
+            throwBodyReadError(error, abortSource, timeout, url),
+          )
           .finally(cleanup);
     },
   });
