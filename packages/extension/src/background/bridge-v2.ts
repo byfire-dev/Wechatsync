@@ -774,9 +774,30 @@ export async function runPublicationInspection(
     ]
   }
 
-  const observations = result.observations.map((observation) =>
-    PublicationObservationSchema.safeParse(observation),
-  )
+  // The version-neutral domain carries richer v3 evidence. Bridge v2 remains
+  // frozen, so explicitly down-project those fields instead of relying on a
+  // strict v2 schema to ignore them.
+  const observations = result.observations.map((observation) => {
+    const {
+      internalEvidence: _internalEvidence,
+      publicAccess,
+      ...v2Observation
+    } = observation
+    return PublicationObservationSchema.safeParse({
+      ...v2Observation,
+      ...(publicAccess
+        ? {
+            publicAccess:
+              publicAccess.status === 'CONFIRMED'
+                ? { status: 'CONFIRMED' }
+                : {
+                    status: 'BLOCKED_BY_PLATFORM',
+                    reasonCode: publicAccess.reasonCode,
+                  },
+          }
+        : {}),
+    })
+  })
   if (observations.some((observation) => !observation.success)) {
     return [
       createInspectionFailure(

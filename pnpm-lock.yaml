@@ -173,12 +173,12 @@ importers:
 
   packages/extension:
     dependencies:
+      '@byfire-dev/publication-bridge-contract':
+        specifier: 3.0.0
+        version: 3.0.0
       '@wechatsync/core':
         specifier: 2.0.0
         version: link:../core
-      '@wechatsync/publication-contract':
-        specifier: 0.1.0
-        version: link:../publication-contract
       clsx:
         specifier: ^2.0.0
         version: 2.1.1
@@ -379,6 +379,10 @@ packages:
   '@babel/types@7.28.6':
     resolution: {integrity: sha512-0ZrskXVEHSWIqZM/sQZ4EV3jZJXRkio/WCxaqKZP1g//CEWEPSfeZFcms4XeKBCHU0ZKnIkdJeU/kF+eRp5lBg==}
     engines: {node: '>=6.9.0'}
+
+  '@byfire-dev/publication-bridge-contract@3.0.0':
+    resolution: {integrity: sha512-4RbDoi3i0mUI/AItUTnIqLa595NWDwn25tV1xpdngTTSFxjfKS+uLGjwxPGT4V9m99xAz+R9bn/i+lOeL602Sw==}
+    engines: {node: '>=20.0.0'}
 
   '@crxjs/vite-plugin@2.3.0':
     resolution: {integrity: sha512-+0CNVGS4bB30OoaF1vUsHVwWU1Lm7MxI0XWY9Fd/Ob+ZVTZgEFNqJ1ZC69IVwQsoYhY0sMQLvpLWiFIuDz8htg==}
@@ -3515,6 +3519,10 @@ snapshots:
     dependencies:
       '@babel/helper-string-parser': 7.27.1
       '@babel/helper-validator-identifier': 7.28.5
+
+  '@byfire-dev/publication-bridge-contract@3.0.0':
+    dependencies:
+      zod: 3.25.76
 
   '@crxjs/vite-plugin@2.3.0':
     dependencies:

@@ -21,11 +21,9 @@ import {
   WEIXIN_PUBLIC_PAGE_MAX_REDIRECTS,
 } from '../weixin'
 
-const WEIXIN_LONG_A =
-  'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+const WEIXIN_LONG_A = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
 const WEIXIN_LONG_A_WITH_SN = `${WEIXIN_LONG_A}&sn=0123456789abcdef0123456789abcdef`
-const WEIXIN_LONG_B =
-  'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=778&idx=1'
+const WEIXIN_LONG_B = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=778&idx=1'
 const WEIXIN_SHORT_A = 'https://mp.weixin.qq.com/s/ShortAbC_123'
 
 function publicResponseMetadata(
@@ -112,7 +110,7 @@ describe('WeChat publication-inspection helpers', () => {
     'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=1&appmsgid=2',
     'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&action=view&appmsgid=1',
     'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=1#editor',
-    'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+    'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
   ])('rejects an unverified draft URL shape: %s', (draftUrl) => {
     expect(resolveWeixinAppMsgId(undefined, draftUrl)).toMatchObject({
       success: false,
@@ -195,7 +193,7 @@ describe('WeChat publication-inspection helpers', () => {
                 appmsgex: [
                   {
                     itemidx: 1,
-                    link: 'http://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&amp;mid=777&amp;idx=1',
+                    link: 'http://mp.weixin.qq.com/s?__biz=MzA1AA&amp;mid=777&amp;idx=1',
                   },
                 ],
               }),
@@ -211,8 +209,7 @@ describe('WeChat publication-inspection helpers', () => {
     expect(result).toEqual({
       success: true,
       match: 'PUBLISHED',
-      canonicalUrl:
-        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1',
+      canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1',
       publishedAt: '2024-07-03T09:46:40.000Z',
     })
   })
@@ -307,8 +304,7 @@ describe('WeChat publication-inspection helpers', () => {
       appmsgex: [
         {
           itemidx: 1,
-          content_url:
-            'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1',
+          content_url: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1',
         },
       ],
     }
@@ -486,7 +482,10 @@ describe('WeChat publication-inspection helpers', () => {
     ).toBe('https://mp.weixin.qq.com/s?tempkey=redacted&mid=900000001')
     expect(
       classifyWeixinTempUrl('http://mp.weixin.qq.com/s?tempkey=must-not-leak'),
-    ).toEqual({ success: true, shape: 'SAFE_HTTP_UPGRADED' })
+    ).toEqual({
+      success: true,
+      shape: 'SAFE_HTTP_UPGRADED',
+    })
     expect(
       resolveWeixinTempUrl('http://mp.weixin.qq.com/s?tempkey=must-not-leak'),
     ).toEqual({
@@ -659,7 +658,10 @@ describe('WeChat publication-inspection helpers', () => {
           candidate,
           publicResponseMetadata(responseUrl, redirected),
         ),
-      ).toEqual({ success: false, errorCode })
+      ).toEqual({
+        success: false,
+        errorCode,
+      })
     },
   )
 
@@ -670,7 +672,7 @@ describe('WeChat publication-inspection helpers', () => {
     'https://user:password@mp.weixin.qq.com/s/ShortAbC_123?secret=candidate',
     'https://mp.weixin.qq.com:444/s/ShortAbC_123?secret=candidate',
     'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9001',
-    'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777',
+    'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777',
     'not-a-url-secret-candidate',
   ])(
     'rejects an invalid public candidate URL without leaking it: %s',
@@ -696,7 +698,7 @@ describe('WeChat publication-inspection helpers', () => {
     'https://user:password@mp.weixin.qq.com/s/ShortAbC_123?secret=response',
     'https://mp.weixin.qq.com:444/s/ShortAbC_123?secret=response',
     'https://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=9001',
-    'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777',
+    'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777',
   ])('rejects an invalid final response URL without leaking it: %s', (url) => {
     const result = validateWeixinPublicPageResponse(
       WEIXIN_LONG_A,

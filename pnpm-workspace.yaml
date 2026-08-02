@@ -5,3 +5,6 @@ linkWorkspacePackages: true
 
 ignoredBuiltDependencies:
   - esbuild
+
+minimumReleaseAgeExclude:
+  - '@byfire-dev/publication-bridge-contract@3.0.0'

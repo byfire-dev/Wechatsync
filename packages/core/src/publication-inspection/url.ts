@@ -10,8 +10,23 @@ export interface ParsedPublicationUrl {
   canonicalUrl?: string
 }
 
+/**
+ * Stable, cross-runtime identity for one publicly reachable publication.
+ *
+ * `canonicalUrl` is an identity URL, not necessarily the exact URL fetched by
+ * an inspector. Callers must retain the latter separately as `checkedUrl`.
+ */
+export interface PublicationPublicIdentity {
+  key: string
+  canonicalUrl: string
+}
+
 const ZHIHU_ALLOWED_HOSTS = new Set(['www.zhihu.com', 'zhuanlan.zhihu.com'])
-const SOHU_ALLOWED_HOSTS = new Set(['mp.sohu.com', 'www.sohu.com'])
+const SOHU_ALLOWED_HOSTS = new Set([
+  'mp.sohu.com',
+  'www.sohu.com',
+  'm.sohu.com',
+])
 const WEIXIN_ALLOWED_HOSTS = new Set(['mp.weixin.qq.com'])
 const TOUTIAO_ALLOWED_HOSTS = new Set(['mp.toutiao.com', 'www.toutiao.com'])
 const SOHU_DRAFT_PATH = '/mpfe/v4/contentManagement/news/addarticle'
@@ -97,7 +112,10 @@ function parseSohu(url: URL): ParsedPublicationUrl {
   }
 
   const articleMatch = pathname.match(/^\/a\/(\d+)_(\d+)$/)
-  if (url.hostname === 'www.sohu.com' && articleMatch) {
+  if (
+    (url.hostname === 'www.sohu.com' || url.hostname === 'm.sohu.com') &&
+    articleMatch
+  ) {
     const postId = articleMatch[1]
     const accountId = articleMatch[2]
     return {
@@ -171,7 +189,7 @@ function parseWeixin(url: URL): ParsedPublicationUrl {
 
     if (
       !accountId ||
-      !/^[A-Za-z0-9+/]{4,126}={0,2}$/.test(accountId) ||
+      !normalizeCanonicalBase64(accountId) ||
       !publicMid ||
       !itemIndex ||
       !/^[1-9]\d*$/.test(itemIndex) ||
@@ -242,11 +260,10 @@ function parseToutiao(url: URL): ParsedPublicationUrl {
         platform: 'toutiao',
         surface: 'PUBLISHED',
         postId: publicItemId,
-        ...(shape === 'article'
-          ? {
-              canonicalUrl: `https://www.toutiao.com/article/${publicItemId}/`,
-            }
-          : {}),
+        canonicalUrl:
+          shape === 'article'
+            ? `https://www.toutiao.com/article/${publicItemId}/`
+            : `https://www.toutiao.com/item/${publicItemId}`,
       }
     }
   }
@@ -293,4 +310,106 @@ export function parsePublicationUrl(
 
   if (!WEIXIN_ALLOWED_HOSTS.has(url.hostname)) return null
   return parseWeixin(url)
+}
+
+function normalizeCanonicalBase64(value: string): string | null {
+  if (value.length < 2 || value.length > 128) return null
+
+  const match = value.match(/^([A-Za-z0-9+/]+)(={0,2})$/)
+  const unpadded = match?.[1]
+  const suppliedPadding = match?.[2]?.length
+  if (!unpadded || suppliedPadding === undefined) return null
+
+  const remainder = unpadded.length % 4
+  if (remainder === 1) return null
+  const expectedPadding = remainder === 0 ? 0 : 4 - remainder
+  if (suppliedPadding !== 0 && suppliedPadding !== expectedPadding) return null
+
+  const lastAlphabetIndex =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(
+      unpadded.at(-1) ?? '',
+    )
+  if (
+    lastAlphabetIndex < 0 ||
+    (remainder === 2 && lastAlphabetIndex % 16 !== 0) ||
+    (remainder === 3 && lastAlphabetIndex % 4 !== 0)
+  ) {
+    return null
+  }
+  return unpadded
+}
+
+/**
+ * Derive the same deterministic public identity regardless of harmless URL
+ * variants (for example Sohu's desktop/mobile host or WeChat's `sn` token).
+ */
+export function derivePublicationPublicIdentity(
+  platform: PublicationPlatform,
+  href: string,
+): PublicationPublicIdentity | null {
+  const parsed = parsePublicationUrl(platform, href)
+  if (!parsed || parsed.surface !== 'PUBLISHED') return null
+
+  if (platform === 'zhihu') {
+    if (!parsed.postId || !parsed.canonicalUrl) return null
+    return {
+      key: `zhihu:post:v1:${parsed.postId}`,
+      canonicalUrl: parsed.canonicalUrl,
+    }
+  }
+
+  if (platform === 'sohu') {
+    if (!parsed.postId || !parsed.accountId || !parsed.canonicalUrl) return null
+    return {
+      key: `sohu:post:v1:${parsed.postId}:${parsed.accountId}`,
+      canonicalUrl: parsed.canonicalUrl,
+    }
+  }
+
+  const url = safeUrl(href)
+  if (!url) return null
+  url.hostname = url.hostname.toLowerCase()
+
+  if (platform === 'weixin') {
+    const pathname = cleanPath(url.pathname)
+    const shortLinkMatch = pathname.match(/^\/s\/([A-Za-z0-9_-]{8,128})$/)
+    if (shortLinkMatch?.[1]) {
+      return {
+        key: `weixin:short:v1:${shortLinkMatch[1]}`,
+        canonicalUrl: `https://mp.weixin.qq.com/s/${shortLinkMatch[1]}`,
+      }
+    }
+
+    const bizValues = url.searchParams.getAll('__biz')
+    const midValues = url.searchParams.getAll('mid')
+    const idxValues = url.searchParams.getAll('idx')
+    const biz =
+      bizValues.length === 1
+        ? normalizeCanonicalBase64(bizValues[0] ?? '')
+        : null
+    const mid =
+      midValues.length === 1
+        ? normalizePositiveDecimal(midValues[0])
+        : undefined
+    const idx =
+      idxValues.length === 1
+        ? normalizePositiveDecimal(idxValues[0])
+        : undefined
+    if (!biz || !mid || !idx) return null
+
+    const canonicalUrl = new URL('https://mp.weixin.qq.com/s')
+    canonicalUrl.searchParams.set('__biz', biz)
+    canonicalUrl.searchParams.set('mid', mid)
+    canonicalUrl.searchParams.set('idx', idx)
+    return {
+      key: `weixin:article:v1:${biz.replace(/\+/g, '-').replace(/\//g, '_')}:${mid}:${idx}`,
+      canonicalUrl: canonicalUrl.toString(),
+    }
+  }
+
+  if (!parsed.postId) return null
+  return {
+    key: `toutiao:item:v1:${parsed.postId}`,
+    canonicalUrl: `https://www.toutiao.com/item/${parsed.postId}`,
+  }
 }

@@ -1,13 +1,14 @@
 import type { AuthResult } from '../types'
 import type {
-  PublicationInspectRequest,
-  PublicationObservation,
-  PublicationObservationOutcome,
-  PublicationObservationSource,
-  PublicationPublicAccess,
-} from './types'
+  PublicationInspectionEvidenceSource as PublicationObservationSource,
+  PublicationInspectionObservation as PublicationObservation,
+  PublicationInspectionOutcome as PublicationObservationOutcome,
+  PublicationInspectionPublicAccess as PublicationPublicAccess,
+  PublicationInspectionRequest as PublicationInspectRequest,
+} from './domain'
+import { PublicationInspectionObservationSchema } from './domain'
 import { normalizeHtmlText, parseTagAttributes } from './html'
-import { parsePublicationUrl } from './url'
+import { derivePublicationPublicIdentity, parsePublicationUrl } from './url'
 
 const ZHIHU_PUBLIC_ORIGIN = 'https://zhuanlan.zhihu.com'
 const ZHIHU_SOFT_NOT_FOUND_TITLE = '你似乎来到了没有知识存在的荒原 - 知乎'
@@ -37,6 +38,8 @@ interface ObservationDetails {
 interface PageContent {
   html: string
   responseUrl: string
+  checkedAt: string
+  httpStatus: number
 }
 
 type PublishedPageSource = 'PUBLIC_PAGE' | 'AUTHENTICATED_PUBLIC_PAGE'
@@ -44,7 +47,14 @@ type PublishedPageSource = 'PUBLIC_PAGE' | 'AUTHENTICATED_PUBLIC_PAGE'
 type PageProbe =
   | { kind: 'FOUND'; page: PageContent }
   | { kind: 'NOT_FOUND' }
-  | { kind: 'ACCESS_DENIED'; observation: PublicationObservation }
+  | {
+      kind: 'ACCESS_DENIED'
+      observation: PublicationObservation
+      publicAccess?: Extract<
+        PublicationPublicAccess,
+        { status: 'BLOCKED_BY_PLATFORM' }
+      >
+    }
   | { kind: 'OBSERVATION'; observation: PublicationObservation }
 
 interface DraftContent {
@@ -104,13 +114,13 @@ function createObservation(
   observedAt: string,
   details: ObservationDetails,
 ): PublicationObservation {
-  return {
+  return PublicationInspectionObservationSchema.parse({
     observationKey: `zhihu:${request.requestId}:${details.source}:${details.outcome}`,
     platform: 'zhihu',
     externalAccountId: request.externalAccountId,
     observedAt,
     ...details,
-  }
+  })
 }
 
 function resolvePostId(request: PublicationInspectRequest): PostIdResolution {
@@ -514,6 +524,24 @@ async function fetchPage(
   }
 
   if (response.status === 403) {
+    const checkedIdentity = derivePublicationPublicIdentity(
+      'zhihu',
+      response.url,
+    )
+    if (!checkedIdentity) {
+      return {
+        kind: 'OBSERVATION',
+        observation: createObservation(request, observedAt, {
+          outcome: 'PARSE_ERROR',
+          source,
+          platformPostId: postId,
+          errorCode: 'ZHIHU_UNEXPECTED_PUBLIC_PAGE',
+          errorMessage:
+            'The denied Zhihu response did not identify the expected public article.',
+        }),
+      }
+    }
+    const checkedAt = dependencies.now?.() ?? new Date().toISOString()
     return {
       kind: 'ACCESS_DENIED',
       observation: createObservation(request, observedAt, {
@@ -529,6 +557,18 @@ async function fetchPage(
             ? 'Zhihu denied the authenticated inspection request.'
             : 'Zhihu denied the anonymous inspection request.',
       }),
+      ...(credentials === 'omit'
+        ? {
+            publicAccess: {
+              status: 'BLOCKED_BY_PLATFORM' as const,
+              checkedUrl: response.url,
+              checkedPublicIdentityKey: checkedIdentity.key,
+              checkedAt,
+              httpStatus: response.status,
+              reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
+            },
+          }
+        : {}),
     }
   }
 
@@ -559,11 +599,14 @@ async function fetchPage(
   }
 
   try {
+    const html = await response.text()
     return {
       kind: 'FOUND',
       page: {
-        html: await response.text(),
+        html,
         responseUrl: response.url,
+        checkedAt: dependencies.now?.() ?? new Date().toISOString(),
+        httpStatus: response.status,
       },
     }
   } catch {
@@ -594,10 +637,13 @@ async function fetchPage(
 function inspectPublishedPage(
   request: PublicationInspectRequest,
   postId: string,
-  publicUrl: string,
   page: PageContent,
   source: PublishedPageSource,
   observedAt: string,
+  blockedPublicAccess?: Extract<
+    PublicationPublicAccess,
+    { status: 'BLOCKED_BY_PLATFORM' }
+  >,
 ): PublicationObservation | null {
   if (!responseUrlMatches(page.responseUrl, postId, 'PUBLISHED')) {
     return createObservation(request, observedAt, {
@@ -650,22 +696,43 @@ function inspectPublishedPage(
     })
   }
 
+  const publicIdentity = derivePublicationPublicIdentity(
+    'zhihu',
+    page.responseUrl,
+  )
+  if (
+    !publicIdentity ||
+    (source === 'AUTHENTICATED_PUBLIC_PAGE' && !blockedPublicAccess)
+  ) {
+    return createObservation(request, observedAt, {
+      outcome: 'PARSE_ERROR',
+      source,
+      platformPostId: postId,
+      errorCode: 'ZHIHU_PUBLIC_ACCESS_EVIDENCE_INVALID',
+      errorMessage:
+        'The Zhihu public-access check did not produce complete identity evidence.',
+    })
+  }
+
   return createObservation(request, observedAt, {
     outcome: 'PUBLISHED',
     source,
     platformPostId: postId,
-    canonicalUrl: publicUrl,
+    canonicalUrl: publicIdentity.canonicalUrl,
     title: decision.evidence.title,
     publishedAt: decision.evidence.publishedAt,
     bodyText: decision.evidence.bodyText,
     bodyTruncated: decision.evidence.bodyTruncated,
     publicAccess:
       source === 'PUBLIC_PAGE'
-        ? { status: 'CONFIRMED' }
-        : {
-            status: 'BLOCKED_BY_PLATFORM',
-            reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
-          },
+        ? {
+            status: 'CONFIRMED',
+            checkedUrl: page.responseUrl,
+            checkedPublicIdentityKey: publicIdentity.key,
+            checkedAt: page.checkedAt,
+            httpStatus: page.httpStatus,
+          }
+        : blockedPublicAccess,
   })
 }
 
@@ -959,6 +1026,9 @@ export async function inspectZhihuPublication(
 
   const publicUrl = `${ZHIHU_PUBLIC_ORIGIN}/p/${postId}`
   let publishedPageSource: PublishedPageSource = 'PUBLIC_PAGE'
+  let blockedPublicAccess:
+    | Extract<PublicationPublicAccess, { status: 'BLOCKED_BY_PLATFORM' }>
+    | undefined
   let publicProbe = await fetchPage(
     request,
     postId,
@@ -970,6 +1040,7 @@ export async function inspectZhihuPublication(
   )
 
   if (publicProbe.kind === 'ACCESS_DENIED') {
+    blockedPublicAccess = publicProbe.publicAccess
     publishedPageSource = 'AUTHENTICATED_PUBLIC_PAGE'
     publicProbe = await fetchPage(
       request,
@@ -990,13 +1061,14 @@ export async function inspectZhihuPublication(
   }
 
   if (publicProbe.kind === 'FOUND') {
+    const publishedObservedAt = dependencies.now?.() ?? new Date().toISOString()
     const observation = inspectPublishedPage(
       request,
       postId,
-      publicUrl,
       publicProbe.page,
       publishedPageSource,
-      observedAt,
+      publishedObservedAt,
+      blockedPublicAccess,
     )
     if (observation) return [observation]
   }

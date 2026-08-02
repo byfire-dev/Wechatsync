@@ -3,11 +3,22 @@
  */
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
-import type { PublicationPublishedProof, PublishOptions } from '../types'
 import type {
-  PublicationInspectRequest,
-  PublicationObservation,
-} from '../../publication-inspection/types'
+  AdapterAccountProbe,
+  AdapterOperationContext,
+  PublicationPublishedProof,
+  PublishOptions,
+} from '../types'
+import {
+  adapterAccountSelectionErrorMessage,
+  normalizeAdapterAccountBinding,
+  normalizeAdapterExternalAccountId,
+  resolveAdapterAccountBinding,
+} from '../account-binding'
+import type {
+  PublicationInspectionObservation as PublicationObservation,
+  PublicationInspectionRequest as PublicationInspectRequest,
+} from '../../publication-inspection/domain'
 import { inspectZhihuPublication } from '../../publication-inspection/zhihu'
 import { createLogger } from '../../lib/logger'
 import md5Lib from 'js-md5'
@@ -15,7 +26,33 @@ import md5Lib from 'js-md5'
 const logger = createLogger('Zhihu')
 
 // js-md5 导出的是函数本身
-const jsMd5 = md5Lib as unknown as (message: string | ArrayBuffer | Uint8Array) => string
+const jsMd5 = md5Lib as unknown as (
+  message: string | ArrayBuffer | Uint8Array,
+) => string
+
+function normalizeAccountDisplayName(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return normalized.length > 0 &&
+    normalized.length <= 500 &&
+    !/[\u0000-\u001f\u007f]/.test(normalized)
+    ? normalized
+    : fallback
+}
+
+function normalizeAccountAvatarUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (normalized.length === 0 || normalized.length > 2_000) return undefined
+  try {
+    const url = new URL(normalized)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+      ? url.href
+      : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export class ZhihuAdapter extends CodeAdapter {
   readonly meta: PlatformMeta = {
@@ -23,7 +60,14 @@ export class ZhihuAdapter extends CodeAdapter {
     name: '知乎',
     icon: 'https://static.zhihu.com/static/favicon.ico',
     homepage: 'https://www.zhihu.com',
-    capabilities: ['article', 'draft', 'image_upload', 'tags', 'cover'],
+    capabilities: [
+      'article',
+      'draft',
+      'image_upload',
+      'account_binding',
+      'tags',
+      'cover',
+    ],
   }
 
   /** 预处理配置: 知乎使用 HTML，需要特殊处理 */
@@ -64,17 +108,23 @@ export class ZhihuAdapter extends CodeAdapter {
     },
   ]
 
-  async checkAuth(): Promise<AuthResult> {
+  async checkAuth(context?: AdapterOperationContext): Promise<AuthResult> {
+    const signal = context?.signal
+    signal?.throwIfAborted()
     try {
-      const response = await this.runtime.fetch('https://www.zhihu.com/api/v4/me', {
-        method: 'GET',
-        credentials: 'include',
-        headers: {
-          'x-requested-with': 'fetch',
+      const response = await this.runtime.fetch(
+        'https://www.zhihu.com/api/v4/me',
+        {
+          method: 'GET',
+          credentials: 'include',
+          signal,
+          headers: {
+            'x-requested-with': 'fetch',
+          },
         },
-      })
+      )
 
-      const data = await response.json() as {
+      const data = (await response.json()) as {
         id?: string
         name?: string
         avatar_url?: string
@@ -91,13 +141,53 @@ export class ZhihuAdapter extends CodeAdapter {
 
       return { isAuthenticated: false }
     } catch (error) {
+      signal?.throwIfAborted()
       logger.debug('checkAuth: not logged in -', error)
       return { isAuthenticated: false, error: (error as Error).message }
     }
   }
 
+  async probeAccounts(
+    context?: AdapterOperationContext,
+  ): Promise<AdapterAccountProbe> {
+    const auth = await this.checkAuth(context)
+    if (!auth.isAuthenticated) {
+      return auth.error
+        ? {
+            status: 'PROBE_FAILED',
+            accounts: [],
+            errorCode: 'UNKNOWN_ERROR',
+          }
+        : { status: 'NOT_AUTHENTICATED', accounts: [] }
+    }
+
+    const externalAccountId = normalizeAdapterExternalAccountId(auth.userId)
+    if (!externalAccountId) {
+      return {
+        status: 'PROBE_FAILED',
+        accounts: [],
+        errorCode: 'ACCOUNT_ID_MISSING',
+      }
+    }
+
+    const avatarUrl = normalizeAccountAvatarUrl(auth.avatar)
+    return {
+      status: 'AUTHENTICATED',
+      accounts: [
+        {
+          externalAccountId,
+          displayName: normalizeAccountDisplayName(
+            auth.username,
+            externalAccountId,
+          ),
+          ...(avatarUrl ? { avatarUrl } : {}),
+        },
+      ],
+    }
+  }
+
   async inspectPublication(
-    request: PublicationInspectRequest
+    request: PublicationInspectRequest,
   ): Promise<PublicationObservation[]> {
     return inspectZhihuPublication(request, {
       checkAuth: () => this.checkAuth(),
@@ -144,31 +234,66 @@ export class ZhihuAdapter extends CodeAdapter {
     }
   }
 
-  async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {
+  async publish(
+    article: Article,
+    options?: PublishOptions,
+  ): Promise<SyncResult> {
+    const requestedBinding =
+      options?.accountBinding === undefined
+        ? undefined
+        : normalizeAdapterAccountBinding(options.accountBinding)
+    let operationExternalAccountId = requestedBinding?.externalAccountId
+
     return this.withHeaderRules(this.HEADER_RULES, async () => {
       logger.info('Starting publish...')
 
+      const selection = resolveAdapterAccountBinding(
+        await this.probeAccounts(),
+        options?.accountBinding,
+      )
+      if (!selection.ok) {
+        return this.createResult(false, {
+          ...(operationExternalAccountId
+            ? { externalAccountId: operationExternalAccountId }
+            : {}),
+          errorCode: selection.errorCode,
+          error: adapterAccountSelectionErrorMessage(selection.errorCode),
+        })
+      }
+      operationExternalAccountId = selection.account.externalAccountId
+
+      await options?.beforeDispatch?.()
+
       // 1. 创建草稿
-      const createResponse = await this.runtime.fetch('https://zhuanlan.zhihu.com/api/articles/drafts', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-requested-with': 'fetch',
+      const createResponse = await this.runtime.fetch(
+        'https://zhuanlan.zhihu.com/api/articles/drafts',
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-requested-with': 'fetch',
+          },
+          body: JSON.stringify({
+            title: article.title,
+            content: '',
+            delta_time: 0,
+          }),
         },
-        body: JSON.stringify({
-          title: article.title,
-          content: '',
-          delta_time: 0,
-        }),
-      })
+      )
 
       // 检查响应状态和内容
       const responseText = await createResponse.text()
-      logger.debug('Create draft response:', createResponse.status, responseText.substring(0, 200))
+      logger.debug(
+        'Create draft response:',
+        createResponse.status,
+        responseText.substring(0, 200),
+      )
 
       if (!createResponse.ok) {
-        throw new Error(`创建草稿失败: ${createResponse.status} - ${responseText}`)
+        throw new Error(
+          `创建草稿失败: ${createResponse.status} - ${responseText}`,
+        )
       }
 
       // 尝试解析 JSON
@@ -176,7 +301,9 @@ export class ZhihuAdapter extends CodeAdapter {
       try {
         createData = JSON.parse(responseText)
       } catch {
-        throw new Error(`创建草稿失败: 响应不是有效 JSON - ${responseText.substring(0, 100)}`)
+        throw new Error(
+          `创建草稿失败: 响应不是有效 JSON - ${responseText.substring(0, 100)}`,
+        )
       }
 
       if (!createData.id) {
@@ -195,9 +322,15 @@ export class ZhihuAdapter extends CodeAdapter {
         content,
         (src) => this.uploadImageByUrl(src),
         {
-          skipPatterns: ['zhimg.com', 'pic1.zhimg.com', 'pic2.zhimg.com', 'pic3.zhimg.com', 'pic4.zhimg.com'],
+          skipPatterns: [
+            'zhimg.com',
+            'pic1.zhimg.com',
+            'pic2.zhimg.com',
+            'pic3.zhimg.com',
+            'pic4.zhimg.com',
+          ],
           onProgress: options?.onImageProgress,
-        }
+        },
       )
 
       // 4. 知乎特定的内容转换
@@ -217,7 +350,7 @@ export class ZhihuAdapter extends CodeAdapter {
             title: article.title,
             content: content,
           }),
-        }
+        },
       )
 
       // 检查更新响应 (PATCH 可能返回空响应或 204)
@@ -234,11 +367,17 @@ export class ZhihuAdapter extends CodeAdapter {
       return this.createResult(true, {
         postId: draftId,
         postUrl: draftUrl,
+        externalAccountId: operationExternalAccountId,
         draftOnly: options?.draftOnly ?? true,
       })
-    }).catch((error) => this.createResult(false, {
-      error: (error as Error).message,
-    }))
+    }).catch((error) =>
+      this.createResult(false, {
+        ...(operationExternalAccountId
+          ? { externalAccountId: operationExternalAccountId }
+          : {}),
+        error: (error as Error).message,
+      }),
+    )
   }
 
   /**
@@ -253,13 +392,13 @@ export class ZhihuAdapter extends CodeAdapter {
     // 2. 图片格式 - 知乎需要 figure 包裹
     result = result.replace(
       /<img([^>]+)src="([^"]+)"([^>]*)>/gi,
-      '<figure><img$1src="$2"$3></figure>'
+      '<figure><img$1src="$2"$3></figure>',
     )
 
     // 3. 代码块格式
     result = result.replace(
       /<pre><code class="language-(\w+)">/gi,
-      '<pre lang="$1"><code>'
+      '<pre lang="$1"><code>',
     )
 
     // 4. 移除微信样式属性 (但保留知乎的 data-draft-* 属性)
@@ -276,7 +415,7 @@ export class ZhihuAdapter extends CodeAdapter {
     // 1. 解包 figure 中的 table
     let result = html.replace(
       /<figure[^>]*>\s*(<table[\s\S]*?<\/table>)\s*<\/figure>/gi,
-      '$1'
+      '$1',
     )
 
     // 2. 转换 table 结构
@@ -284,9 +423,13 @@ export class ZhihuAdapter extends CodeAdapter {
       /<table[^>]*>([\s\S]*?)<\/table>/gi,
       (_match, tableContent) => {
         // 提取 thead 中的行
-        const theadMatch = tableContent.match(/<thead[^>]*>([\s\S]*?)<\/thead>/i)
+        const theadMatch = tableContent.match(
+          /<thead[^>]*>([\s\S]*?)<\/thead>/i,
+        )
         // 提取 tbody 中的行
-        const tbodyMatch = tableContent.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i)
+        const tbodyMatch = tableContent.match(
+          /<tbody[^>]*>([\s\S]*?)<\/tbody>/i,
+        )
 
         let headerRows = ''
         let bodyRows = ''
@@ -312,7 +455,10 @@ export class ZhihuAdapter extends CodeAdapter {
           const firstRowMatch = bodyRows.match(/<tr[^>]*>([\s\S]*?)<\/tr>/i)
           if (firstRowMatch) {
             const firstRowContent = firstRowMatch[1]
-            if (/<th[^>]*>/i.test(firstRowContent) && !/<td[^>]*>/i.test(firstRowContent)) {
+            if (
+              /<th[^>]*>/i.test(firstRowContent) &&
+              !/<td[^>]*>/i.test(firstRowContent)
+            ) {
               headerRows = firstRowMatch[0]
               bodyRows = bodyRows.replace(firstRowMatch[0], '')
             }
@@ -321,7 +467,7 @@ export class ZhihuAdapter extends CodeAdapter {
 
         // 组装知乎格式的表格
         return `<table data-draft-node="block" data-draft-type="table" data-size="normal" data-row-style="normal"><tbody>${headerRows}${bodyRows}</tbody></table>`
-      }
+      },
     )
 
     return result
@@ -342,26 +488,29 @@ export class ZhihuAdapter extends CodeAdapter {
     // 检测 data URI，使用二进制上传
     if (src.startsWith('data:')) {
       logger.debug('Detected data URI, using binary upload')
-      const blob = await fetch(src).then(r => r.blob())
+      const blob = await fetch(src).then((r) => r.blob())
       const url = await this.uploadImageBinaryInternal(blob)
       return { url }
     }
 
     // 远程 URL 使用知乎 URL 上传 API
-    const response = await this.runtime.fetch('https://zhuanlan.zhihu.com/api/uploaded_images', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'x-requested-with': 'fetch',
-        'Content-Type': 'application/x-www-form-urlencoded',
+    const response = await this.runtime.fetch(
+      'https://zhuanlan.zhihu.com/api/uploaded_images',
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'x-requested-with': 'fetch',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          url: src,
+          source: 'article',
+        }),
       },
-      body: new URLSearchParams({
-        url: src,
-        source: 'article',
-      }),
-    })
+    )
 
-    const data = await response.json() as { src?: string; hash?: string }
+    const data = (await response.json()) as { src?: string; hash?: string }
 
     if (data.src) {
       return { url: data.src }
@@ -379,19 +528,22 @@ export class ZhihuAdapter extends CodeAdapter {
     const imageHash = jsMd5(buffer)
 
     // 2. 请求上传凭证
-    const tokenResponse = await this.runtime.fetch('https://api.zhihu.com/images', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
+    const tokenResponse = await this.runtime.fetch(
+      'https://api.zhihu.com/images',
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          image_hash: imageHash,
+          source: 'article',
+        }),
       },
-      body: JSON.stringify({
-        image_hash: imageHash,
-        source: 'article',
-      }),
-    })
+    )
 
-    const tokenData = await tokenResponse.json() as {
+    const tokenData = (await tokenResponse.json()) as {
       upload_file: {
         state: number
         image_id: string
@@ -418,7 +570,7 @@ export class ZhihuAdapter extends CodeAdapter {
       'https://zhihu-pics-upload.zhimg.com',
       uploadFile.object_key,
       file,
-      token
+      token,
     )
 
     // 5. 处理 GIF 扩展名
@@ -433,19 +585,27 @@ export class ZhihuAdapter extends CodeAdapter {
   /**
    * 等待图片处理完成
    */
-  private async waitForImageReady(imageId: string): Promise<{ original_hash: string }> {
+  private async waitForImageReady(
+    imageId: string,
+  ): Promise<{ original_hash: string }> {
     const maxRetries = 10
     for (let i = 0; i < maxRetries; i++) {
-      const response = await this.runtime.fetch(`https://api.zhihu.com/images/${imageId}`, {
-        credentials: 'include',
-      })
-      const data = await response.json() as { status?: string; original_hash?: string }
+      const response = await this.runtime.fetch(
+        `https://api.zhihu.com/images/${imageId}`,
+        {
+          credentials: 'include',
+        },
+      )
+      const data = (await response.json()) as {
+        status?: string
+        original_hash?: string
+      }
 
       if (data.status === 'completed' || data.original_hash) {
         return data as { original_hash: string }
       }
 
-      await new Promise(resolve => setTimeout(resolve, 1000))
+      await new Promise((resolve) => setTimeout(resolve, 1000))
     }
     throw new Error('Image processing timeout')
   }
@@ -457,7 +617,7 @@ export class ZhihuAdapter extends CodeAdapter {
     endpoint: string,
     objectKey: string,
     blob: Blob,
-    token: { access_id: string; access_key: string; access_token: string }
+    token: { access_id: string; access_key: string; access_token: string },
   ): Promise<void> {
     const contentType = blob.type || 'application/octet-stream'
     const url = `${endpoint}/${objectKey}`
@@ -475,7 +635,7 @@ export class ZhihuAdapter extends CodeAdapter {
     // 按字母顺序排序，每个 header 以 \n 结尾
     const canonicalizedOSSHeaders = Object.keys(ossHeaders)
       .sort()
-      .map(key => `${key}:${ossHeaders[key]}`)
+      .map((key) => `${key}:${ossHeaders[key]}`)
       .join('\n')
 
     // CanonicalizedResource: /bucket/object-key
@@ -487,10 +647,13 @@ export class ZhihuAdapter extends CodeAdapter {
     // VERB + "\n" + Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" + CanonicalizedOSSHeaders + "\n" + CanonicalizedResource
     const stringToSign =
       'PUT\n' +
-      '\n' +  // Content-MD5 (空)
-      contentType + '\n' +
-      ossDate + '\n' +  // Date (与 x-oss-date 相同)
-      canonicalizedOSSHeaders + '\n' +
+      '\n' + // Content-MD5 (空)
+      contentType +
+      '\n' +
+      ossDate +
+      '\n' + // Date (与 x-oss-date 相同)
+      canonicalizedOSSHeaders +
+      '\n' +
       canonicalizedResource
 
     // 计算 HMAC-SHA1 签名
@@ -507,8 +670,8 @@ export class ZhihuAdapter extends CodeAdapter {
         ruleId = await this.runtime.headerRules.add({
           urlFilter: '*://zhihu-pics-upload.zhimg.com/*',
           headers: {
-            'Origin': 'https://zhuanlan.zhihu.com',
-            'Referer': 'https://zhuanlan.zhihu.com/',
+            Origin: 'https://zhuanlan.zhihu.com',
+            Referer: 'https://zhuanlan.zhihu.com/',
           },
           resourceTypes: ['xmlhttprequest'],
         })
@@ -519,7 +682,7 @@ export class ZhihuAdapter extends CodeAdapter {
         method: 'PUT',
         headers: {
           'Content-Type': contentType,
-          'Authorization': authorization,
+          Authorization: authorization,
           'x-oss-date': ossDate,
           'x-oss-security-token': token.access_token,
           'x-oss-user-agent': 'aliyun-sdk-js/6.8.0',
@@ -555,7 +718,7 @@ export class ZhihuAdapter extends CodeAdapter {
       keyData,
       { name: 'HMAC', hash: 'SHA-1' },
       false,
-      ['sign']
+      ['sign'],
     )
 
     const signature = await crypto.subtle.sign('HMAC', cryptoKey, messageData)

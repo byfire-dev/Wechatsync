@@ -431,8 +431,40 @@ describe('Sohu exact-ID publication inspector', () => {
         publishedAt: PUBLISHED_AT,
         bodyText: '第一段\n第二段 & 证据',
         bodyTruncated: false,
+        publicAccess: {
+          status: 'CONFIRMED',
+          checkedUrl: PUBLIC_URL,
+          checkedPublicIdentityKey: `sohu:post:v1:${POST_ID}:${ACCOUNT_ID}`,
+          checkedAt: NOW,
+          httpStatus: 200,
+        },
       },
     ])
+  })
+
+  it('records the mobile URL that was checked while keeping one canonical identity', async () => {
+    const mobileUrl = `https://m.sohu.com/a/${POST_ID}_${ACCOUNT_ID}/`
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, DETAIL_URL, detailPayload(4)))
+      .mockResolvedValueOnce(htmlResponse(200, mobileUrl, publishedHtml()))
+
+    const [observation] = await inspectSohuPublication(
+      createRequest(),
+      createDependencies(fetch),
+    )
+
+    expect(observation).toMatchObject({
+      outcome: 'PUBLISHED',
+      canonicalUrl: PUBLIC_URL,
+      publicAccess: {
+        status: 'CONFIRMED',
+        checkedUrl: mobileUrl,
+        checkedPublicIdentityKey: `sohu:post:v1:${POST_ID}:${ACCOUNT_ID}`,
+        checkedAt: NOW,
+        httpStatus: 200,
+      },
+    })
   })
 
   it.each([

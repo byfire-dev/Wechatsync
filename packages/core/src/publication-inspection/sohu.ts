@@ -1,12 +1,14 @@
 import type { AuthResult } from '../types'
 import { normalizeHtmlText, parseTagAttributes } from './html'
 import type {
-  PublicationInspectRequest,
-  PublicationObservation,
-  PublicationObservationOutcome,
-  PublicationObservationSource,
-} from './types'
-import { parsePublicationUrl } from './url'
+  PublicationInspectionEvidenceSource as PublicationObservationSource,
+  PublicationInspectionObservation as PublicationObservation,
+  PublicationInspectionOutcome as PublicationObservationOutcome,
+  PublicationInspectionPublicAccess,
+  PublicationInspectionRequest as PublicationInspectRequest,
+} from './domain'
+import { PublicationInspectionObservationSchema } from './domain'
+import { derivePublicationPublicIdentity, parsePublicationUrl } from './url'
 
 const SOHU_MANAGEMENT_ORIGIN = 'https://mp.sohu.com'
 const SOHU_PUBLIC_ORIGIN = 'https://www.sohu.com'
@@ -37,6 +39,7 @@ interface ObservationDetails {
   publishedAt?: string
   bodyText?: string
   bodyTruncated?: boolean
+  publicAccess?: PublicationInspectionPublicAccess
   errorCode?: string
   errorMessage?: string
 }
@@ -98,13 +101,13 @@ function createObservation(
   observedAt: string,
   details: ObservationDetails,
 ): PublicationObservation {
-  return {
+  return PublicationInspectionObservationSchema.parse({
     observationKey: `sohu:${request.requestId}:${details.source}:${details.outcome}`,
     platform: 'sohu',
     externalAccountId: request.externalAccountId,
     observedAt,
     ...details,
-  }
+  })
 }
 
 function normalizeIdentifier(value: unknown): string | undefined {
@@ -484,7 +487,7 @@ function normalizePublicIdentityUrl(value: string): string | undefined {
   const trimmed = value.trim()
   const withScheme = trimmed.startsWith('//')
     ? `https:${trimmed}`
-    : /^www\.sohu\.com\//i.test(trimmed)
+    : /^(?:www|m)\.sohu\.com\//i.test(trimmed)
       ? `https://${trimmed}`
       : trimmed
 
@@ -499,7 +502,7 @@ function normalizePublicIdentityUrl(value: string): string | undefined {
     ) {
       return undefined
     }
-    return url.href
+    return derivePublicationPublicIdentity('sohu', url.href)?.canonicalUrl
   } catch {
     return undefined
   }
@@ -826,7 +829,13 @@ async function inspectPublicPage(
     })
   }
 
-  if (response.url !== publicUrl) {
+  const expectedIdentity = derivePublicationPublicIdentity('sohu', publicUrl)
+  const checkedIdentity = derivePublicationPublicIdentity('sohu', response.url)
+  if (
+    !expectedIdentity ||
+    !checkedIdentity ||
+    checkedIdentity.key !== expectedIdentity.key
+  ) {
     return createObservation(request, observedAt, {
       outcome: 'REVIEW_REQUIRED',
       source: 'PUBLIC_PAGE',
@@ -871,15 +880,25 @@ async function inspectPublicPage(
     })
   }
 
-  return createObservation(request, observedAt, {
+  const checkedAt = dependencies.now?.() ?? new Date().toISOString()
+  const publicObservedAt = dependencies.now?.() ?? new Date().toISOString()
+
+  return createObservation(request, publicObservedAt, {
     outcome: 'PUBLISHED',
     source: 'PUBLIC_PAGE',
     platformPostId: postId,
-    canonicalUrl: publicUrl,
+    canonicalUrl: expectedIdentity.canonicalUrl,
     title: parsed.evidence.title,
     publishedAt: parsed.evidence.publishedAt,
     bodyText: parsed.evidence.bodyText,
     bodyTruncated: parsed.evidence.bodyTruncated,
+    publicAccess: {
+      status: 'CONFIRMED',
+      checkedUrl: response.url,
+      checkedPublicIdentityKey: checkedIdentity.key,
+      checkedAt,
+      httpStatus: response.status,
+    },
   })
 }
 

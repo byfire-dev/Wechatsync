@@ -1,5 +1,7 @@
 import { z } from 'zod'
 
+import { derivePublicationPublicIdentity } from './url'
+
 /**
  * Version-neutral publication inspection domain.
  *
@@ -57,11 +59,29 @@ export const PublicationInspectionPublicAccessSchema = z.discriminatedUnion(
     z
       .object({
         status: z.literal('CONFIRMED'),
+        checkedUrl: z.string().url().max(4_096),
+        checkedPublicIdentityKey: z
+          .string()
+          .trim()
+          .min(3)
+          .max(500)
+          .regex(/^\S+$/),
+        checkedAt: z.string().datetime({ offset: true }),
+        httpStatus: z.number().int().min(200).max(299),
       })
       .strict(),
     z
       .object({
         status: z.literal('BLOCKED_BY_PLATFORM'),
+        checkedUrl: z.string().url().max(4_096),
+        checkedPublicIdentityKey: z
+          .string()
+          .trim()
+          .min(3)
+          .max(500)
+          .regex(/^\S+$/),
+        checkedAt: z.string().datetime({ offset: true }),
+        httpStatus: z.number().int().min(400).max(599).optional(),
         reasonCode: z
           .string()
           .trim()
@@ -184,6 +204,19 @@ export const PublicationInspectionObservationSchema = z
     }
 
     if (
+      value.outcome === 'PUBLISHED' &&
+      value.source === 'PUBLIC_PAGE' &&
+      value.publicAccess?.status !== 'CONFIRMED'
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'published public-page observations require confirmed public access evidence',
+        path: ['publicAccess'],
+      })
+    }
+
+    if (
       value.publicAccess?.status === 'BLOCKED_BY_PLATFORM' &&
       (value.outcome !== 'PUBLISHED' ||
         value.source !== 'AUTHENTICATED_PUBLIC_PAGE')
@@ -229,6 +262,55 @@ export const PublicationInspectionObservationSchema = z
           'published observations require a platform post ID or canonical URL',
         path: ['platformPostId'],
       })
+    }
+
+    if (value.publicAccess) {
+      const checkedIdentity = derivePublicationPublicIdentity(
+        value.platform,
+        value.publicAccess.checkedUrl,
+      )
+      const canonicalIdentity = value.canonicalUrl
+        ? derivePublicationPublicIdentity(value.platform, value.canonicalUrl)
+        : null
+      if (
+        !checkedIdentity ||
+        checkedIdentity.key !== value.publicAccess.checkedPublicIdentityKey
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'public access evidence must identify the URL that was actually checked',
+          path: ['publicAccess', 'checkedPublicIdentityKey'],
+        })
+      }
+      if (
+        !canonicalIdentity ||
+        canonicalIdentity.key !== value.publicAccess.checkedPublicIdentityKey
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'public access evidence must prove the canonical publication identity',
+          path: ['canonicalUrl'],
+        })
+      }
+
+      const checkedAt = Date.parse(value.publicAccess.checkedAt)
+      const observedAt = Date.parse(value.observedAt)
+      const publishedAt = value.publishedAt
+        ? Date.parse(value.publishedAt)
+        : undefined
+      if (
+        checkedAt > observedAt ||
+        (publishedAt !== undefined && publishedAt > checkedAt)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'publication, public access, and observation timestamps must be monotonic',
+          path: ['publicAccess', 'checkedAt'],
+        })
+      }
     }
   })
 

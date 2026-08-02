@@ -4,17 +4,27 @@
 import { CodeAdapter, type ImageUploadResult } from '../code-adapter'
 import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
 import type {
+  AdapterAccountProbe,
   AdapterOperationContext,
   PublicationPublishedProof,
   PublishOptions,
 } from '../types'
+import {
+  adapterAccountSelectionErrorMessage,
+  normalizeAdapterAccountBinding,
+  normalizeAdapterExternalAccountId,
+  resolveAdapterAccountBinding,
+} from '../account-binding'
 import type {
   OpenPublicationDraftRequest,
   OpenPublicationDraftResult,
-  PublicationInspectRequest,
-  PublicationObservation,
 } from '../../publication-inspection/types'
-import { PublicationObservationSchema } from '../../publication-inspection/types'
+import {
+  PublicationInspectionObservationSchema,
+  type PublicationInspectionObservation as PublicationObservation,
+  type PublicationInspectionRequest as PublicationInspectRequest,
+} from '../../publication-inspection/domain'
+import { derivePublicationPublicIdentity } from '../../publication-inspection/url'
 import {
   buildWeixinPublishedListRequest,
   buildWeixinTempUrlRequest,
@@ -43,6 +53,30 @@ import juice from 'juice'
 
 const logger = createLogger('Weixin')
 
+function normalizeAccountDisplayName(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return normalized.length > 0 &&
+    normalized.length <= 500 &&
+    !/[\u0000-\u001f\u007f]/.test(normalized)
+    ? normalized
+    : fallback
+}
+
+function normalizeAccountAvatarUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (normalized.length === 0 || normalized.length > 2_000) return undefined
+  try {
+    const url = new URL(normalized)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+      ? url.href
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 interface WeixinMeta {
   token: string
   userName: string
@@ -61,6 +95,10 @@ type WeixinPublicPageFetchResult =
   | {
       success: true
       canonicalUrl: string
+      checkedUrl: string
+      checkedPublicIdentityKey: string
+      checkedAt: string
+      httpStatus: number
       html: string
     }
   | {
@@ -124,7 +162,7 @@ export class WeixinAdapter extends CodeAdapter {
     name: '微信公众号',
     icon: 'https://mp.weixin.qq.com/favicon.ico',
     homepage: 'https://mp.weixin.qq.com',
-    capabilities: ['article', 'draft', 'image_upload'],
+    capabilities: ['article', 'draft', 'image_upload', 'account_binding'],
   }
 
   /** 预处理配置: 微信公众号使用 HTML 格式，移除非微信域名链接，压缩标签间空白避免 ProseMirror 产生空节点 */
@@ -219,9 +257,26 @@ export class WeixinAdapter extends CodeAdapter {
       }
     }
 
+    const publicIdentity = derivePublicationPublicIdentity(
+      'weixin',
+      response.url,
+    )
+    if (!publicIdentity) {
+      return {
+        success: false,
+        errorCode: 'WEIXIN_PUBLIC_IDENTITY_INVALID',
+        errorMessage:
+          'The matched WeChat public article did not expose a stable identity.',
+      }
+    }
+
     return {
       success: true,
-      canonicalUrl: resolution.canonicalUrl,
+      canonicalUrl: publicIdentity.canonicalUrl,
+      checkedUrl: response.url,
+      checkedPublicIdentityKey: publicIdentity.key,
+      checkedAt: new Date().toISOString(),
+      httpStatus: response.status,
       html: body.text,
     }
   }
@@ -293,6 +348,45 @@ export class WeixinAdapter extends CodeAdapter {
       signal?.throwIfAborted()
       logger.debug('checkAuth: not logged in -', error)
       return { isAuthenticated: false, error: (error as Error).message }
+    }
+  }
+
+  async probeAccounts(
+    context?: AdapterOperationContext,
+  ): Promise<AdapterAccountProbe> {
+    const auth = await this.checkAuth(context)
+    if (!auth.isAuthenticated) {
+      return auth.error
+        ? {
+            status: 'PROBE_FAILED',
+            accounts: [],
+            errorCode: 'UNKNOWN_ERROR',
+          }
+        : { status: 'NOT_AUTHENTICATED', accounts: [] }
+    }
+
+    const externalAccountId = normalizeAdapterExternalAccountId(auth.userId)
+    if (!externalAccountId) {
+      return {
+        status: 'PROBE_FAILED',
+        accounts: [],
+        errorCode: 'ACCOUNT_ID_MISSING',
+      }
+    }
+
+    const avatarUrl = normalizeAccountAvatarUrl(auth.avatar)
+    return {
+      status: 'AUTHENTICATED',
+      accounts: [
+        {
+          externalAccountId,
+          displayName: normalizeAccountDisplayName(
+            auth.username,
+            externalAccountId,
+          ),
+          ...(avatarUrl ? { avatarUrl } : {}),
+        },
+      ],
     }
   }
 
@@ -422,7 +516,7 @@ export class WeixinAdapter extends CodeAdapter {
 
       return {
         kind: 'PUBLISHED',
-        observation: PublicationObservationSchema.parse({
+        observation: PublicationInspectionObservationSchema.parse({
           observationKey: `weixin:${request.requestId}:public-page`,
           platform: 'weixin',
           externalAccountId: request.externalAccountId,
@@ -434,6 +528,13 @@ export class WeixinAdapter extends CodeAdapter {
           publishedAt: lookup.publishedAt,
           bodyText: article.bodyText,
           bodyTruncated: article.bodyTruncated,
+          publicAccess: {
+            status: 'CONFIRMED',
+            checkedUrl: publicPage.checkedUrl,
+            checkedPublicIdentityKey: publicPage.checkedPublicIdentityKey,
+            checkedAt: publicPage.checkedAt,
+            httpStatus: publicPage.httpStatus,
+          },
           observedAt: new Date().toISOString(),
         }),
       }
@@ -681,7 +782,7 @@ export class WeixinAdapter extends CodeAdapter {
         }
 
         return [
-          PublicationObservationSchema.parse({
+          PublicationInspectionObservationSchema.parse({
             observationKey: `weixin:${request.requestId}:draft-detail`,
             platform: 'weixin',
             externalAccountId: request.externalAccountId,
@@ -735,8 +836,7 @@ export class WeixinAdapter extends CodeAdapter {
       !observation.title?.trim() ||
       !observation.bodyText?.trim() ||
       typeof observation.bodyTruncated !== 'boolean' ||
-      (observation.publicAccess !== undefined &&
-        observation.publicAccess.status !== 'CONFIRMED') ||
+      observation.publicAccess?.status !== 'CONFIRMED' ||
       observation.errorCode !== undefined ||
       observation.errorMessage !== undefined
     ) {
@@ -747,7 +847,7 @@ export class WeixinAdapter extends CodeAdapter {
     // accepts the anonymous public page as publication evidence.
     return {
       observedAuthorExternalAccountId: observation.externalAccountId,
-      publicAccess: { status: 'CONFIRMED' },
+      publicAccess: observation.publicAccess,
       bodyTruncated: observation.bodyTruncated,
     }
   }
@@ -770,7 +870,7 @@ export class WeixinAdapter extends CodeAdapter {
       source === 'DRAFT_DETAIL'
         ? 'draft-detail'
         : source.toLowerCase().replace(/_/g, '-')
-    return PublicationObservationSchema.parse({
+    return PublicationInspectionObservationSchema.parse({
       observationKey: `weixin:${request.requestId}:${observationSource}`,
       platform: 'weixin',
       externalAccountId: request.externalAccountId,
@@ -806,15 +906,31 @@ export class WeixinAdapter extends CodeAdapter {
     article: Article,
     options?: PublishOptions,
   ): Promise<SyncResult> {
+    const requestedBinding =
+      options?.accountBinding === undefined
+        ? undefined
+        : normalizeAdapterAccountBinding(options.accountBinding)
+    let operationExternalAccountId = requestedBinding?.externalAccountId
+
     return this.withHeaderRules(this.HEADER_RULES, async () => {
       logger.info('Starting publish...')
 
-      if (!this.weixinMeta) {
-        const auth = await this.checkAuth()
-        if (!auth.isAuthenticated) {
-          throw new Error('请先登录微信公众号')
-        }
+      const selection = resolveAdapterAccountBinding(
+        await this.probeAccounts(),
+        options?.accountBinding,
+      )
+      if (!selection.ok) {
+        return this.createResult(false, {
+          ...(operationExternalAccountId
+            ? { externalAccountId: operationExternalAccountId }
+            : {}),
+          errorCode: selection.errorCode,
+          error: adapterAccountSelectionErrorMessage(selection.errorCode),
+        })
       }
+      operationExternalAccountId = selection.account.externalAccountId
+
+      await options?.beforeDispatch?.()
 
       // 微信到微信：使用原始 HTML，跳过所有处理
       let content =
@@ -947,10 +1063,14 @@ export class WeixinAdapter extends CodeAdapter {
       return this.createResult(true, {
         postId: appMsgId,
         postUrl: draftUrl,
+        externalAccountId: operationExternalAccountId,
         draftOnly: options?.draftOnly ?? true,
       })
     }).catch((error) =>
       this.createResult(false, {
+        ...(operationExternalAccountId
+          ? { externalAccountId: operationExternalAccountId }
+          : {}),
         error: (error as Error).message,
       }),
     )

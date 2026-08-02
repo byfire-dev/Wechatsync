@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import samples from '../__fixtures__/url-samples.json'
 import type { PublicationPlatform } from '../types'
-import { parsePublicationUrl } from '../url'
+import { derivePublicationPublicIdentity, parsePublicationUrl } from '../url'
 
 describe('parsePublicationUrl', () => {
   for (const sample of samples) {
@@ -55,7 +55,10 @@ describe('parsePublicationUrl', () => {
     ).toEqual({ platform: 'sohu', surface: 'UNKNOWN' })
     expect(
       parsePublicationUrl('sohu', 'https://www.sohu.com/a/abc_120000001'),
-    ).toEqual({ platform: 'sohu', surface: 'UNKNOWN' })
+    ).toEqual({
+      platform: 'sohu',
+      surface: 'UNKNOWN',
+    })
   })
 
   it('rejects a valid-looking Weixin identity hosted on the wrong domain', () => {
@@ -97,17 +100,23 @@ describe('parsePublicationUrl', () => {
         'weixin',
         'http://mp.weixin.qq.com/cgi-bin/appmsg?action=edit&appmsgid=1',
       ),
-    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    ).toEqual({
+      platform: 'weixin',
+      surface: 'UNKNOWN',
+    })
     expect(
       parsePublicationUrl(
         'weixin',
-        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1&idx=2',
+        'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1&idx=2',
       ),
-    ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
+    ).toEqual({
+      platform: 'weixin',
+      surface: 'UNKNOWN',
+    })
     expect(
       parsePublicationUrl(
         'weixin',
-        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1&sn=not-a-signature',
+        'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1&sn=not-a-signature',
       ),
     ).toEqual({ platform: 'weixin', surface: 'UNKNOWN' })
   })
@@ -130,12 +139,86 @@ describe('parsePublicationUrl', () => {
         'toutiao',
         'https://www.toutiao.com/article/7667071065847677450/?from=item',
       ),
-    ).toEqual({ platform: 'toutiao', surface: 'UNKNOWN' })
+    ).toEqual({
+      platform: 'toutiao',
+      surface: 'UNKNOWN',
+    })
   })
 
   it('does not guess unknown Zhihu URL shapes', () => {
     expect(
       parsePublicationUrl('zhihu', 'https://www.zhihu.com/question/123'),
-    ).toEqual({ platform: 'zhihu', surface: 'UNKNOWN' })
+    ).toEqual({
+      platform: 'zhihu',
+      surface: 'UNKNOWN',
+    })
+  })
+})
+
+describe('derivePublicationPublicIdentity', () => {
+  it('collapses Sohu desktop and mobile URLs to one identity', () => {
+    const desktop = derivePublicationPublicIdentity(
+      'sohu',
+      'https://www.sohu.com/a/1054312481_120219780',
+    )
+    const mobile = derivePublicationPublicIdentity(
+      'sohu',
+      'https://m.sohu.com/a/1054312481_120219780/',
+    )
+
+    expect(desktop).toEqual({
+      key: 'sohu:post:v1:1054312481:120219780',
+      canonicalUrl: 'https://www.sohu.com/a/1054312481_120219780',
+    })
+    expect(mobile).toEqual(desktop)
+  })
+
+  it('uses the shared stable identity algorithms for every active platform', () => {
+    expect(
+      derivePublicationPublicIdentity(
+        'zhihu',
+        'https://zhuanlan.zhihu.com/p/123456',
+      ),
+    ).toEqual({
+      key: 'zhihu:post:v1:123456',
+      canonicalUrl: 'https://zhuanlan.zhihu.com/p/123456',
+    })
+    expect(
+      derivePublicationPublicIdentity(
+        'weixin',
+        'https://mp.weixin.qq.com/s?__biz=%2B%2F8%3D&mid=2247483999&idx=2&sn=0123456789abcdef0123456789abcdef',
+      ),
+    ).toEqual({
+      key: 'weixin:article:v1:-_8:2247483999:2',
+      canonicalUrl:
+        'https://mp.weixin.qq.com/s?__biz=%2B%2F8&mid=2247483999&idx=2',
+    })
+    expect(
+      derivePublicationPublicIdentity(
+        'weixin',
+        'https://mp.weixin.qq.com/s/AaBbCcDd_123',
+      ),
+    ).toEqual({
+      key: 'weixin:short:v1:AaBbCcDd_123',
+      canonicalUrl: 'https://mp.weixin.qq.com/s/AaBbCcDd_123',
+    })
+    expect(
+      derivePublicationPublicIdentity(
+        'toutiao',
+        'https://www.toutiao.com/article/7480099001/',
+      ),
+    ).toEqual({
+      key: 'toutiao:item:v1:7480099001',
+      canonicalUrl: 'https://www.toutiao.com/item/7480099001',
+    })
+    expect(
+      derivePublicationPublicIdentity(
+        'toutiao',
+        'https://www.toutiao.com/item/7480099001',
+      ),
+    ).toEqual({
+      key: 'toutiao:item:v1:7480099001',
+      canonicalUrl: 'https://www.toutiao.com/item/7480099001',
+    })
   })
 })

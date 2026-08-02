@@ -19,22 +19,14 @@ import type {
   SyncerAccountV2,
   SyncerAccountsV2Detailed,
 } from '@wechatsync/core/publication-inspection'
-import {
-  PublicationBridgeInfoV3Schema,
-  PublicationInspectRequestV3Schema,
-  PublicationInspectResultV3Schema,
-  type PublicationBridgeInfoV3,
-  type PublicationInspectResultV3,
-} from '@wechatsync/publication-contract/v3'
 import { createLogger } from '../lib/logger'
 import {
   BRIDGE_API_VERSION,
   BRIDGE_NAMESPACE,
   createBridgeErrorResponse,
   createBridgeSuccessResponse,
-  createPublicationBridgeErrorResponseV3,
-  createPublicationBridgeSuccessResponseV3,
   deriveLegacySyncTargets,
+  getPublicationBridgeOperationToRunV3,
   isLegacyMutationMethod,
   INVALID_ACCOUNT_BINDINGS,
   LEGACY_API_ORIGIN_NOT_ALLOWED,
@@ -42,13 +34,13 @@ import {
   parseLegacyPageActionEvent,
   parseBridgeRequestEvent,
   parsePublicationBridgeRequestEventV3,
+  parsePublicationBridgeResponseForRequestV3,
   validateLegacyMutationPageEvent,
   type BridgeErrorResponse,
   type BridgeRequest,
   type BridgeResponse,
-  type PublicationBridgeErrorResponseV3,
-  type PublicationBridgeRequestV3,
-  type PublicationBridgeResponseV3,
+  type PublicationBridgeV3Request,
+  type PublicationBridgeV3Response,
 } from '../bridge'
 import { projectLegacyAccounts } from '../bridge/legacy-account'
 import { LEGACY_MAGIC_CALL_METHOD_NOT_ALLOWED } from '../bridge/legacy-magic-call'
@@ -74,8 +66,6 @@ interface BridgeRuntimeResponse {
   detailedAccounts?: SyncerAccountsV2Detailed
   draftOpenResult?: OpenPublicationDraftResult
   observations?: PublicationObservation[]
-  publicationBridgeInfoV3?: PublicationBridgeInfoV3
-  publicationInspectResultV3?: PublicationInspectResultV3
   error?: string
 }
 
@@ -146,7 +136,7 @@ function sendConsoleLog(args: unknown) {
 }
 
 function postBridgeResponse(
-  response: BridgeResponse | PublicationBridgeResponseV3,
+  response: BridgeResponse | PublicationBridgeV3Response,
   targetOrigin: string,
 ) {
   window.postMessage(response, targetOrigin)
@@ -170,18 +160,6 @@ function createBridgeFailure(
   }
 }
 
-function createPublicationBridgeFailureV3(
-  request: PublicationBridgeRequestV3,
-  code: string,
-  message: string,
-): PublicationBridgeErrorResponseV3 {
-  switch (request.method) {
-    case 'getPublicationBridgeInfoV3':
-    case 'inspectPublicationV3':
-      return createPublicationBridgeErrorResponseV3(request, { code, message })
-  }
-}
-
 function sendBridgeRuntimeMessage(
   message: Record<string, unknown>
 ): Promise<BridgeRuntimeResponse> {
@@ -200,6 +178,47 @@ function sendBridgeRuntimeMessage(
       resolve(response || {})
     })
   })
+}
+
+function sendPublicationBridgeRuntimeMessageV3(
+  request: PublicationBridgeV3Request,
+): Promise<PublicationBridgeV3Response> {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: 'BRIDGE_CALL_V3', request },
+      (response: unknown) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message))
+          return
+        }
+
+        const parsed = parsePublicationBridgeResponseForRequestV3(
+          request,
+          response,
+        )
+        if (!parsed.success) {
+          reject(new Error('Publication Bridge returned an invalid response'))
+          return
+        }
+
+        resolve(parsed.data)
+      },
+    )
+  })
+}
+
+function keepPublicationBridgeOperationAliveV3(operationId: string): void {
+  chrome.runtime.sendMessage(
+    { type: 'BRIDGE_RUN_PUBLICATION_OPERATION_V3', operationId },
+    () => {
+      if (chrome.runtime.lastError) {
+        logger.error(
+          'Publication Bridge operation runner disconnected:',
+          chrome.runtime.lastError,
+        )
+      }
+    },
+  )
 }
 
 async function handleBridgeRequest(evt: MessageEvent): Promise<void> {
@@ -310,60 +329,29 @@ async function handleBridgeRequest(evt: MessageEvent): Promise<void> {
   }
 }
 
-async function handlePublicationBridgeRequestV3(
+export async function handlePublicationBridgeRequestV3(
   evt: MessageEvent,
 ): Promise<void> {
   if (window.top !== window) return
+  if (evt.source !== window || evt.origin !== window.location.origin) return
 
   const parsed = parsePublicationBridgeRequestEventV3(evt, window)
   if (!parsed.success) return
   const request = parsed.data
 
   try {
-    switch (request.method) {
-      case 'getPublicationBridgeInfoV3': {
-        const response = await sendBridgeRuntimeMessage({
-          type: 'BRIDGE_GET_PUBLICATION_INFO_V3',
-          requestId: request.requestId,
-          payload: request.payload,
-        })
-        const bridgeInfo = PublicationBridgeInfoV3Schema.parse(
-          response.publicationBridgeInfoV3,
-        )
-        postBridgeResponse(
-          createPublicationBridgeSuccessResponseV3(request, bridgeInfo),
-          evt.origin,
-        )
-        return
-      }
+    const response = await sendPublicationBridgeRuntimeMessageV3(request)
 
-      case 'inspectPublicationV3': {
-        const payload = PublicationInspectRequestV3Schema.parse(request.payload)
-        const response = await sendBridgeRuntimeMessage({
-          type: 'BRIDGE_INSPECT_PUBLICATION_V3',
-          requestId: request.requestId,
-          payload,
-        })
-        const result = PublicationInspectResultV3Schema.parse(
-          response.publicationInspectResultV3,
-        )
-        postBridgeResponse(
-          createPublicationBridgeSuccessResponseV3(request, result),
-          evt.origin,
-        )
-        return
-      }
+    // Return the accepted/replayed envelope before opening the long-lived
+    // operation runner, so page latency never includes the platform write.
+    postBridgeResponse(response, evt.origin)
+
+    const operationId = getPublicationBridgeOperationToRunV3(request, response)
+    if (operationId) {
+      keepPublicationBridgeOperationAliveV3(operationId)
     }
   } catch (error) {
-    const failure = projectBridgeRuntimeError(error)
-    postBridgeResponse(
-      createPublicationBridgeFailureV3(
-        request,
-        failure.code,
-        failure.message,
-      ),
-      evt.origin,
-    )
+    logger.error('Publication Bridge request failed:', error)
   }
 }
 
@@ -684,4 +672,3 @@ if (document.readyState === 'loading') {
 } else {
   injectAPI();
 }
-

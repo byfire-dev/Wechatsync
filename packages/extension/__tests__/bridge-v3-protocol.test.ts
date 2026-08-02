@@ -1,310 +1,263 @@
+import {
+  INVALID_PUBLICATION_BRIDGE_V3_FIXTURES,
+  VALID_PUBLICATION_BRIDGE_V3_FIXTURES,
+  publicationBridgeV3AccountsRequestFixture,
+  publicationBridgeV3AccountsResponseFixture,
+  publicationBridgeV3CompletedOperationFixture,
+  publicationBridgeV3GetOperationRequestFixture,
+  publicationBridgeV3GetOperationResponseFixture,
+  publicationBridgeV3InspectRequestFixture,
+  publicationBridgeV3InspectResponseFixture,
+  publicationBridgeV3NegotiationRequestFixture,
+  publicationBridgeV3NegotiationResponseFixture,
+  publicationBridgeV3OpenDraftRequestFixture,
+  publicationBridgeV3OpenDraftResponseFixture,
+  publicationBridgeV3PublishAcceptedResponseFixture,
+  publicationBridgeV3PublishReplayRequestFixture,
+  publicationBridgeV3PublishReplayedResponseFixture,
+  publicationBridgeV3PublishRequestFixture,
+  publicationBridgeV3RunningOperationFixture,
+} from "@byfire-dev/publication-bridge-contract/v3/testing";
 import { describe, expect, it } from "vitest";
 
 import {
+  BRIDGE_API_VERSION,
   BRIDGE_DIRECTIONS,
   BRIDGE_NAMESPACE,
-  PUBLICATION_BRIDGE_API_VERSION_V3,
-  createPublicationBridgeErrorResponseV3,
-  createPublicationBridgeSuccessResponseV3,
+  getPublicationBridgeOperationToRunV3,
   parseBridgeRequestEvent,
   parsePublicationBridgeRequestEventV3,
   parsePublicationBridgeResponseEventV3,
+  parsePublicationBridgeResponseForRequestV3,
   type BridgeMessageEventLike,
+  type PublicationBridgeV3Request,
+  type PublicationBridgeV3Response,
 } from "../src/bridge";
 
 const topWindow = { kind: "top-window" };
 
-const inspectRequest = {
-  contractVersion: "3.0" as const,
-  requestId: "inspect-v3-001",
-  platform: "zhihu" as const,
-  externalAccountId: "zhihu-user-1",
-  draft: {
-    platformPostId: "123456789",
-    draftedAt: "2026-07-29T08:00:00.000Z",
-  },
-  articleHint: {
-    title: "Bridge v3 article",
-  },
-  limit: 20,
-};
-
 function requestEvent(
+  data: unknown,
   overrides: Partial<BridgeMessageEventLike> = {},
 ): BridgeMessageEventLike {
   return {
     origin: "http://localhost",
     source: topWindow,
-    data: {
-      namespace: BRIDGE_NAMESPACE,
-      apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-      direction: BRIDGE_DIRECTIONS.request,
-      requestId: "info-v3-001",
-      method: "getPublicationBridgeInfoV3",
-      payload: {},
-    },
+    data,
     ...overrides,
   };
 }
 
-describe("publication Bridge v3 request protocol", () => {
-  it("allows only the two explicit v3 methods with contract-validated payloads", () => {
-    expect(
-      parsePublicationBridgeRequestEventV3(requestEvent(), topWindow),
-    ).toMatchObject({
-      success: true,
-      data: { method: "getPublicationBridgeInfoV3" },
-    });
+function parseRequest(data: unknown): PublicationBridgeV3Request {
+  const parsed = parsePublicationBridgeRequestEventV3(
+    requestEvent(data),
+    topWindow,
+  );
+  if (!parsed.success) throw new Error("expected a valid v3 request fixture");
+  return parsed.data;
+}
 
+function parseResponse(data: unknown): PublicationBridgeV3Response {
+  const parsed = parsePublicationBridgeResponseEventV3(
+    requestEvent(data),
+    topWindow,
+  );
+  if (!parsed.success) throw new Error("expected a valid v3 response fixture");
+  return parsed.data;
+}
+
+describe("published publication Bridge v3 boundary", () => {
+  it("accepts every published request and response fixture", () => {
+    for (const request of VALID_PUBLICATION_BRIDGE_V3_FIXTURES.requests) {
+      expect(
+        parsePublicationBridgeRequestEventV3(requestEvent(request), topWindow),
+      ).toMatchObject({ success: true });
+    }
+
+    for (const response of VALID_PUBLICATION_BRIDGE_V3_FIXTURES.responses) {
+      expect(
+        parsePublicationBridgeResponseEventV3(
+          requestEvent(response),
+          topWindow,
+        ),
+      ).toMatchObject({ success: true });
+    }
+  });
+
+  it("fails closed for a foreign source, unlisted origin, or malformed envelope", () => {
     expect(
       parsePublicationBridgeRequestEventV3(
-        requestEvent({
-          data: {
-            namespace: BRIDGE_NAMESPACE,
-            apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-            direction: BRIDGE_DIRECTIONS.request,
-            requestId: inspectRequest.requestId,
-            method: "inspectPublicationV3",
-            payload: inspectRequest,
-          },
+        requestEvent(publicationBridgeV3NegotiationRequestFixture, {
+          source: { kind: "foreign-frame" },
         }),
-        topWindow,
-      ),
-    ).toMatchObject({
-      success: true,
-      data: {
-        method: "inspectPublicationV3",
-        payload: inspectRequest,
-      },
-    });
-  });
-
-  it.each([
-    "inspectPublication",
-    "getBridgeInfo",
-    "magicCall",
-    "inspectPublicationV4",
-  ])("rejects non-v3 method %s", (method) => {
-    expect(
-      parsePublicationBridgeRequestEventV3(
-        requestEvent({
-          data: {
-            namespace: BRIDGE_NAMESPACE,
-            apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-            direction: BRIDGE_DIRECTIONS.request,
-            requestId: "bad-method-v3",
-            method,
-            payload: {},
-          },
-        }),
-        topWindow,
-      ),
-    ).toEqual({ success: false, code: "METHOD_NOT_ALLOWED" });
-  });
-
-  it.each([
-    "https://evil.example",
-    "http://localhost:3000",
-    "http://127.0.0.1",
-    "http://localhost.evil.example",
-  ])("rejects unlisted origin %s", (origin) => {
-    expect(
-      parsePublicationBridgeRequestEventV3(requestEvent({ origin }), topWindow),
-    ).toEqual({ success: false, code: "ORIGIN_NOT_ALLOWED" });
-  });
-
-  it("rejects foreign frames, unknown fields and request-ID mismatches", () => {
-    expect(
-      parsePublicationBridgeRequestEventV3(
-        requestEvent({ source: { kind: "child-frame" } }),
         topWindow,
       ),
     ).toEqual({ success: false, code: "SOURCE_MISMATCH" });
 
     expect(
       parsePublicationBridgeRequestEventV3(
-        requestEvent({
-          data: {
-            namespace: BRIDGE_NAMESPACE,
-            apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-            direction: BRIDGE_DIRECTIONS.request,
-            requestId: "info-v3-001",
-            method: "getPublicationBridgeInfoV3",
-            payload: { unexpected: true },
-          },
+        requestEvent(publicationBridgeV3NegotiationRequestFixture, {
+          origin: "https://evil.example",
         }),
         topWindow,
       ),
-    ).toEqual({ success: false, code: "INVALID_PAYLOAD" });
+    ).toEqual({ success: false, code: "ORIGIN_NOT_ALLOWED" });
 
+    const invalidRequest = INVALID_PUBLICATION_BRIDGE_V3_FIXTURES.find(
+      (fixture) => fixture.schema === "request",
+    );
+    expect(invalidRequest).toBeDefined();
     expect(
       parsePublicationBridgeRequestEventV3(
-        requestEvent({
-          data: {
-            namespace: BRIDGE_NAMESPACE,
-            apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-            direction: BRIDGE_DIRECTIONS.request,
-            requestId: "another-id",
-            method: "inspectPublicationV3",
-            payload: inspectRequest,
-          },
-        }),
-        topWindow,
-      ),
-    ).toEqual({ success: false, code: "INVALID_PAYLOAD" });
-
-    expect(
-      parsePublicationBridgeRequestEventV3(
-        requestEvent({
-          data: {
-            ...(requestEvent().data as Record<string, unknown>),
-            unexpected: true,
-          },
-        }),
+        requestEvent(invalidRequest?.value),
         topWindow,
       ),
     ).toEqual({ success: false, code: "INVALID_ENVELOPE" });
   });
-});
 
-describe("publication Bridge v3 response protocol", () => {
-  it("strictly creates and parses bridge info from runtime descriptors", () => {
-    const parsed = parsePublicationBridgeRequestEventV3(
-      requestEvent(),
-      topWindow,
-    );
-    if (
-      !parsed.success ||
-      parsed.data.method !== "getPublicationBridgeInfoV3"
-    ) {
-      throw new Error("expected v3 bridge info request");
-    }
-
-    const response = createPublicationBridgeSuccessResponseV3(parsed.data, {
-      contractVersion: "3.0",
-      extensionVersion: "2.0.27",
-      platforms: [
-        {
-          contractVersion: "3.0",
-          platform: "zhihu",
-          adapterVersion: "2.0.27",
-          capabilities: ["publication_inspect"],
-        },
-      ],
-    });
-
+  it("keeps v2 and the published v3 namespace strictly separate", () => {
     expect(
-      parsePublicationBridgeResponseEventV3(
-        { origin: "http://localhost", source: topWindow, data: response },
+      parseBridgeRequestEvent(
+        requestEvent(publicationBridgeV3NegotiationRequestFixture),
         topWindow,
       ),
-    ).toEqual({ success: true, data: response });
-  });
+    ).toEqual({ success: false, code: "INVALID_ENVELOPE" });
 
-  it("strictly creates and parses the discriminated inspection result", () => {
-    const parsed = parsePublicationBridgeRequestEventV3(
-      requestEvent({
-        data: {
-          namespace: BRIDGE_NAMESPACE,
-          apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-          direction: BRIDGE_DIRECTIONS.request,
-          requestId: inspectRequest.requestId,
-          method: "inspectPublicationV3",
-          payload: inspectRequest,
-        },
-      }),
-      topWindow,
-    );
-    if (!parsed.success || parsed.data.method !== "inspectPublicationV3") {
-      throw new Error("expected v3 inspection request");
-    }
-
-    const response = createPublicationBridgeSuccessResponseV3(parsed.data, {
-      contractVersion: "3.0",
-      requestId: inspectRequest.requestId,
-      platform: "zhihu",
-      externalAccountId: "zhihu-user-1",
-      adapterVersion: "2.0.27",
-      ok: false,
-      failure: {
-        stage: "TIMEOUT",
-        code: "PUBLICATION_INSPECTION_TIMEOUT",
-        retryable: true,
-        message: "The publication inspection timed out.",
-        requiredAction: "RETRY",
-      },
-    });
-
+    const v2Request = {
+      namespace: BRIDGE_NAMESPACE,
+      apiVersion: BRIDGE_API_VERSION,
+      direction: BRIDGE_DIRECTIONS.request,
+      requestId: "v2-info",
+      method: "getBridgeInfo",
+      payload: {},
+    };
     expect(
-      parsePublicationBridgeResponseEventV3(
-        { origin: "http://localhost", source: topWindow, data: response },
-        topWindow,
-      ),
-    ).toEqual({ success: true, data: response });
-
+      parsePublicationBridgeRequestEventV3(requestEvent(v2Request), topWindow),
+    ).toEqual({ success: false, code: "INVALID_ENVELOPE" });
     expect(
-      parsePublicationBridgeResponseEventV3(
-        {
-          origin: "http://localhost",
-          source: topWindow,
-          data: {
-            ...response,
-            result: { ...response.result, requestId: "another-id" },
-          },
-        },
-        topWindow,
-      ),
-    ).toEqual({ success: false, code: "INVALID_PAYLOAD" });
-  });
-
-  it("keeps bounded transport errors separate from inspection failures", () => {
-    const parsed = parsePublicationBridgeRequestEventV3(
-      requestEvent(),
-      topWindow,
-    );
-    if (
-      !parsed.success ||
-      parsed.data.method !== "getPublicationBridgeInfoV3"
-    ) {
-      throw new Error("expected v3 bridge info request");
-    }
-    const response = createPublicationBridgeErrorResponseV3(parsed.data, {
-      code: "BRIDGE_RUNTIME_ERROR",
-      message: "Bridge request failed",
-    });
-    expect(
-      parsePublicationBridgeResponseEventV3(
-        { origin: "http://localhost", source: topWindow, data: response },
-        topWindow,
-      ),
-    ).toEqual({ success: true, data: response });
-  });
-});
-
-describe("Bridge v2 and publication Bridge v3 coexistence", () => {
-  it("does not let either parser accept the other API version", () => {
-    expect(parseBridgeRequestEvent(requestEvent(), topWindow)).toEqual({
-      success: false,
-      code: "INVALID_ENVELOPE",
-    });
-
-    const v2Event = requestEvent({
-      data: {
-        namespace: BRIDGE_NAMESPACE,
-        apiVersion: "2.0",
-        direction: BRIDGE_DIRECTIONS.request,
-        requestId: "v2-info",
-        method: "getBridgeInfo",
-        payload: {},
-      },
-    });
-    expect(parsePublicationBridgeRequestEventV3(v2Event, topWindow)).toEqual({
-      success: false,
-      code: "INVALID_ENVELOPE",
-    });
-    expect(parseBridgeRequestEvent(v2Event, topWindow)).toMatchObject({
+      parseBridgeRequestEvent(requestEvent(v2Request), topWindow),
+    ).toMatchObject({
       success: true,
       data: { method: "getBridgeInfo" },
     });
+  });
+});
+
+describe("publication Bridge v3 request/response correlation", () => {
+  it.each([
+    [
+      publicationBridgeV3NegotiationRequestFixture,
+      publicationBridgeV3NegotiationResponseFixture,
+    ],
+    [
+      publicationBridgeV3AccountsRequestFixture,
+      publicationBridgeV3AccountsResponseFixture,
+    ],
+    [
+      publicationBridgeV3PublishRequestFixture,
+      publicationBridgeV3PublishAcceptedResponseFixture,
+    ],
+    [
+      publicationBridgeV3PublishReplayRequestFixture,
+      publicationBridgeV3PublishReplayedResponseFixture,
+    ],
+    [
+      publicationBridgeV3GetOperationRequestFixture,
+      publicationBridgeV3GetOperationResponseFixture,
+    ],
+    [
+      publicationBridgeV3InspectRequestFixture,
+      publicationBridgeV3InspectResponseFixture,
+    ],
+    [
+      publicationBridgeV3OpenDraftRequestFixture,
+      publicationBridgeV3OpenDraftResponseFixture,
+    ],
+  ])(
+    "accepts a fully correlated published exchange",
+    (requestFixture, responseFixture) => {
+      const request = parseRequest(requestFixture);
+      const response = parsePublicationBridgeResponseForRequestV3(
+        request,
+        responseFixture,
+      );
+      expect(response).toMatchObject({ success: true });
+    },
+  );
+
+  it("rejects a schema-valid response with mismatched correlation fields", () => {
+    const request = parseRequest(publicationBridgeV3InspectRequestFixture);
+    expect(
+      parsePublicationBridgeResponseForRequestV3(request, {
+        ...publicationBridgeV3InspectResponseFixture,
+        requestId: "req-other-001",
+      }),
+    ).toEqual({ success: false, code: "INVALID_PAYLOAD" });
+    expect(
+      parsePublicationBridgeResponseForRequestV3(request, {
+        ...publicationBridgeV3InspectResponseFixture,
+        operationId: "op-other-001",
+      }),
+    ).toEqual({ success: false, code: "INVALID_PAYLOAD" });
+    expect(
+      parsePublicationBridgeResponseForRequestV3(request, {
+        ...publicationBridgeV3InspectResponseFixture,
+        sessionId: "session-other-001",
+      }),
+    ).toEqual({ success: false, code: "INVALID_PAYLOAD" });
+  });
+});
+
+describe("publication Bridge v3 MV3 operation handoff", () => {
+  it("runs accepted and incomplete replayed operations by the result operation id", () => {
+    const acceptedRequest = parseRequest(
+      publicationBridgeV3PublishRequestFixture,
+    );
+    const acceptedResponse = parseResponse(
+      publicationBridgeV3PublishAcceptedResponseFixture,
+    );
+    expect(
+      getPublicationBridgeOperationToRunV3(acceptedRequest, acceptedResponse),
+    ).toBe(
+      publicationBridgeV3PublishAcceptedResponseFixture.result.operation
+        .operationId,
+    );
+
+    const replayRequest = parseRequest(
+      publicationBridgeV3PublishReplayRequestFixture,
+    );
+    const incompleteReplay = parseResponse({
+      ...publicationBridgeV3PublishReplayedResponseFixture,
+      result: {
+        ...publicationBridgeV3PublishReplayedResponseFixture.result,
+        operation: publicationBridgeV3RunningOperationFixture,
+      },
+    });
+    expect(
+      getPublicationBridgeOperationToRunV3(replayRequest, incompleteReplay),
+    ).toBe(publicationBridgeV3RunningOperationFixture.operationId);
+  });
+
+  it("does not run a completed replay or a non-publish exchange", () => {
+    const replayRequest = parseRequest(
+      publicationBridgeV3PublishReplayRequestFixture,
+    );
+    const completedReplay = parseResponse({
+      ...publicationBridgeV3PublishReplayedResponseFixture,
+      result: {
+        ...publicationBridgeV3PublishReplayedResponseFixture.result,
+        operation: publicationBridgeV3CompletedOperationFixture,
+      },
+    });
+    expect(
+      getPublicationBridgeOperationToRunV3(replayRequest, completedReplay),
+    ).toBeNull();
+
+    expect(
+      getPublicationBridgeOperationToRunV3(
+        parseRequest(publicationBridgeV3NegotiationRequestFixture),
+        parseResponse(publicationBridgeV3NegotiationResponseFixture),
+      ),
+    ).toBeNull();
   });
 });

@@ -16,9 +16,9 @@ import {
   resolveAdapterAccountBinding,
 } from '../account-binding'
 import type {
-  PublicationInspectRequest,
-  PublicationObservation,
-} from '../../publication-inspection/types'
+  PublicationInspectionObservation as PublicationObservation,
+  PublicationInspectionRequest as PublicationInspectRequest,
+} from '../../publication-inspection/domain'
 import { inspectSohuPublication } from '../../publication-inspection/sohu'
 import { createLogger } from '../../lib/logger'
 
@@ -103,8 +103,8 @@ export class SohuAdapter extends CodeAdapter {
     {
       urlFilter: '*://mp.sohu.com/*',
       headers: {
-        'Origin': 'https://mp.sohu.com',
-        'Referer': 'https://mp.sohu.com/',
+        Origin: 'https://mp.sohu.com',
+        Referer: 'https://mp.sohu.com/',
       },
       resourceTypes: ['xmlhttprequest'],
     },
@@ -223,7 +223,7 @@ export class SohuAdapter extends CodeAdapter {
         probeSource: 'EXTENSION',
         probeErrorCode:
           probe.status === 'PROBE_FAILED'
-            ? probe.errorCode ?? 'UNKNOWN_ERROR'
+            ? (probe.errorCode ?? 'UNKNOWN_ERROR')
             : 'UNKNOWN_ERROR',
       }
     }
@@ -296,8 +296,7 @@ export class SohuAdapter extends CodeAdapter {
       !observation.title?.trim() ||
       !observation.bodyText?.trim() ||
       typeof observation.bodyTruncated !== 'boolean' ||
-      (observation.publicAccess !== undefined &&
-        observation.publicAccess.status !== 'CONFIRMED') ||
+      observation.publicAccess?.status !== 'CONFIRMED' ||
       observation.errorCode !== undefined ||
       observation.errorMessage !== undefined
     ) {
@@ -308,7 +307,7 @@ export class SohuAdapter extends CodeAdapter {
     // proves both the stable post ID and the bound Sohu media ID.
     return {
       observedAuthorExternalAccountId: observation.externalAccountId,
-      publicAccess: { status: 'CONFIRMED' },
+      publicAccess: observation.publicAccess,
       bodyTruncated: observation.bodyTruncated,
     }
   }
@@ -337,7 +336,10 @@ export class SohuAdapter extends CodeAdapter {
     }
   }
 
-  async publish(article: Article, options?: PublishOptions): Promise<SyncResult> {
+  async publish(
+    article: Article,
+    options?: PublishOptions,
+  ): Promise<SyncResult> {
     const requestedBinding =
       options?.accountBinding === undefined
         ? undefined
@@ -379,6 +381,8 @@ export class SohuAdapter extends CodeAdapter {
       const account = selection.account
       operationExternalAccountId = account.externalAccountId
 
+      await options?.beforeDispatch?.()
+
       // Use pre-processed HTML content directly
       let content = article.html || ''
 
@@ -389,7 +393,7 @@ export class SohuAdapter extends CodeAdapter {
         {
           skipPatterns: ['sohu.com'],
           onProgress: options?.onImageProgress,
-        }
+        },
       )
 
       // 4. 保存草稿 (v2 API - JSON 格式)
@@ -431,10 +435,10 @@ export class SohuAdapter extends CodeAdapter {
             'sp-cm': this.spCm,
           },
           body: JSON.stringify(postData),
-        }
+        },
       )
 
-      const res = await response.json() as {
+      const res = (await response.json()) as {
         success?: unknown
         data?: string | number
         msg?: string
@@ -505,7 +509,8 @@ export class SohuAdapter extends CodeAdapter {
 
     // 2. 上传到搜狐
     const formData = new FormData()
-    const filename = imageBlob.type === 'image/svg+xml' ? 'table.svg' : 'image.jpg'
+    const filename =
+      imageBlob.type === 'image/svg+xml' ? 'table.svg' : 'image.jpg'
     formData.append('file', imageBlob, filename)
     formData.append('accountId', account.externalAccountId)
 
@@ -516,17 +521,17 @@ export class SohuAdapter extends CodeAdapter {
         method: 'POST',
         credentials: 'include',
         body: formData,
-      }
+      },
     )
 
-    const res = await uploadResponse.json() as {
+    const res = (await uploadResponse.json()) as {
       url?: string
       msg?: string
     }
 
     logger.debug(' Image upload response:', res)
     if (!res.url) {
-      throw new Error('图片上传失败:'+ (res.msg))
+      throw new Error('图片上传失败:' + res.msg)
     }
 
     return {

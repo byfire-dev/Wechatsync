@@ -1,7 +1,8 @@
 {
   "name": "@wechatsync/publication-contract",
   "version": "0.1.0",
-  "description": "Versioned wire contracts shared by VibeMarket and Wechatsync",
+  "description": "Internal legacy Bridge v2 wire contracts for Wechatsync",
+  "private": true,
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -33,18 +34,7 @@
         "default": "./dist/v2.cjs"
       }
     },
-    "./v3": {
-      "import": {
-        "types": "./dist/v3.d.ts",
-        "default": "./dist/v3.js"
-      },
-      "require": {
-        "types": "./dist/v3.d.cts",
-        "default": "./dist/v3.cjs"
-      }
-    },
-    "./fixtures/v2/*.json": "./fixtures/v2/*.json",
-    "./fixtures/v3/*.json": "./fixtures/v3/*.json"
+    "./fixtures/v2/*.json": "./fixtures/v2/*.json"
   },
   "scripts": {
     "build": "tsup",
@@ -65,8 +55,5 @@
   },
   "engines": {
     "node": ">=20.0.0"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }

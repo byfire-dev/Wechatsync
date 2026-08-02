@@ -196,8 +196,7 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
 
   it('returns a public observation from the exact published-list mapping', async () => {
     const events: string[] = []
-    const publicUrl =
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
       if (url === 'https://mp.weixin.qq.com/') {
         events.push('fetch:auth')
@@ -258,6 +257,12 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
         canonicalUrl: publicUrl,
         title: 'Published title',
         bodyText: 'Published body',
+        publicAccess: expect.objectContaining({
+          status: 'CONFIRMED',
+          checkedUrl: publicUrl,
+          checkedPublicIdentityKey: 'weixin:article:v1:MzA1AA:777:1',
+          httpStatus: 200,
+        }),
       }),
     ])
     expect(events).toEqual([

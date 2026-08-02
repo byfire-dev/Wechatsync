@@ -362,27 +362,19 @@ describe('publication inspection contracts', () => {
         },
       },
     ]) {
-      expect(PublicationObservationSchema.safeParse(invalid).success).toBe(false)
+      expect(PublicationObservationSchema.safeParse(invalid).success).toBe(
+        false,
+      )
     }
   })
 
   it.each([
-    [
-      'zhihu',
-      '42',
-      'https://zhuanlan.zhihu.com/p/42',
-      {},
-    ],
-    [
-      'sohu',
-      '1054312481',
-      'https://www.sohu.com/a/1054312481_120219780',
-      {},
-    ],
+    ['zhihu', '42', 'https://zhuanlan.zhihu.com/p/42', {}],
+    ['sohu', '1054312481', 'https://www.sohu.com/a/1054312481_120219780', {}],
     [
       'weixin',
       '900000001',
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+      'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
       {
         title: 'Verified public article',
         bodyText: 'Verified public body',
@@ -395,8 +387,7 @@ describe('publication inspection contracts', () => {
       const published = {
         observationKey: `observation-${platform}-published-source`,
         platform,
-        externalAccountId:
-          platform === 'sohu' ? '120219780' : 'account-1',
+        externalAccountId: platform === 'sohu' ? '120219780' : 'account-1',
         outcome: 'PUBLISHED' as const,
         platformPostId,
         canonicalUrl,
@@ -553,23 +544,20 @@ describe('publication inspection contracts', () => {
     expect(
       PublicationObservationSchema.safeParse({
         ...base,
-        canonicalUrl:
-          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
       }).success,
     ).toBe(false)
     expect(
       PublicationObservationSchema.safeParse({
         ...base,
-        canonicalUrl:
-          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
         publishedAt: '2026-07-24T19:00:00+08:00',
       }).success,
     ).toBe(false)
     expect(
       PublicationObservationSchema.safeParse({
         ...base,
-        canonicalUrl:
-          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
         publishedAt: '2026-07-24T19:00:00+08:00',
         title: 'Verified public article',
         bodyText: 'Verified public body',
@@ -580,8 +568,7 @@ describe('publication inspection contracts', () => {
       PublicationObservationSchema.safeParse({
         ...base,
         source: 'PUBLISHED_LIST',
-        canonicalUrl:
-          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
         publishedAt: '2026-07-24T19:00:00+08:00',
         title: 'Unverified list title',
         bodyText: 'Unverified list body',

@@ -1,10 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RuntimeInterface } from '../../../runtime/interface'
-import type {
-  PublicationInspectRequest,
-  PublicationObservation,
-} from '../../../publication-inspection/types'
+import type { PublicationInspectRequest } from '../../../publication-inspection/types'
+import type { PublicationInspectionObservation as PublicationObservation } from '../../../publication-inspection/domain'
 import {
   normalizeWeixinAppMsgId,
   WEIXIN_PUBLIC_PAGE_MAX_BYTES,
@@ -218,6 +216,43 @@ describe('normalizeWeixinAppMsgId', () => {
 })
 
 describe('WeixinAdapter draft identity', () => {
+  it('probes one stable authenticated account', async () => {
+    const adapter = new WeixinAdapter()
+    await adapter.init(createRuntime())
+
+    await expect(adapter.probeAccounts()).resolves.toEqual({
+      status: 'AUTHENTICATED',
+      accounts: [
+        {
+          externalAccountId: ACCOUNT_ID,
+          displayName: 'Test account',
+        },
+      ],
+    })
+    expect(adapter.meta.capabilities).toContain('account_binding')
+  })
+
+  it('rejects a stale binding before the first platform write', async () => {
+    const fetch = vi.fn(
+      async (_url: string) => new Response(authHtml(TOKEN, 'gh_other_account')),
+    )
+    const adapter = new WeixinAdapter()
+    await adapter.init(createRuntime(undefined, { fetch }))
+
+    await expect(
+      adapter.publish(ARTICLE, {
+        accountBinding: { externalAccountId: ACCOUNT_ID },
+      }),
+    ).resolves.toMatchObject({
+      platform: 'weixin',
+      success: false,
+      externalAccountId: ACCOUNT_ID,
+      errorCode: 'ACCOUNT_BINDING_NOT_FOUND',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(fetch.mock.calls[0]?.[0]).toBe('https://mp.weixin.qq.com/')
+  })
+
   it.each([
     ['string', '9001'],
     ['number', 9001],
@@ -226,11 +261,16 @@ describe('WeixinAdapter draft identity', () => {
     const adapter = new WeixinAdapter()
     await adapter.init(createRuntime(value))
 
-    await expect(adapter.publish(ARTICLE)).resolves.toMatchObject({
+    await expect(
+      adapter.publish(ARTICLE, {
+        accountBinding: { externalAccountId: ACCOUNT_ID },
+      }),
+    ).resolves.toMatchObject({
       platform: 'weixin',
       success: true,
       postId: '9001',
       postUrl: expect.stringContaining('appmsgid=9001'),
+      externalAccountId: ACCOUNT_ID,
       draftOnly: true,
     })
   })
@@ -505,8 +545,7 @@ describe('WeixinAdapter publication inspection', () => {
   })
 
   it('returns PUBLISHED only after an exact free-publish match and public-page verification', async () => {
-    const publicUrl =
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const calls: Array<{ url: string; options?: RequestInit }> = []
     const { runtime } = createInspectionRuntime(async (url, options) => {
       calls.push({ url, options })
@@ -561,6 +600,13 @@ describe('WeixinAdapter publication inspection', () => {
         publishedAt: '2024-07-03T09:46:40.000Z',
         title: 'Published title',
         bodyText: 'Published body',
+        publicAccess: {
+          status: 'CONFIRMED',
+          checkedUrl: publicUrl,
+          checkedPublicIdentityKey: 'weixin:article:v1:MzA1AA:777:1',
+          checkedAt: expect.any(String),
+          httpStatus: 200,
+        },
       }),
     ])
     expect(JSON.stringify(observations)).not.toContain('fresh-token')
@@ -621,8 +667,7 @@ describe('WeixinAdapter publication inspection', () => {
   })
 
   it('fails closed if a runtime exposes an opaque manual redirect response', async () => {
-    const publicUrl =
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const publicRequests: RequestInit[] = []
     const { runtime } = createInspectionRuntime(async (url, options) => {
       if (url === 'https://mp.weixin.qq.com/') {
@@ -653,8 +698,7 @@ describe('WeixinAdapter publication inspection', () => {
   })
 
   it('cancels the body when public response metadata is rejected', async () => {
-    const publicUrl =
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const cancelBody = vi.fn()
     const { runtime } = createInspectionRuntime(async (url) => {
       if (url === 'https://mp.weixin.qq.com/') {
@@ -667,7 +711,9 @@ describe('WeixinAdapter publication inspection', () => {
         return publicHtmlResponse(
           new ReadableStream<Uint8Array>({ cancel: cancelBody }),
           publicUrl,
-          { contentType: 'application/json' },
+          {
+            contentType: 'application/json',
+          },
         )
       }
       throw new Error('Draft fallback must not run')
@@ -685,8 +731,7 @@ describe('WeixinAdapter publication inspection', () => {
   })
 
   it('stops a chunked public body at the decoded byte limit', async () => {
-    const publicUrl =
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const cancelBody = vi.fn()
     const chunks = [
       new Uint8Array(WEIXIN_PUBLIC_PAGE_MAX_BYTES),
@@ -735,12 +780,18 @@ describe('WeixinAdapter publication inspection', () => {
       outcome: 'PUBLISHED',
       source: 'PUBLIC_PAGE',
       platformPostId: '9001',
-      canonicalUrl:
-        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1',
+      canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1',
       title: 'Published title',
       publishedAt: '2024-07-03T09:46:40.000Z',
       bodyText: 'Published body',
       bodyTruncated: false,
+      publicAccess: {
+        status: 'CONFIRMED',
+        checkedUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1',
+        checkedPublicIdentityKey: 'weixin:article:v1:MzA1AA:777:1',
+        checkedAt: '2024-07-03T09:46:50.000Z',
+        httpStatus: 200,
+      },
       observedAt: '2024-07-03T09:47:00.000Z',
     }
 
@@ -748,7 +799,7 @@ describe('WeixinAdapter publication inspection', () => {
       adapter.provePublishedObservation(INSPECT_REQUEST, validObservation),
     ).toEqual({
       observedAuthorExternalAccountId: ACCOUNT_ID,
-      publicAccess: { status: 'CONFIRMED' },
+      publicAccess: validObservation.publicAccess,
       bodyTruncated: false,
     })
 
@@ -796,7 +847,7 @@ describe('WeixinAdapter publication inspection', () => {
                     {
                       itemidx: 1,
                       content_url:
-                        'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1',
+                        'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1',
                     },
                   ],
                 },
@@ -825,8 +876,7 @@ describe('WeixinAdapter publication inspection', () => {
   })
 
   it('returns REVIEW_REQUIRED without exposing the candidate when public verification fails', async () => {
-    const publicUrl =
-      'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const { runtime } = createInspectionRuntime(async (url) => {
       if (url === 'https://mp.weixin.qq.com/') {
         return new Response(authHtml('fresh-token'))
@@ -872,7 +922,7 @@ describe('WeixinAdapter publication inspection', () => {
       errorCode: 'WEIXIN_PUBLIC_PAGE_CONTENT_INVALID',
     })
     expect(JSON.stringify(observations)).not.toContain('mid=777')
-    expect(JSON.stringify(observations)).not.toContain('MzA0000000000')
+    expect(JSON.stringify(observations)).not.toContain('MzA1AA')
   })
 
   it('requires review when the published-list response cannot be parsed', async () => {

@@ -629,15 +629,23 @@ describe('Bridge v2 inspection execution boundary', () => {
             platformPostId: '42',
             canonicalUrl: 'https://zhuanlan.zhihu.com/p/42?utm_source=test',
             publishedAt: '2026-07-21T11:55:00.000Z',
+            publicAccess: {
+              status: 'CONFIRMED',
+              checkedUrl: 'https://zhuanlan.zhihu.com/p/42?utm_source=test',
+              checkedPublicIdentityKey: 'zhihu:post:v1:42',
+              checkedAt: '2026-07-21T11:59:00.000Z',
+              httpStatus: 200,
+            },
             observedAt: '2026-07-21T12:00:00.000Z',
           },
         ],
       }),
-    ).resolves.toMatchObject([
-      {
+    ).resolves.toEqual([
+      expect.objectContaining({
         outcome: 'PUBLISHED',
         canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
-      },
+        publicAccess: { status: 'CONFIRMED' },
+      }),
     ])
   })
 
@@ -658,14 +666,18 @@ describe('Bridge v2 inspection execution boundary', () => {
             bodyText: 'Verified authenticated article body',
             publicAccess: {
               status: 'BLOCKED_BY_PLATFORM',
+              checkedUrl: 'https://zhuanlan.zhihu.com/p/42',
+              checkedPublicIdentityKey: 'zhihu:post:v1:42',
+              checkedAt: '2026-07-21T11:59:00.000Z',
+              httpStatus: 403,
               reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
             },
             observedAt: '2026-07-21T12:00:00.000Z',
           },
         ],
       }),
-    ).resolves.toMatchObject([
-      {
+    ).resolves.toEqual([
+      expect.objectContaining({
         outcome: 'PUBLISHED',
         source: 'AUTHENTICATED_PUBLIC_PAGE',
         canonicalUrl: 'https://zhuanlan.zhihu.com/p/42',
@@ -673,7 +685,7 @@ describe('Bridge v2 inspection execution boundary', () => {
           status: 'BLOCKED_BY_PLATFORM',
           reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
         },
-      },
+      }),
     ])
   })
 
@@ -877,6 +889,13 @@ describe('Bridge v2 Sohu inspection identity boundary', () => {
         platformPostId: '1000000001',
         canonicalUrl: `${canonicalUrl}?spm=tracking`,
         publishedAt: '2026-07-21T11:55:00.000Z',
+        publicAccess: {
+          status: 'CONFIRMED',
+          checkedUrl: `${canonicalUrl}?spm=tracking`,
+          checkedPublicIdentityKey: 'sohu:post:v1:1000000001:120000001',
+          checkedAt: '2026-07-21T11:59:00.000Z',
+          httpStatus: 200,
+        },
         observedAt: '2026-07-21T12:00:00.000Z',
       },
     ])
@@ -1237,12 +1256,18 @@ describe('Bridge v2 WeChat inspection identity boundary', () => {
           outcome: 'PUBLISHED',
           source: 'PUBLIC_PAGE',
           platformPostId: '9001',
-          canonicalUrl:
-            'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+          canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
           publishedAt: '2026-07-24T11:55:00.000Z',
           title: 'Verified public article',
           bodyText: 'Verified public body',
           bodyTruncated: false,
+          publicAccess: {
+            status: 'CONFIRMED',
+            checkedUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
+            checkedPublicIdentityKey: 'weixin:article:v1:MzA1AA:1:1',
+            checkedAt: '2026-07-24T11:59:00.000Z',
+            httpStatus: 200,
+          },
           observedAt: '2026-07-24T12:00:00.000Z',
         },
       ],
@@ -1253,10 +1278,10 @@ describe('Bridge v2 WeChat inspection identity boundary', () => {
         outcome: 'PUBLISHED',
         source: 'PUBLIC_PAGE',
         platformPostId: '9001',
-        canonicalUrl:
-          'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=1&idx=1',
+        canonicalUrl: 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=1&idx=1',
       }),
     ])
+    expect(observations[0]?.publicAccess).toEqual({ status: 'CONFIRMED' })
   })
 
   it.each([
