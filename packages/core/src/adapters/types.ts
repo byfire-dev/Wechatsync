@@ -149,6 +149,11 @@ export interface PublishOptions {
    * account set and verify this identity before performing any write.
    */
   accountBinding?: AdapterAccountBinding
+  /**
+   * Internal orchestration hook. An adapter awaits it after account and input
+   * validation, immediately before its first platform write.
+   */
+  beforeDispatch?: () => void | Promise<void>
 }
 
 export const ADAPTER_EXTERNAL_ACCOUNT_ID_MAX_LENGTH = 500

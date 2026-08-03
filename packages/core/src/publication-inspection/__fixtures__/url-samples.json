@@ -88,12 +88,12 @@
   {
     "name": "weixin published article",
     "platform": "weixin",
-    "href": "https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=900000001&idx=1&sn=0123456789abcdef0123456789abcdef&utm_source=test",
+    "href": "https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=900000001&idx=1&sn=0123456789abcdef0123456789abcdef&utm_source=test",
     "expected": {
       "surface": "PUBLISHED",
       "postId": "900000001",
-      "accountId": "MzA0000000000==",
-      "canonicalUrl": "https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=900000001&idx=1&sn=0123456789abcdef0123456789abcdef"
+      "accountId": "MzA1AA",
+      "canonicalUrl": "https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=900000001&idx=1&sn=0123456789abcdef0123456789abcdef"
     }
   },
   {

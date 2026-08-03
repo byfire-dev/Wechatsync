@@ -178,9 +178,15 @@ describe("ToutiaoAdapter publication inspection", () => {
       outcome: "PUBLISHED",
       source: "PUBLIC_PAGE",
       platformPostId: PGC_ID,
-      canonicalUrl: PUBLIC_URL,
+      canonicalUrl: `https://www.toutiao.com/item/${ITEM_ID}`,
       title: TITLE,
-      publicAccess: { status: "CONFIRMED" },
+      publicAccess: {
+        status: "CONFIRMED",
+        checkedUrl: PUBLIC_URL,
+        checkedPublicIdentityKey: `toutiao:item:v1:${ITEM_ID}`,
+        checkedAt: expect.any(String),
+        httpStatus: 200,
+      },
       internalEvidence: {
         publicItemId: ITEM_ID,
         scanComplete: true,
@@ -192,7 +198,7 @@ describe("ToutiaoAdapter publication inspection", () => {
     expect(adapter.provePublishedObservation(request, observations[0])).toEqual(
       {
         observedAuthorExternalAccountId: ACCOUNT_ID,
-        publicAccess: { status: "CONFIRMED" },
+        publicAccess: observations[0].publicAccess,
         bodyTruncated: false,
       },
     );
@@ -204,7 +210,9 @@ describe("ToutiaoAdapter publication inspection", () => {
       91,
       scanToutiaoPublishedListInPage,
       [PGC_ID, TITLE, 20, 10_000],
-      { world: "ISOLATED" },
+      {
+        world: "ISOLATED",
+      },
     );
     expect(mocks.remove).toHaveBeenCalledWith(91);
     expect(mocks.fetch).toHaveBeenCalledWith(
@@ -261,19 +269,22 @@ describe("ToutiaoAdapter publication inspection", () => {
         outcome: "PUBLISHED",
         source: "AUTHENTICATED_PUBLIC_PAGE",
         platformPostId: PGC_ID,
-        canonicalUrl: PUBLIC_URL,
+        canonicalUrl: `https://www.toutiao.com/item/${ITEM_ID}`,
         publicAccess: {
           status: "BLOCKED_BY_PLATFORM",
+          checkedUrl: PUBLIC_URL,
+          checkedPublicIdentityKey: `toutiao:item:v1:${ITEM_ID}`,
+          checkedAt: expect.any(String),
+          ...(reasonCode === TOUTIAO_ANONYMOUS_HTTP_404_REASON
+            ? { httpStatus: 404 }
+            : {}),
           reasonCode,
         },
         internalEvidence: { publicItemId: ITEM_ID },
       });
       expect(adapter.provePublishedObservation(request, observation)).toEqual({
         observedAuthorExternalAccountId: ACCOUNT_ID,
-        publicAccess: {
-          status: "BLOCKED_BY_PLATFORM",
-          reasonCode,
-        },
+        publicAccess: observation.publicAccess,
         bodyTruncated: false,
       });
       expect(fetch).toHaveBeenCalledTimes(3);

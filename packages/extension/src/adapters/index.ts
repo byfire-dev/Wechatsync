@@ -14,13 +14,8 @@ import {
   type Article,
   type SyncResult,
 } from '@wechatsync/core'
-import {
-  PublicationPlatformV3Schema,
-  type PublicationPlatformV3,
-} from '@wechatsync/publication-contract/v3'
 import { createExtensionRuntime } from '../runtime/extension'
 import { createLogger } from '../lib/logger'
-import { deriveRegisteredPublicationInspectorPlatforms } from '../bridge/publication-capabilities-v3'
 import { isConfirmedSyncSuccess } from '../lib/sync-outcome'
 import {
   INVALID_ACCOUNT_BINDINGS,
@@ -186,35 +181,6 @@ export function getAllPlatformMetas() {
 }
 
 /**
- * Derive the v3 publication capability surface from the adapters that are
- * actually registered in this extension build. A platform is advertised only
- * when its live adapter exposes both inspection and PUBLISHED proof.
- */
-export async function getRegisteredPublicationInspectorPlatforms(): Promise<
-  PublicationPlatformV3[]
-> {
-  await initAdapters()
-
-  const candidates: Array<{
-    platformId: string
-    inspectPublication?: unknown
-    provePublishedObservation?: unknown
-  }> = []
-  for (const platformId of adapterRegistry.getRegisteredIds()) {
-    const platform = PublicationPlatformV3Schema.safeParse(platformId)
-    if (!platform.success) continue
-
-    const adapter = await adapterRegistry.get(platform.data)
-    candidates.push({
-      platformId: platform.data,
-      inspectPublication: adapter?.inspectPublication,
-      provePublishedObservation: adapter?.provePublishedObservation,
-    })
-  }
-  return deriveRegisteredPublicationInspectorPlatforms(candidates)
-}
-
-/**
  * 获取平台的预处理配置
  */
 export function getPlatformPreprocessConfig(platformId: string) {
@@ -260,9 +226,15 @@ class OperationTimeoutError extends Error {
 /**
  * 带超时的 Promise 包装
  */
-function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  errorMessage: string,
+  onTimeout?: () => void,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
+      onTimeout?.()
       reject(new OperationTimeoutError(errorMessage))
     }, ms)
 
@@ -586,6 +558,8 @@ export async function syncToPlatform(
   options?: {
     draftOnly?: boolean
     accountBinding?: AdapterAccountBinding
+    /** Persist the v3 write boundary after validation and before platform I/O. */
+    beforeDispatch?: () => void | Promise<void>
   },
   onImageProgress?: ImageProgressCallback
 ): Promise<SyncResult> {
@@ -650,16 +624,38 @@ export async function syncToPlatform(
     }
 
     // 默认只保存草稿，带超时保护
+    const publishController = new AbortController()
+    const guardedBeforeDispatch = options?.beforeDispatch
+      ? async () => {
+          // A timed-out adapter may still finish its asynchronous preflight.
+          // Never let that stale promise cross the first-write boundary.
+          if (publishController.signal.aborted) {
+            throw new OperationTimeoutError(
+              `发布超时（${PUBLISH_TIMEOUT / 60000}分钟）`,
+            )
+          }
+          await options.beforeDispatch?.()
+          if (publishController.signal.aborted) {
+            throw new OperationTimeoutError(
+              `发布超时（${PUBLISH_TIMEOUT / 60000}分钟）`,
+            )
+          }
+        }
+      : undefined
     const result = await withTimeout(
       adapter.publish(platformArticle, {
         draftOnly: options?.draftOnly ?? true,
         ...(accountBinding ? { accountBinding } : {}),
+        ...(guardedBeforeDispatch
+          ? { beforeDispatch: guardedBeforeDispatch }
+          : {}),
         onImageProgress: onImageProgress
           ? (current: number, total: number) => onImageProgress(platformId, current, total)
           : undefined,
       }),
       PUBLISH_TIMEOUT,
-      `发布超时（${PUBLISH_TIMEOUT / 60000}分钟）`
+      `发布超时（${PUBLISH_TIMEOUT / 60000}分钟）`,
+      () => publishController.abort(),
     )
     const normalizedResultExternalAccountId =
       normalizeAdapterExternalAccountId(result.externalAccountId)

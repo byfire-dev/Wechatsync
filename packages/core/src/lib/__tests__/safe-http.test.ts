@@ -35,8 +35,7 @@ function allowExactWeixinArticle(url: string): string | null {
 }
 
 describe('fetchWithValidatedNoRedirects', () => {
-  const longUrl =
-    'https://mp.weixin.qq.com/s?__biz=MzA0000000000%3D%3D&mid=777&idx=1'
+  const longUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
 
   it('validates the only request target before calling fetch', async () => {
     const fetch = vi.fn()

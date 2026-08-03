@@ -9,7 +9,7 @@ import {
 
 const POST_ID = '2000000000000000001'
 const ACCOUNT_ID = 'account-zhihu'
-const NOW = '2026-07-22T09:00:00+08:00'
+const NOW = '2026-07-22T17:00:00+08:00'
 const PUBLISHED_AT = '2026-07-22T07:49:00.000Z'
 const PUBLIC_URL = `https://zhuanlan.zhihu.com/p/${POST_ID}`
 const DRAFT_URL = `${PUBLIC_URL}/edit`
@@ -386,6 +386,13 @@ describe('Zhihu exact-ID publication inspector', () => {
         title: '脱敏后的标题 & 版本',
         publishedAt: PUBLISHED_AT,
         bodyText: '第一段\n第二段',
+        publicAccess: {
+          status: 'CONFIRMED',
+          checkedUrl: PUBLIC_URL,
+          checkedPublicIdentityKey: `zhihu:post:v1:${POST_ID}`,
+          checkedAt: NOW,
+          httpStatus: 200,
+        },
         observedAt: NOW,
       }),
     ])
@@ -821,6 +828,10 @@ describe('Zhihu exact-ID publication inspector', () => {
       publishedAt: PUBLISHED_AT,
       publicAccess: {
         status: 'BLOCKED_BY_PLATFORM',
+        checkedUrl: PUBLIC_URL,
+        checkedPublicIdentityKey: `zhihu:post:v1:${POST_ID}`,
+        checkedAt: NOW,
+        httpStatus: 403,
         reasonCode: 'ZHIHU_ANONYMOUS_HTTP_403',
       },
     })
@@ -843,11 +854,7 @@ describe('Zhihu exact-ID publication inspector', () => {
       .fn()
       .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
       .mockResolvedValueOnce(
-        htmlResponse(
-          200,
-          PUBLIC_URL,
-          publishedHtmlFor({ isVisible: false }),
-        ),
+        htmlResponse(200, PUBLIC_URL, publishedHtmlFor({ isVisible: false })),
       )
     const result = await inspectZhihuPublication(
       createRequest(),

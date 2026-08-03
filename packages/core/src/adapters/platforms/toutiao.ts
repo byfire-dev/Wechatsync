@@ -22,8 +22,10 @@ import { parseMarkdownImages } from "../../lib/markdown-images";
 import {
   PublicationInspectionObservationSchema,
   type PublicationInspectionObservation,
+  type PublicationInspectionPublicAccess,
   type PublicationInspectionRequest,
 } from "../../publication-inspection/domain";
+import { derivePublicationPublicIdentity } from "../../publication-inspection/url";
 import {
   TOUTIAO_ANONYMOUS_BLOCKED_REASONS,
   TOUTIAO_ANONYMOUS_HTTP_404_REASON,
@@ -77,10 +79,18 @@ type ToutiaoPublicPageFetchResult =
   | {
       success: true;
       article: Extract<ToutiaoPublicArticleHtmlResult, { success: true }>;
+      publicAccess: Extract<
+        PublicationInspectionPublicAccess,
+        { status: "CONFIRMED" }
+      >;
     }
   | {
       success: false;
       anonymousNotFound: boolean;
+      publicAccess?: Extract<
+        PublicationInspectionPublicAccess,
+        { status: "BLOCKED_BY_PLATFORM" }
+      >;
       blockedReasonCode?: (typeof TOUTIAO_ANONYMOUS_BLOCKED_REASONS)[number];
       outcome: "FETCH_ERROR" | "REVIEW_REQUIRED";
       errorCode: string;
@@ -485,9 +495,7 @@ export class ToutiaoAdapter extends CodeAdapter {
     publicItemId?: string,
   ): PublicationInspectionObservation {
     return PublicationInspectionObservationSchema.parse({
-      observationKey: `toutiao:${request.requestId}:${source
-        .toLowerCase()
-        .replace(/_/g, "-")}`,
+      observationKey: `toutiao:${request.requestId}:${source.toLowerCase().replace(/_/g, "-")}`,
       platform: "toutiao",
       externalAccountId: request.externalAccountId,
       outcome,
@@ -613,12 +621,36 @@ export class ToutiaoAdapter extends CodeAdapter {
 
     const response = fetched.response;
     if (response.status === 404) {
+      const publicIdentity = derivePublicationPublicIdentity(
+        "toutiao",
+        response.url,
+      );
       await discardResponseBody(response);
+      if (!publicIdentity) {
+        return {
+          success: false,
+          anonymousNotFound: false,
+          outcome: "REVIEW_REQUIRED",
+          errorCode: "TOUTIAO_PUBLIC_IDENTITY_MISMATCH",
+          errorMessage:
+            "The Toutiao public response did not identify the expected article.",
+        };
+      }
       return {
         success: false,
         anonymousNotFound: credentials === "omit",
         ...(credentials === "omit"
-          ? { blockedReasonCode: TOUTIAO_ANONYMOUS_HTTP_404_REASON }
+          ? {
+              blockedReasonCode: TOUTIAO_ANONYMOUS_HTTP_404_REASON,
+              publicAccess: {
+                status: "BLOCKED_BY_PLATFORM" as const,
+                checkedUrl: response.url,
+                checkedPublicIdentityKey: publicIdentity.key,
+                checkedAt: new Date().toISOString(),
+                httpStatus: response.status,
+                reasonCode: TOUTIAO_ANONYMOUS_HTTP_404_REASON,
+              },
+            }
           : {}),
         outcome: "REVIEW_REQUIRED",
         errorCode:
@@ -671,11 +703,34 @@ export class ToutiaoAdapter extends CodeAdapter {
     }
 
     if (isToutiaoSoft404Html(body.text)) {
+      const publicIdentity = derivePublicationPublicIdentity(
+        "toutiao",
+        response.url,
+      );
+      if (!publicIdentity) {
+        return {
+          success: false,
+          anonymousNotFound: false,
+          outcome: "REVIEW_REQUIRED",
+          errorCode: "TOUTIAO_PUBLIC_IDENTITY_MISMATCH",
+          errorMessage:
+            "The Toutiao public response did not identify the expected article.",
+        };
+      }
       return {
         success: false,
         anonymousNotFound: credentials === "omit",
         ...(credentials === "omit"
-          ? { blockedReasonCode: TOUTIAO_ANONYMOUS_SOFT_404_REASON }
+          ? {
+              blockedReasonCode: TOUTIAO_ANONYMOUS_SOFT_404_REASON,
+              publicAccess: {
+                status: "BLOCKED_BY_PLATFORM" as const,
+                checkedUrl: response.url,
+                checkedPublicIdentityKey: publicIdentity.key,
+                checkedAt: new Date().toISOString(),
+                reasonCode: TOUTIAO_ANONYMOUS_SOFT_404_REASON,
+              },
+            }
           : {}),
         outcome: "REVIEW_REQUIRED",
         errorCode:
@@ -704,7 +759,32 @@ export class ToutiaoAdapter extends CodeAdapter {
       };
     }
 
-    return { success: true, article };
+    const publicIdentity = derivePublicationPublicIdentity(
+      "toutiao",
+      response.url,
+    );
+    if (!publicIdentity) {
+      return {
+        success: false,
+        anonymousNotFound: false,
+        outcome: "REVIEW_REQUIRED",
+        errorCode: "TOUTIAO_PUBLIC_IDENTITY_MISMATCH",
+        errorMessage:
+          "The Toutiao public response did not identify the expected article.",
+      };
+    }
+
+    return {
+      success: true,
+      article,
+      publicAccess: {
+        status: "CONFIRMED",
+        checkedUrl: response.url,
+        checkedPublicIdentityKey: publicIdentity.key,
+        checkedAt: new Date().toISOString(),
+        httpStatus: response.status,
+      },
+    };
   }
 
   async inspectPublication(
@@ -838,9 +918,16 @@ export class ToutiaoAdapter extends CodeAdapter {
     let blockedReasonCode:
       | (typeof TOUTIAO_ANONYMOUS_BLOCKED_REASONS)[number]
       | undefined;
+    let blockedPublicAccess:
+      | Extract<
+          PublicationInspectionPublicAccess,
+          { status: "BLOCKED_BY_PLATFORM" }
+        >
+      | undefined;
     if (!anonymousPage.success && anonymousPage.anonymousNotFound) {
       blockedReasonCode = anonymousPage.blockedReasonCode;
-      if (!blockedReasonCode) {
+      blockedPublicAccess = anonymousPage.publicAccess;
+      if (!blockedReasonCode || !blockedPublicAccess) {
         return [
           this.createInspectionError(
             request,
@@ -869,6 +956,27 @@ export class ToutiaoAdapter extends CodeAdapter {
           page.outcome,
           page.errorCode,
           page.errorMessage,
+          pgcId,
+          source,
+          scan.publicItemId,
+        ),
+      ];
+    }
+
+    const publicIdentity = derivePublicationPublicIdentity(
+      "toutiao",
+      page.article.canonicalUrl,
+    );
+    if (
+      !publicIdentity ||
+      (source === "AUTHENTICATED_PUBLIC_PAGE" && !blockedPublicAccess)
+    ) {
+      return [
+        this.createInspectionError(
+          request,
+          "REVIEW_REQUIRED",
+          "TOUTIAO_PUBLIC_IDENTITY_MISMATCH",
+          "The Toutiao public article identity could not be normalized.",
           pgcId,
           source,
           scan.publicItemId,
@@ -922,18 +1030,13 @@ export class ToutiaoAdapter extends CodeAdapter {
         outcome: "PUBLISHED",
         source,
         platformPostId: pgcId,
-        canonicalUrl: page.article.canonicalUrl,
+        canonicalUrl: publicIdentity.canonicalUrl,
         title: page.article.title,
         publishedAt: page.article.publishedAt,
         bodyText: page.article.bodyText,
         bodyTruncated: page.article.bodyTruncated,
         publicAccess:
-          source === "PUBLIC_PAGE"
-            ? { status: "CONFIRMED" }
-            : {
-                status: "BLOCKED_BY_PLATFORM",
-                reasonCode: blockedReasonCode,
-              },
+          source === "PUBLIC_PAGE" ? page.publicAccess : blockedPublicAccess,
         observedAt: new Date().toISOString(),
         internalEvidence: {
           publicItemId: scan.publicItemId,
@@ -952,13 +1055,9 @@ export class ToutiaoAdapter extends CodeAdapter {
       request.draft.draftUrl,
     );
     const publicItemId = observation.internalEvidence?.publicItemId;
-    const canonicalUrl =
-      observation.canonicalUrl && publicItemId
-        ? normalizeToutiaoPublicArticleUrl(
-            observation.canonicalUrl,
-            publicItemId,
-          )
-        : null;
+    const publicIdentity = observation.canonicalUrl
+      ? derivePublicationPublicIdentity("toutiao", observation.canonicalUrl)
+      : null;
     const normalizedObservedTitle = observation.title
       ?.replace(/\s+/g, " ")
       .trim();
@@ -983,7 +1082,8 @@ export class ToutiaoAdapter extends CodeAdapter {
       observation.platformPostId !== pgcResolution.pgcId ||
       !publicItemId ||
       !normalizeToutiaoId(publicItemId) ||
-      canonicalUrl !== observation.canonicalUrl ||
+      publicIdentity?.key !== `toutiao:item:v1:${publicItemId}` ||
+      publicIdentity.canonicalUrl !== observation.canonicalUrl ||
       !observation.publishedAt ||
       normalizedObservedTitle !== normalizedRequestedTitle ||
       !Number.isFinite(publishedAt) ||
@@ -1055,6 +1155,7 @@ export class ToutiaoAdapter extends CodeAdapter {
         .replace(/\n{3,}/g, "\n\n");
 
       this.assertSafeImageSources(content);
+      await options?.beforeDispatch?.();
       content = await this.withHeaderRules(this.HEADER_RULES, () =>
         this.processImages(content, (src) => this.uploadImageByUrl(src), {
           skipPatterns: ["pstatp.com", "toutiao.com", "byteimg.com"],

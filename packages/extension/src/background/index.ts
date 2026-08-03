@@ -6,7 +6,7 @@ import {
   getAllPlatformMetas,
   cancelSync,
   getAdapter,
-  getRegisteredPublicationInspectorPlatforms,
+  syncToPlatform,
   getPlatformPreprocessConfigs,
   type SyncDetailProgress,
 } from '../adapters'
@@ -45,10 +45,8 @@ import {
   validateLegacyMutationMessageSender,
 } from './bridge-v2'
 import {
-  buildPublicationBridgeInfoV3,
-  runPublicationInspectionV3,
-  validatePublicationBridgeInfoPayloadV3,
-  validatePublicationInspectPayloadV3,
+  PublicationBridgeV3Coordinator,
+  createChromePublicationBridgeV3StateStore,
 } from './bridge-v3'
 import { dispatchLegacyMagicCall } from '../bridge/legacy-magic-call'
 import { isLegacyMutationRuntimeMessage } from '../bridge/legacy-origin-policy'
@@ -59,6 +57,14 @@ import {
 } from '../bridge'
 
 const logger = createLogger('Background')
+
+const publicationBridgeV3 = new PublicationBridgeV3Coordinator({
+  extensionVersion: () => chrome.runtime.getManifest().version,
+  getAdapter,
+  syncToPlatform: (platform, article, options) =>
+    syncToPlatform(platform, article, options),
+  store: createChromePublicationBridgeV3StateStore(chrome.storage.local),
+})
 
 // CMS 类型
 type CMSType = 'wordpress' | 'typecho' | 'metaweblog'
@@ -165,16 +171,8 @@ type MessageAction =
       payload: unknown
     }
   | { type: 'BRIDGE_INSPECT_PUBLICATION'; requestId: string; payload: unknown }
-  | {
-      type: 'BRIDGE_GET_PUBLICATION_INFO_V3'
-      requestId: string
-      payload: unknown
-    }
-  | {
-      type: 'BRIDGE_INSPECT_PUBLICATION_V3'
-      requestId: string
-      payload: unknown
-    }
+  | { type: 'BRIDGE_CALL_V3'; request: unknown }
+  | { type: 'BRIDGE_RUN_PUBLICATION_OPERATION_V3'; operationId: string }
   | {
       type: 'BRIDGE_OPEN_PUBLICATION_DRAFT'
       requestId: string
@@ -352,53 +350,20 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
       }
     }
 
-    case 'BRIDGE_GET_PUBLICATION_INFO_V3': {
+    case 'BRIDGE_CALL_V3': {
       const verifiedSender = validateBridgeMessageSender(sender || {})
       if (!verifiedSender.success) {
         return { error: verifiedSender.code }
       }
-      if (
-        !validatePublicationBridgeInfoPayloadV3(
-          message.payload,
-          message.requestId,
-        )
-      ) {
-        return { error: 'INVALID_PAYLOAD' }
-      }
-
-      const extensionVersion = chrome.runtime.getManifest().version
-      const platforms = await getRegisteredPublicationInspectorPlatforms()
-      return {
-        publicationBridgeInfoV3: buildPublicationBridgeInfoV3(
-          platforms,
-          extensionVersion,
-        ),
-      }
+      return publicationBridgeV3.handle(message.request)
     }
 
-    case 'BRIDGE_INSPECT_PUBLICATION_V3': {
+    case 'BRIDGE_RUN_PUBLICATION_OPERATION_V3': {
       const verifiedSender = validateBridgeMessageSender(sender || {})
       if (!verifiedSender.success) {
         return { error: verifiedSender.code }
       }
-
-      const validatedPayload = validatePublicationInspectPayloadV3(
-        message.payload,
-        message.requestId,
-      )
-      if (!validatedPayload.success) {
-        return { error: validatedPayload.code }
-      }
-
-      const extensionVersion = chrome.runtime.getManifest().version
-      const adapter = await getAdapter(validatedPayload.data.platform)
-      return {
-        publicationInspectResultV3: await runPublicationInspectionV3(
-          validatedPayload.data,
-          adapter,
-          extensionVersion,
-        ),
-      }
+      return publicationBridgeV3.runPublicationOperation(message.operationId)
     }
 
     case 'BRIDGE_OPEN_PUBLICATION_DRAFT': {

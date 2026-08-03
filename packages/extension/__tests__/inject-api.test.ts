@@ -1,5 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { runInNewContext } from 'node:vm'
+import {
+  publicationBridgeV3IdempotencyConflictResponseFixture,
+  publicationBridgeV3NegotiationRequestFixture,
+  publicationBridgeV3NegotiationResponseFixture,
+  publicationBridgeV3PublishRequestFixture,
+} from '@byfire-dev/publication-bridge-contract/v3/testing'
 import { describe, expect, it, vi } from 'vitest'
 
 const injectApiSource = readFileSync(new URL('../public/inject-api.js', import.meta.url), 'utf8')
@@ -179,7 +185,7 @@ describe('injected Bridge v2 API', () => {
 })
 
 describe('injected publication Bridge v3 API', () => {
-  it('exposes distinct v3 info and inspection methods without consuming v2 responses', () => {
+  it('exposes one raw v3 call on both aliases and returns the full envelope', () => {
     const {
       clearTimeoutMock,
       listeners,
@@ -187,165 +193,88 @@ describe('injected publication Bridge v3 API', () => {
       postMessage,
       windowObject,
     } = createInjectedApiHarness()
-
-    const request = {
-      contractVersion: '3.0',
-      requestId: 'inspect-v3-001',
-      platform: 'zhihu',
-      externalAccountId: 'zhihu-user-1',
-      draft: {
-        platformPostId: '123456789',
-        draftedAt: '2026-07-29T08:00:00.000Z',
-      },
-      articleHint: { title: 'Bridge v3 article' },
-      limit: 20,
-    }
     const callback = vi.fn()
     const poster = windowObject.$poster as {
-      getPublicationBridgeInfoV3(cb: typeof callback): void
-      inspectPublicationV3(value: typeof request, cb: typeof callback): void
-      inspectPublication(value: typeof request, cb: typeof callback): void
-    }
-
-    poster.getPublicationBridgeInfoV3(callback)
-    expect(postMessage.mock.calls.at(-1)?.[0]).toMatchObject({
-      namespace: 'vibemarket.syncer.bridge',
-      apiVersion: '3.0',
-      direction: 'PAGE_TO_EXTENSION',
-      method: 'getPublicationBridgeInfoV3',
-      payload: {},
-    })
-
-    poster.inspectPublicationV3(request, callback)
-    expect(postMessage.mock.calls.at(-1)?.[0]).toEqual({
-      namespace: 'vibemarket.syncer.bridge',
-      apiVersion: '3.0',
-      direction: 'PAGE_TO_EXTENSION',
-      requestId: request.requestId,
-      method: 'inspectPublicationV3',
-      payload: request,
-    })
-
-    const v2Callback = vi.fn()
-    poster.inspectPublication(request, v2Callback)
-
-    listeners[0]?.({
-      source: windowObject,
-      origin: location.origin,
-      data: {
-        namespace: 'vibemarket.syncer.bridge',
-        apiVersion: '2.0',
-        direction: 'EXTENSION_TO_PAGE',
-        requestId: request.requestId,
-        method: 'inspectPublicationV3',
-        ok: true,
-        result: { shouldNotBeAccepted: true },
-      },
-    })
-    expect(callback).not.toHaveBeenCalled()
-    expect(v2Callback).not.toHaveBeenCalled()
-
-    const result = {
-      contractVersion: '3.0',
-      requestId: request.requestId,
-      platform: 'zhihu',
-      externalAccountId: 'zhihu-user-1',
-      adapterVersion: '2.0.27',
-      ok: false,
-      failure: {
-        stage: 'TIMEOUT',
-        code: 'PUBLICATION_INSPECTION_TIMEOUT',
-        retryable: true,
-        message: 'The publication inspection timed out.',
-      },
-    }
-    listeners[0]?.({
-      source: windowObject,
-      origin: location.origin,
-      data: {
-        namespace: 'vibemarket.syncer.bridge',
-        apiVersion: '3.0',
-        direction: 'EXTENSION_TO_PAGE',
-        requestId: request.requestId,
-        method: 'inspectPublicationV3',
-        ok: true,
-        result,
-      },
-    })
-    expect(callback).toHaveBeenCalledWith(null, result)
-    expect(clearTimeoutMock).toHaveBeenCalledTimes(1)
-    expect(v2Callback).not.toHaveBeenCalled()
-
-    listeners[0]?.({
-      source: windowObject,
-      origin: location.origin,
-      data: {
-        namespace: 'vibemarket.syncer.bridge',
-        apiVersion: '2.0',
-        direction: 'EXTENSION_TO_PAGE',
-        requestId: request.requestId,
-        method: 'inspectPublication',
-        ok: true,
-        result: [],
-      },
-    })
-    expect(v2Callback).toHaveBeenCalledWith(null, [])
-  })
-
-  it('normalizes v3 request IDs and rejects blank IDs without posting', () => {
-    const { postMessage, windowObject } = createInjectedApiHarness()
-    const poster = windowObject.$poster as {
-      inspectPublicationV3(
-        request: { requestId: string; platform: string },
-        cb: (error?: unknown) => void,
+      callPublicationBridgeV3(
+        request: typeof publicationBridgeV3NegotiationRequestFixture,
+        cb: typeof callback
       ): void
     }
+    expect(windowObject.$syncer).toBe(windowObject.$poster)
 
-    const normalizedCallback = vi.fn()
-    poster.inspectPublicationV3(
-      { requestId: '  inspect-v3-normalized  ', platform: 'zhihu' },
-      normalizedCallback,
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      callback,
     )
     expect(postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        apiVersion: '3.0',
-        requestId: 'inspect-v3-normalized',
-        payload: {
-          requestId: 'inspect-v3-normalized',
-          platform: 'zhihu',
-        },
-      }),
-      'http://localhost',
+      publicationBridgeV3NegotiationRequestFixture,
+      location.origin,
     )
 
-    const callsBeforeBlankId = postMessage.mock.calls.length
-    const invalidCallback = vi.fn()
-    poster.inspectPublicationV3(
-      { requestId: '   ', platform: 'zhihu' },
-      invalidCallback,
-    )
-    expect(invalidCallback).toHaveBeenCalledWith({
-      code: 'INVALID_REQUEST_ID',
-      message: 'Publication Bridge requestId must be a non-empty string.',
+    listeners[0]?.({
+      source: windowObject,
+      origin: location.origin,
+      data: publicationBridgeV3NegotiationResponseFixture,
     })
-    expect(postMessage).toHaveBeenCalledTimes(callsBeforeBlankId)
+    expect(callback).toHaveBeenCalledWith(
+      null,
+      publicationBridgeV3NegotiationResponseFixture,
+    )
+    expect(clearTimeoutMock).toHaveBeenCalledTimes(1)
   })
 
-  it('rejects a duplicate pending v3 request ID without replacing the first callback', () => {
-    const { listeners, location, postMessage, windowObject } =
-      createInjectedApiHarness()
+  it('returns a contract-level ok:false response as a successful transport exchange', () => {
+    const { listeners, location, windowObject } = createInjectedApiHarness()
     const poster = windowObject.$poster as {
-      inspectPublicationV3(
-        request: { requestId: string; platform: string },
-        cb: (error: unknown, result?: unknown) => void,
+      callPublicationBridgeV3(
+        request: Record<string, unknown>,
+        cb: (error: unknown, response?: unknown) => void
       ): void
     }
-    const request = { requestId: 'inspect-v3-duplicate', platform: 'zhihu' }
+    const request = {
+      ...publicationBridgeV3PublishRequestFixture,
+      requestId:
+        publicationBridgeV3IdempotencyConflictResponseFixture.requestId,
+      operationId:
+        publicationBridgeV3IdempotencyConflictResponseFixture.operationId,
+    }
+    const callback = vi.fn()
+
+    poster.callPublicationBridgeV3(request, callback)
+    listeners[0]?.({
+      source: windowObject,
+      origin: location.origin,
+      data: publicationBridgeV3IdempotencyConflictResponseFixture,
+    })
+
+    expect(callback).toHaveBeenCalledWith(
+      null,
+      publicationBridgeV3IdempotencyConflictResponseFixture,
+    )
+  })
+
+  it('rejects malformed requests and duplicate pending request IDs', () => {
+    const { postMessage, windowObject } = createInjectedApiHarness()
+    const poster = windowObject.$poster as {
+      callPublicationBridgeV3(
+        request: Record<string, unknown>,
+        cb: (error: unknown, response?: unknown) => void
+      ): void
+    }
     const firstCallback = vi.fn()
     const duplicateCallback = vi.fn()
 
-    poster.inspectPublicationV3(request, firstCallback)
-    poster.inspectPublicationV3(request, duplicateCallback)
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      firstCallback,
+    )
+    poster.callPublicationBridgeV3(
+      {
+        ...publicationBridgeV3NegotiationRequestFixture,
+        command: 'accounts.resolve',
+      },
+      duplicateCallback,
+    )
 
     expect(postMessage).toHaveBeenCalledTimes(1)
     expect(duplicateCallback).toHaveBeenCalledWith({
@@ -353,23 +282,22 @@ describe('injected publication Bridge v3 API', () => {
       message: 'A Publication Bridge request with this requestId is pending.',
     })
 
-    listeners[0]?.({
-      source: windowObject,
-      origin: location.origin,
-      data: {
-        namespace: 'vibemarket.syncer.bridge',
-        apiVersion: '3.0',
-        direction: 'EXTENSION_TO_PAGE',
-        requestId: request.requestId,
-        method: 'inspectPublicationV3',
-        ok: true,
-        result: { ok: true },
+    const invalidCallback = vi.fn()
+    poster.callPublicationBridgeV3(
+      {
+        ...publicationBridgeV3NegotiationRequestFixture,
+        requestId: ' invalid ',
       },
+      invalidCallback,
+    )
+    expect(invalidCallback).toHaveBeenCalledWith({
+      code: 'INVALID_BRIDGE_REQUEST',
+      message: 'Publication Bridge request is invalid.',
     })
-    expect(firstCallback).toHaveBeenCalledWith(null, { ok: true })
+    expect(postMessage).toHaveBeenCalledTimes(1)
   })
 
-  it('times out and removes a pending v3 callback', () => {
+  it('ignores foreign or mismatched responses, then times out and cleans up', () => {
     const {
       listeners,
       location,
@@ -379,16 +307,43 @@ describe('injected publication Bridge v3 API', () => {
       windowObject,
     } = createInjectedApiHarness()
     const poster = windowObject.$poster as {
-      inspectPublicationV3(
-        request: { requestId: string; platform: string },
-        cb: (error: unknown, result?: unknown) => void,
+      callPublicationBridgeV3(
+        request: Record<string, unknown>,
+        cb: (error: unknown, response?: unknown) => void
       ): void
     }
-    const request = { requestId: 'inspect-v3-timeout', platform: 'zhihu' }
     const callback = vi.fn()
 
-    poster.inspectPublicationV3(request, callback)
-    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 15000)
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      callback,
+    )
+    expect(setTimeoutMock).toHaveBeenCalledWith(expect.any(Function), 30000)
+
+    for (const event of [
+      {
+        source: { foreign: true },
+        origin: location.origin,
+        data: publicationBridgeV3NegotiationResponseFixture,
+      },
+      {
+        source: windowObject,
+        origin: 'https://evil.example',
+        data: publicationBridgeV3NegotiationResponseFixture,
+      },
+      {
+        source: windowObject,
+        origin: location.origin,
+        data: {
+          ...publicationBridgeV3NegotiationResponseFixture,
+          command: 'accounts.resolve',
+        },
+      },
+    ]) {
+      listeners[0]?.(event)
+    }
+    expect(callback).not.toHaveBeenCalled()
+
     const timeoutCallback = [...timeoutCallbacks.values()][0]
     timeoutCallback?.()
     expect(callback).toHaveBeenCalledWith({
@@ -399,19 +354,14 @@ describe('injected publication Bridge v3 API', () => {
     listeners[0]?.({
       source: windowObject,
       origin: location.origin,
-      data: {
-        namespace: 'vibemarket.syncer.bridge',
-        apiVersion: '3.0',
-        direction: 'EXTENSION_TO_PAGE',
-        requestId: request.requestId,
-        method: 'inspectPublicationV3',
-        ok: true,
-        result: { tooLate: true },
-      },
+      data: publicationBridgeV3NegotiationResponseFixture,
     })
     expect(callback).toHaveBeenCalledTimes(1)
 
-    poster.inspectPublicationV3(request, vi.fn())
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      vi.fn(),
+    )
     expect(postMessage).toHaveBeenCalledTimes(2)
   })
 })

@@ -87,10 +87,8 @@ try {
       "--input-type=module",
       "--eval",
       [
-        "import { PublicationInspectResultV3Schema } from '@wechatsync/publication-contract/v3'",
         "import { PublicationPlatformSchema } from '@wechatsync/publication-contract/v2'",
         "if (PublicationPlatformSchema.parse('zhihu') !== 'zhihu') throw new Error('v2 ESM export failed')",
-        "if (typeof PublicationInspectResultV3Schema.safeParse !== 'function') throw new Error('v3 ESM export failed')",
       ].join(";"),
     ],
     consumerDirectory,
@@ -101,12 +99,10 @@ try {
     [
       "--eval",
       [
-        "const { PublicationInspectResultV3Schema } = require('@wechatsync/publication-contract/v3')",
-        "const { PublicationPlatformSchema } = require('@wechatsync/publication-contract/v2')",
-        "const fixture = require('@wechatsync/publication-contract/fixtures/v3/toutiao-published.json')",
+        "const { PublicationObservationSchema, PublicationPlatformSchema } = require('@wechatsync/publication-contract/v2')",
+        "const fixture = require('@wechatsync/publication-contract/fixtures/v2/zhihu-published.json')",
         "if (PublicationPlatformSchema.parse('sohu') !== 'sohu') throw new Error('v2 CJS export failed')",
-        "if (typeof PublicationInspectResultV3Schema.safeParse !== 'function') throw new Error('v3 CJS export failed')",
-        "if (!PublicationInspectResultV3Schema.safeParse(fixture).success) throw new Error('fixture export failed')",
+        "if (!PublicationObservationSchema.safeParse(fixture).success) throw new Error('v2 fixture export failed')",
       ].join(";"),
     ],
     consumerDirectory,
@@ -116,9 +112,9 @@ try {
     path.join(consumerDirectory, "consumer.mts"),
     [
       "import { PublicationPlatformSchema } from '@wechatsync/publication-contract'",
-      "import { PublicationInspectResultV3Schema } from '@wechatsync/publication-contract/v3'",
+      "import { SyncerBridgeInfoSchema } from '@wechatsync/publication-contract/v2'",
       "PublicationPlatformSchema.parse('zhihu')",
-      "PublicationInspectResultV3Schema.safeParse({})",
+      "SyncerBridgeInfoSchema.safeParse({})",
       "",
     ].join("\n"),
     "utf8",
@@ -127,9 +123,8 @@ try {
     path.join(consumerDirectory, "consumer.cts"),
     [
       "import v2 = require('@wechatsync/publication-contract/v2')",
-      "import v3 = require('@wechatsync/publication-contract/v3')",
       "v2.PublicationPlatformSchema.parse('sohu')",
-      "v3.PublicationInspectResultV3Schema.safeParse({})",
+      "v2.SyncerBridgeInfoSchema.safeParse({})",
       "",
     ].join("\n"),
     "utf8",
@@ -161,7 +156,7 @@ try {
   );
 
   console.log(
-    `Packed ESM/CJS runtime, types, and fixtures verified: ${tarballName}`,
+    `Packed v2 ESM/CJS runtime, types, and fixtures verified: ${tarballName}`,
   );
 } finally {
   await rm(scratchDirectory, { recursive: true, force: true });

@@ -455,6 +455,61 @@ describe('account binding sync propagation', () => {
     }
   })
 
+  it('prevents a delayed adapter from crossing the write boundary after timeout', async () => {
+    vi.useFakeTimers()
+    try {
+      let releasePreflight: (() => void) | undefined
+      const beforeDispatch = vi.fn(async () => {})
+      const platformWrite = vi.fn()
+      syncTestState.publish.mockImplementation(
+        async (
+          platform: string,
+          _article: unknown,
+          options: {
+            accountBinding?: { externalAccountId: string }
+            beforeDispatch?: () => void | Promise<void>
+          },
+        ) => {
+          await new Promise<void>((resolve) => {
+            releasePreflight = resolve
+          })
+          await options.beforeDispatch?.()
+          platformWrite()
+          return {
+            platform,
+            success: true,
+            externalAccountId: options.accountBinding?.externalAccountId,
+            timestamp: Date.now(),
+          }
+        },
+      )
+
+      const resultPromise = syncToPlatform('sohu', article, {
+        accountBinding: { externalAccountId: '120219781' },
+        beforeDispatch,
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(releasePreflight).toBeTypeOf('function')
+
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000)
+      await expect(resultPromise).resolves.toMatchObject({
+        success: true,
+        outcome: 'OUTCOME_UNKNOWN',
+        retryable: false,
+        errorCode: PUBLISH_SYNC_ERROR_CODES.TIMEOUT_OUTCOME_UNKNOWN,
+      })
+
+      releasePreflight?.()
+      await vi.runAllTicks()
+      await Promise.resolve()
+
+      expect(beforeDispatch).not.toHaveBeenCalled()
+      expect(platformWrite).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('preserves binding identity for platforms cancelled between batches', async () => {
     syncTestState.metas.splice(
       0,

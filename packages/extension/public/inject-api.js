@@ -3,11 +3,16 @@
 
   var BRIDGE_NAMESPACE = 'vibemarket.syncer.bridge';
   var BRIDGE_API_VERSION = '2.0';
-  var PUBLICATION_BRIDGE_API_VERSION_V3 = '3.0';
+  var PUBLICATION_BRIDGE_NAMESPACE_V3 = 'byfire.publication-bridge';
+  var PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3 = 3;
   var PUBLICATION_BRIDGE_REQUEST_ID_MAX_LENGTH_V3 = 128;
-  var PUBLICATION_BRIDGE_TIMEOUT_MS_V3 = 15000;
+  // Account resolution and inspection can each consume a bounded 12 seconds.
+  // Keep the page transport deadline above the longest sequential read path.
+  var PUBLICATION_BRIDGE_TIMEOUT_MS_V3 = 30000;
   var BRIDGE_REQUEST_DIRECTION = 'PAGE_TO_EXTENSION';
   var BRIDGE_RESPONSE_DIRECTION = 'EXTENSION_TO_PAGE';
+  var PUBLICATION_BRIDGE_REQUEST_DIRECTION_V3 = 'REQUEST';
+  var PUBLICATION_BRIDGE_RESPONSE_DIRECTION_V3 = 'RESPONSE';
 
   var poster = {
     versionNumber: 1001,
@@ -16,6 +21,7 @@
 
   var eventCb = {};
   var bridgeEventCb = {};
+  var publicationBridgeEventCbV3 = Object.create(null);
   var _statueandler = null;
   var _consolehandler = null;
 
@@ -57,34 +63,35 @@
     );
   }
 
-  function normalizePublicationBridgeRequestIdV3(value) {
-    if (typeof value !== 'string') return null;
-    var normalized = value.trim();
-    if (
-      normalized.length === 0 ||
-      normalized.length > PUBLICATION_BRIDGE_REQUEST_ID_MAX_LENGTH_V3
-    ) {
-      return null;
-    }
-    return normalized;
+  function isPublicationBridgeRequestV3(request) {
+    return (
+      request &&
+      typeof request === 'object' &&
+      !Array.isArray(request) &&
+      request.namespace === PUBLICATION_BRIDGE_NAMESPACE_V3 &&
+      request.direction === PUBLICATION_BRIDGE_REQUEST_DIRECTION_V3 &&
+      request.protocolMajor === PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3 &&
+      typeof request.requestId === 'string' &&
+      request.requestId.length > 0 &&
+      request.requestId.length <= PUBLICATION_BRIDGE_REQUEST_ID_MAX_LENGTH_V3 &&
+      request.requestId === request.requestId.trim() &&
+      typeof request.command === 'string' &&
+      request.command.length > 0
+    );
   }
 
-  function callPublicationBridgeV3(method, payload, cb, requestId) {
+  function callPublicationBridgeV3(request, cb) {
     var callback = typeof cb === 'function' ? cb : function() {};
-    var id = normalizePublicationBridgeRequestIdV3(requestId);
-    if (id === null) {
+    if (!isPublicationBridgeRequestV3(request)) {
       callback({
-        code: 'INVALID_REQUEST_ID',
-        message: 'Publication Bridge requestId must be a non-empty string.',
+        code: 'INVALID_BRIDGE_REQUEST',
+        message: 'Publication Bridge request is invalid.',
       });
       return;
     }
 
-    var callbackKey = bridgeCallbackKey(
-      PUBLICATION_BRIDGE_API_VERSION_V3,
-      id
-    );
-    if (bridgeEventCb[callbackKey]) {
+    var id = request.requestId;
+    if (publicationBridgeEventCbV3[id]) {
       callback({
         code: 'DUPLICATE_REQUEST_ID',
         message: 'A Publication Bridge request with this requestId is pending.',
@@ -92,44 +99,22 @@
       return;
     }
 
-    var normalizedPayload = payload || {};
-    if (method === 'inspectPublicationV3') {
-      normalizedPayload = {};
-      if (payload && typeof payload === 'object') {
-        Object.keys(payload).forEach(function(key) {
-          normalizedPayload[key] = payload[key];
-        });
-      }
-      normalizedPayload.requestId = id;
-    }
-
     var pending = {
-      method: method,
-      apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
+      command: request.command,
       callback: callback,
       timeoutId: undefined,
     };
-    bridgeEventCb[callbackKey] = pending;
+    publicationBridgeEventCbV3[id] = pending;
     pending.timeoutId = setTimeout(function() {
-      if (bridgeEventCb[callbackKey] !== pending) return;
-      delete bridgeEventCb[callbackKey];
+      if (publicationBridgeEventCbV3[id] !== pending) return;
+      delete publicationBridgeEventCbV3[id];
       pending.callback({
         code: 'BRIDGE_REQUEST_TIMEOUT',
         message: 'The Publication Bridge request timed out.',
       });
     }, PUBLICATION_BRIDGE_TIMEOUT_MS_V3);
 
-    window.postMessage(
-      {
-        namespace: BRIDGE_NAMESPACE,
-        apiVersion: PUBLICATION_BRIDGE_API_VERSION_V3,
-        direction: BRIDGE_REQUEST_DIRECTION,
-        requestId: id,
-        method: method,
-        payload: normalizedPayload,
-      },
-      location.origin
-    );
+    window.postMessage(request, location.origin);
   }
 
   poster.getAccounts = function(cb) {
@@ -170,22 +155,8 @@
     );
   };
 
-  poster.getPublicationBridgeInfoV3 = function(cb) {
-    callPublicationBridgeV3(
-      'getPublicationBridgeInfoV3',
-      {},
-      cb,
-      createBridgeRequestId()
-    );
-  };
-
-  poster.inspectPublicationV3 = function(request, cb) {
-    callPublicationBridgeV3(
-      'inspectPublicationV3',
-      request,
-      cb,
-      request && request.requestId
-    );
+  poster.callPublicationBridgeV3 = function(request, cb) {
+    callPublicationBridgeV3(request, cb);
   };
 
   poster.openPublicationDraft = function(request, cb) {
@@ -257,9 +228,35 @@
         evt.origin === location.origin &&
         evt.data &&
         typeof evt.data === 'object' &&
+        evt.data.namespace === PUBLICATION_BRIDGE_NAMESPACE_V3 &&
+        evt.data.direction === PUBLICATION_BRIDGE_RESPONSE_DIRECTION_V3 &&
+        evt.data.protocolMajor === PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3
+      ) {
+        var publicationBridgeCallback =
+          publicationBridgeEventCbV3[evt.data.requestId];
+        if (
+          !publicationBridgeCallback ||
+          publicationBridgeCallback.command !== evt.data.command ||
+          typeof evt.data.ok !== 'boolean'
+        ) return;
+
+        if (publicationBridgeCallback.timeoutId !== undefined) {
+          clearTimeout(publicationBridgeCallback.timeoutId);
+        }
+        delete publicationBridgeEventCbV3[evt.data.requestId];
+
+        // Contract-level ok:false is still a successful transport exchange.
+        publicationBridgeCallback.callback(null, evt.data);
+        return;
+      }
+
+      if (
+        evt.source === window &&
+        evt.origin === location.origin &&
+        evt.data &&
+        typeof evt.data === 'object' &&
         evt.data.namespace === BRIDGE_NAMESPACE &&
-        (evt.data.apiVersion === BRIDGE_API_VERSION ||
-          evt.data.apiVersion === PUBLICATION_BRIDGE_API_VERSION_V3) &&
+        evt.data.apiVersion === BRIDGE_API_VERSION &&
         evt.data.direction === BRIDGE_RESPONSE_DIRECTION
       ) {
         var callbackKey = bridgeCallbackKey(
@@ -273,15 +270,6 @@
           bridgeCallback.apiVersion !== evt.data.apiVersion
         ) return;
 
-        var isPublicationBridgeV3 =
-          evt.data.apiVersion === PUBLICATION_BRIDGE_API_VERSION_V3;
-        if (isPublicationBridgeV3) {
-          if (bridgeCallback.timeoutId !== undefined) {
-            clearTimeout(bridgeCallback.timeoutId);
-          }
-          delete bridgeEventCb[callbackKey];
-        }
-
         if (evt.data.ok) {
           bridgeCallback.callback(null, evt.data.result);
         } else {
@@ -290,9 +278,7 @@
             message: 'Bridge request failed',
           });
         }
-        if (!isPublicationBridgeV3) {
-          delete bridgeEventCb[callbackKey];
-        }
+        delete bridgeEventCb[callbackKey];
         return;
       }
 
