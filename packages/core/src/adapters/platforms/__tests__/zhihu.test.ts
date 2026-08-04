@@ -53,6 +53,37 @@ describe('ZhihuAdapter account binding', () => {
       ],
     })
     expect(adapter.meta.capabilities).toContain('account_binding')
+    expect(adapter.openPublicationDraft).toBeTypeOf('function')
+  })
+
+  it('opens only the canonical editor URL for the current account', async () => {
+    const create = vi.fn().mockResolvedValue({ id: 42 })
+    const runtime = createRuntime(async (url) => {
+      expect(url).toBe('https://www.zhihu.com/api/v4/me')
+      return jsonResponse({ id: ACCOUNT_ID, name: 'Test account' })
+    })
+    runtime.tabs = {
+      query: vi.fn(),
+      create,
+      remove: vi.fn(),
+      waitForLoad: vi.fn(),
+      executeScript: vi.fn(),
+    }
+    const adapter = new ZhihuAdapter()
+    await adapter.init(runtime)
+
+    await expect(
+      adapter.openPublicationDraft({
+        requestId: 'open-zhihu',
+        platform: 'zhihu',
+        externalAccountId: ACCOUNT_ID,
+        platformPostId: '2067551877672219379',
+      }),
+    ).resolves.toEqual({ opened: true })
+    expect(create).toHaveBeenCalledWith(
+      'https://zhuanlan.zhihu.com/p/2067551877672219379/edit',
+      true,
+    )
   })
 
   it('rejects a stale binding before the first platform write', async () => {

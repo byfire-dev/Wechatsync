@@ -253,6 +253,50 @@ describe('injected publication Bridge v3 API', () => {
     )
   })
 
+  it('returns a relay transport failure immediately and clears the pending request', () => {
+    const { clearTimeoutMock, listeners, location, postMessage, windowObject } =
+      createInjectedApiHarness()
+    const poster = windowObject.$poster as {
+      callPublicationBridgeV3(
+        request: Record<string, unknown>,
+        cb: (error: unknown, response?: unknown) => void
+      ): void
+    }
+    const callback = vi.fn()
+
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      callback,
+    )
+    listeners[0]?.({
+      source: windowObject,
+      origin: location.origin,
+      data: {
+        namespace: 'byfire.publication-bridge',
+        direction: 'TRANSPORT_ERROR',
+        protocolMajor: 3,
+        requestId: publicationBridgeV3NegotiationRequestFixture.requestId,
+        command: publicationBridgeV3NegotiationRequestFixture.command,
+        error: {
+          code: 'BRIDGE_RUNTIME_ERROR',
+          message: 'The Publication Bridge transport failed.',
+        },
+      },
+    })
+
+    expect(callback).toHaveBeenCalledWith({
+      code: 'BRIDGE_RUNTIME_ERROR',
+      message: 'The Publication Bridge transport failed.',
+    })
+    expect(clearTimeoutMock).toHaveBeenCalledTimes(1)
+
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      vi.fn(),
+    )
+    expect(postMessage).toHaveBeenCalledTimes(2)
+  })
+
   it('rejects malformed requests and duplicate pending request IDs', () => {
     const { postMessage, windowObject } = createInjectedApiHarness()
     const poster = windowObject.$poster as {
@@ -295,6 +339,40 @@ describe('injected publication Bridge v3 API', () => {
       message: 'Publication Bridge request is invalid.',
     })
     expect(postMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('uses a 40 second transport timeout only for publication inspection', () => {
+    const { setTimeoutMock, windowObject } = createInjectedApiHarness()
+    const poster = windowObject.$poster as {
+      callPublicationBridgeV3(
+        request: Record<string, unknown>,
+        cb: (error: unknown, response?: unknown) => void
+      ): void
+    }
+
+    poster.callPublicationBridgeV3(
+      publicationBridgeV3NegotiationRequestFixture,
+      vi.fn(),
+    )
+    poster.callPublicationBridgeV3(
+      {
+        ...publicationBridgeV3NegotiationRequestFixture,
+        requestId: 'req-inspect-transport-timeout',
+        command: 'publication.inspect',
+      },
+      vi.fn(),
+    )
+
+    expect(setTimeoutMock).toHaveBeenNthCalledWith(
+      1,
+      expect.any(Function),
+      30000,
+    )
+    expect(setTimeoutMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(Function),
+      40000,
+    )
   })
 
   it('ignores foreign or mismatched responses, then times out and cleans up', () => {

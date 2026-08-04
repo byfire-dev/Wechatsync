@@ -1,14 +1,20 @@
-import type { Article, PlatformAdapter, SyncResult } from "@wechatsync/core";
+import type {
+  AdapterAccountProbe,
+  AdapterOperationContext,
+  Article,
+  PlatformAdapter,
+  SyncResult,
+} from "@wechatsync/core";
 import {
   PublicationInspectionRequestSchema,
   PublicationPublishedProofSchema,
   derivePublicationPublicIdentity,
   parsePublicationUrl,
   type PublicationInspectionObservation,
+  type PublicationInspectionPublicAccess,
   type PublicationInspectionRequest,
 } from "@wechatsync/core/publication-inspection";
 import {
-  PUBLICATION_BRIDGE_CONTRACT_VERSION,
   PUBLICATION_BRIDGE_NAMESPACE,
   PUBLICATION_BRIDGE_PROTOCOL_MAJOR,
   SUPPORTED_PUBLICATION_BRIDGE_CONTRACT_VERSIONS,
@@ -20,9 +26,11 @@ import {
   PublicationBridgeV3NegotiationExchangeSchema,
   PublicationBridgeV3PublishDraftPayloadSchema,
   PublicationBridgeV3PublishOperationSnapshotSchema,
+  PublicationBridgeV3PublicAccessSchema,
   PublicationBridgeV3RequestSchema,
   PublicationBridgeV3ResponseSchema,
   PublicationBridgeV3RuntimeSnapshotSchema,
+  SupportedBridgeV3ContractVersionSchema,
   canonicalizePublicationBridgeV3PublishPayload,
   getPublicationBridgeV3CommandPolicy,
   publicationBridgeV3RuntimeSnapshotsEqual,
@@ -37,9 +45,11 @@ import {
   type PublicationBridgeV3PublishDraftPayload,
   type PublicationBridgeV3PublishOperationSnapshot,
   type PublicationBridgeV3PublishTargetSnapshot,
+  type PublicationBridgeV3PublicAccess,
   type PublicationBridgeV3Request,
   type PublicationBridgeV3Response,
   type PublicationBridgeV3RuntimeSnapshot,
+  type PublicationBridgeV3NegotiationResult,
 } from "@byfire-dev/publication-bridge-contract/v3";
 
 import {
@@ -49,15 +59,26 @@ import {
   type PublicationBridgeV3PlatformId,
 } from "../bridge/publication-capabilities-v3";
 import { runOpenPublicationDraft } from "./bridge-v2";
-import { runInternalPublicationInspection } from "./publication-inspection-runner";
+import {
+  isPublicationInspectionTimeoutError,
+  runInternalPublicationInspection,
+  withPublicationInspectionDeadline,
+} from "./publication-inspection-runner";
 
 const STORAGE_KEY = "publicationBridgeV3State";
 const MAX_SESSIONS = 32;
-const ACCOUNT_PROBE_TIMEOUT_MS = 12_000;
-const INSPECTION_TIMEOUT_MS = 12_000;
+const ACCOUNT_PROBE_TIMEOUT_MS = 8_000;
+const KNOWN_PUBLIC_INSPECTION_TIMEOUT_MS = 18_000;
+const DISCOVERY_INSPECTION_TIMEOUT_MS = 22_000;
+const INSPECTION_COMMAND_RESERVE_MS = 2_000;
+const INSPECTION_COMMAND_TIMEOUT_MS =
+  ACCOUNT_PROBE_TIMEOUT_MS +
+  DISCOVERY_INSPECTION_TIMEOUT_MS +
+  INSPECTION_COMMAND_RESERVE_MS;
 
 interface StoredSession {
   createdAt: string;
+  contractVersion: PublicationBridgeV3NegotiationResult["selectedContractVersion"];
   runtime: PublicationBridgeV3RuntimeSnapshot;
 }
 
@@ -113,9 +134,19 @@ function parseStoredState(value: unknown): StoredBridgeState {
       const runtime = PublicationBridgeV3RuntimeSnapshotSchema.safeParse(
         candidate.runtime,
       );
-      if (runtime.success && Number.isFinite(Date.parse(candidate.createdAt))) {
+      // Sessions created by 2.0.32 and earlier did not persist the negotiated
+      // version; they can only have spoken the legacy 3.0 wire contract.
+      const contractVersion = SupportedBridgeV3ContractVersionSchema.safeParse(
+        candidate.contractVersion ?? "3.0",
+      );
+      if (
+        runtime.success &&
+        contractVersion.success &&
+        Number.isFinite(Date.parse(candidate.createdAt))
+      ) {
         state.sessions[sessionId] = {
           createdAt: candidate.createdAt,
+          contractVersion: contractVersion.data,
           runtime: runtime.data,
         };
       }
@@ -211,6 +242,28 @@ function safeMessage(value: string | undefined, fallback: string): string {
   return (normalized || fallback).slice(0, 500);
 }
 
+/**
+ * Project the internal inspection-domain access evidence into the versioned
+ * Bridge v3 wire contract. Internal adapters intentionally use stable
+ * UPPER_SNAKE_CASE reason codes, while v3 requires namespaced lower-case
+ * codes. Keep that translation at this contract boundary so v2 and future
+ * adapters can retain their internal vocabulary without leaking it onto the
+ * v3 wire.
+ */
+function projectPublicAccessV3(
+  value: PublicationInspectionPublicAccess,
+): PublicationBridgeV3PublicAccess | null {
+  const projected = PublicationBridgeV3PublicAccessSchema.safeParse(
+    value.status === "CONFIRMED"
+      ? value
+      : {
+          ...value,
+          reasonCode: adapterCode(value.reasonCode, "public-access-blocked"),
+        },
+  );
+  return projected.success ? projected.data : null;
+}
+
 function toArticle(payload: PublicationBridgeV3PublishDraftPayload): Article {
   const { draft } = payload;
   const isHtml = draft.contentFormat === "HTML";
@@ -227,7 +280,8 @@ function stableSuccessfulLocator(
   platform: string,
   result: SyncResult,
 ): { draftReference: string } | { platformPostId: string } | null {
-  const schema = platform === "weixin" ? DraftReferenceSchema : PlatformPostIdSchema;
+  const schema =
+    platform === "weixin" ? DraftReferenceSchema : PlatformPostIdSchema;
   const parsed = schema.safeParse((result as { postId?: unknown }).postId);
   if (!parsed.success) return null;
   return platform === "weixin"
@@ -295,22 +349,6 @@ function interruptedAfterDispatch(
       "REVIEW_MANUALLY",
     ),
   };
-}
-
-function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("TIMEOUT")), timeoutMs);
-    operation.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
 }
 
 export class PublicationBridgeV3Coordinator {
@@ -497,10 +535,7 @@ export class PublicationBridgeV3Coordinator {
     const currentRuntime = await this.runtime();
     const state = await this.exclusive(() => this.ensureState());
     const session = state.sessions[request.sessionId];
-    if (
-      !session ||
-      request.contractVersion !== PUBLICATION_BRIDGE_CONTRACT_VERSION
-    ) {
+    if (!session || request.contractVersion !== session.contractVersion) {
       return {
         ok: false,
         response: this.commandFailure(
@@ -588,11 +623,13 @@ export class PublicationBridgeV3Coordinator {
       { command: "bridge.negotiate" }
     >,
   ): Promise<PublicationBridgeV3Response> {
-    const selected = selectPublicationBridgeContractVersion(
-      request.supportedContractVersions,
-      SUPPORTED_PUBLICATION_BRIDGE_CONTRACT_VERSIONS,
+    const selected = SupportedBridgeV3ContractVersionSchema.safeParse(
+      selectPublicationBridgeContractVersion(
+        request.supportedContractVersions,
+        SUPPORTED_PUBLICATION_BRIDGE_CONTRACT_VERSIONS,
+      ),
     );
-    if (!selected) {
+    if (!selected.success) {
       return this.finalize(request, {
         namespace: PUBLICATION_BRIDGE_NAMESPACE,
         direction: "RESPONSE",
@@ -616,6 +653,7 @@ export class PublicationBridgeV3Coordinator {
       const state = await this.ensureState();
       state.sessions[sessionId] = {
         createdAt: this.now().toISOString(),
+        contractVersion: selected.data,
         runtime,
       };
       await this.persist();
@@ -628,29 +666,46 @@ export class PublicationBridgeV3Coordinator {
       command: "bridge.negotiate",
       requestId: request.requestId,
       ok: true,
-      result: { selectedContractVersion: selected, sessionId, runtime },
+      result: { selectedContractVersion: selected.data, sessionId, runtime },
     });
   }
 
   private async probeAccount(
     platform: string,
     expectedExternalAccountId?: string,
+    context?: AdapterOperationContext,
+    onVerifiedProbe?: (probe: AdapterAccountProbe) => void,
   ): Promise<PublicationBridgeV3AccountProbe> {
-    const adapter = await this.dependencies.getAdapter(platform);
-    if (!adapter?.probeAccounts) {
-      return {
-        platform,
-        status: "UNAVAILABLE",
-        reasonCode: "adapter.account-identity-unavailable",
-        requiredUserAction: "OPEN_PLATFORM",
-      };
-    }
-
     try {
-      const probe = await withTimeout(
-        adapter.probeAccounts(),
-        ACCOUNT_PROBE_TIMEOUT_MS,
+      const resolution = await withPublicationInspectionDeadline(
+        async (signal, deadlineAt) => {
+          const adapter = await this.dependencies.getAdapter(platform);
+          if (!adapter?.probeAccounts) {
+            return { kind: "UNAVAILABLE" as const };
+          }
+          const probe = await adapter.probeAccounts({
+            ...context,
+            signal,
+            deadlineAt,
+          });
+          return { kind: "PROBE" as const, probe };
+        },
+        {
+          timeoutMs: ACCOUNT_PROBE_TIMEOUT_MS,
+          phase: "ACCOUNT_PROBE",
+          parentSignal: context?.signal,
+          deadlineAt: context?.deadlineAt,
+        },
       );
+      if (resolution.kind === "UNAVAILABLE") {
+        return {
+          platform,
+          status: "UNAVAILABLE",
+          reasonCode: "adapter.account-identity-unavailable",
+          requiredUserAction: "OPEN_PLATFORM",
+        };
+      }
+      const probe = resolution.probe;
       if (probe.status === "NOT_AUTHENTICATED") {
         return {
           platform,
@@ -669,6 +724,7 @@ export class PublicationBridgeV3Coordinator {
           requiredUserAction: "REVIEW_MANUALLY",
         };
       }
+      onVerifiedProbe?.(probe);
       const selected = expectedExternalAccountId
         ? probe.accounts.find(
             (account) =>
@@ -703,11 +759,13 @@ export class PublicationBridgeV3Coordinator {
             : {}),
         },
       };
-    } catch {
+    } catch (error) {
       return {
         platform,
         status: "UNAVAILABLE",
-        reasonCode: "adapter.account-probe-failed",
+        reasonCode: isPublicationInspectionTimeoutError(error)
+          ? "adapter.account-probe-timeout"
+          : "adapter.account-probe-failed",
         requiredUserAction: "REVIEW_MANUALLY",
       };
     }
@@ -954,64 +1012,66 @@ export class PublicationBridgeV3Coordinator {
 
     try {
       const currentRuntime = await this.runtime();
-      const start = await this.exclusive(async (): Promise<
-        | { kind: "MISSING" }
-        | {
-            kind: "COMPLETED";
-            operation: PublicationBridgeV3PublishOperationSnapshot;
-          }
-        | { kind: "RUN"; task: StoredPublishTask }
-      > => {
-        const state = await this.ensureState();
-        const operation = state.operations[operationId];
-        const storedTask = state.tasks[operationId];
-        if (!operation || !storedTask || operation.state === "COMPLETED")
-          return { kind: "MISSING" };
+      const start = await this.exclusive(
+        async (): Promise<
+          | { kind: "MISSING" }
+          | {
+              kind: "COMPLETED";
+              operation: PublicationBridgeV3PublishOperationSnapshot;
+            }
+          | { kind: "RUN"; task: StoredPublishTask }
+        > => {
+          const state = await this.ensureState();
+          const operation = state.operations[operationId];
+          const storedTask = state.tasks[operationId];
+          if (!operation || !storedTask || operation.state === "COMPLETED")
+            return { kind: "MISSING" };
 
-        if (
-          !publicationBridgeV3RuntimeSnapshotsEqual(
-            operation.runtime,
-            currentRuntime,
-          )
-        ) {
-          const completedAt = this.now().toISOString();
-          const completed =
+          if (
+            !publicationBridgeV3RuntimeSnapshotsEqual(
+              operation.runtime,
+              currentRuntime,
+            )
+          ) {
+            const completedAt = this.now().toISOString();
+            const completed =
+              PublicationBridgeV3PublishOperationSnapshotSchema.parse({
+                ...operation,
+                state: "COMPLETED",
+                targets: operation.targets.map((target) =>
+                  target.outcome === "PENDING"
+                    ? terminalFailure(
+                        target,
+                        bridgeError(
+                          "publication.runtime-changed-before-dispatch",
+                          "CAPABILITY",
+                          "The producer runtime changed before dispatch; start a new publication operation.",
+                          "SAFE_TO_RETRY",
+                          "RETRY",
+                        ),
+                      )
+                    : target,
+                ),
+                updatedAt: completedAt,
+                completedAt,
+              });
+            state.operations[operationId] = completed;
+            delete state.tasks[operationId];
+            await this.persist();
+            return { kind: "COMPLETED", operation: completed };
+          }
+
+          const updatedAt = this.now().toISOString();
+          state.operations[operationId] =
             PublicationBridgeV3PublishOperationSnapshotSchema.parse({
               ...operation,
-              state: "COMPLETED",
-              targets: operation.targets.map((target) =>
-                target.outcome === "PENDING"
-                  ? terminalFailure(
-                      target,
-                      bridgeError(
-                        "publication.runtime-changed-before-dispatch",
-                        "CAPABILITY",
-                        "The producer runtime changed before dispatch; start a new publication operation.",
-                        "SAFE_TO_RETRY",
-                        "RETRY",
-                      ),
-                    )
-                  : target,
-              ),
-              updatedAt: completedAt,
-              completedAt,
+              state: "RUNNING",
+              updatedAt,
             });
-          state.operations[operationId] = completed;
-          delete state.tasks[operationId];
           await this.persist();
-          return { kind: "COMPLETED", operation: completed };
-        }
-
-        const updatedAt = this.now().toISOString();
-        state.operations[operationId] =
-          PublicationBridgeV3PublishOperationSnapshotSchema.parse({
-            ...operation,
-            state: "RUNNING",
-            updatedAt,
-          });
-        await this.persist();
-        return { kind: "RUN", task: storedTask };
-      });
+          return { kind: "RUN", task: storedTask };
+        },
+      );
       if (start.kind === "MISSING") return null;
       if (start.kind === "COMPLETED") return start.operation;
       const task = start.task;
@@ -1134,9 +1194,7 @@ export class PublicationBridgeV3Coordinator {
                   : {}),
                 error: bridgeError(
                   "publication.outcome-unknown",
-                  resultErrorCode?.includes("TIMEOUT")
-                    ? "TIMEOUT"
-                    : "ADAPTER",
+                  resultErrorCode?.includes("TIMEOUT") ? "TIMEOUT" : "ADAPTER",
                   "A platform write was dispatched without a fully proven terminal result.",
                   "DO_NOT_RETRY",
                   "REVIEW_MANUALLY",
@@ -1266,21 +1324,51 @@ export class PublicationBridgeV3Coordinator {
           request.payload.locator.publicUrl,
         )
       : null;
+    const knownPublicIdentity = request.payload.locator.publicUrl
+      ? derivePublicationPublicIdentity(
+          request.payload.platform as PublicationBridgeV3PlatformId,
+          request.payload.locator.publicUrl,
+        )
+      : null;
+    if (
+      request.payload.locator.publicUrl &&
+      (!knownPublicIdentity ||
+        knownPublicIdentity.canonicalUrl !==
+          request.payload.locator.publicUrl ||
+        knownPublicIdentity.key !== request.payload.locator.publicIdentityKey)
+    ) {
+      return null;
+    }
     const platformPostId =
       request.payload.locator.platformPostId ??
       request.payload.locator.draftReference ??
       parsedPublicUrl?.postId;
     if (!platformPostId) return null;
 
+    const publishedNotBefore =
+      request.contractVersion === "3.1"
+        ? request.payload.publicationWindow?.publishedNotBefore
+        : undefined;
     const candidate = PublicationInspectionRequestSchema.safeParse({
       requestId: request.requestId,
       platform: request.payload.platform,
       externalAccountId: request.payload.requestedExternalAccountId,
       draft: {
         platformPostId,
-        draftedAt: new Date(0).toISOString(),
+        draftedAt: publishedNotBefore ?? new Date(0).toISOString(),
       },
-      articleHint: { title: `Stable locator ${platformPostId}` },
+      articleHint: {
+        title: `Stable locator ${platformPostId}`,
+        ...(publishedNotBefore ? { publishedAfter: publishedNotBefore } : {}),
+      },
+      ...(knownPublicIdentity
+        ? {
+            knownPublicLocator: {
+              publicUrl: knownPublicIdentity.canonicalUrl,
+              publicIdentityKey: knownPublicIdentity.key,
+            },
+          }
+        : {}),
       limit: 20,
     });
     return candidate.success ? candidate.data : null;
@@ -1311,12 +1399,14 @@ export class PublicationBridgeV3Coordinator {
       const proof = PublicationPublishedProofSchema.safeParse(
         adapter.provePublishedObservation(internalRequest, observation),
       );
+      if (!proof.success) return null;
+      const publicAccess = projectPublicAccessV3(proof.data.publicAccess);
       const identity = derivePublicationPublicIdentity(
         request.payload.platform as PublicationBridgeV3PlatformId,
         observation.canonicalUrl,
       );
       if (
-        !proof.success ||
+        !publicAccess ||
         !identity ||
         proof.data.observedAuthorExternalAccountId !==
           request.payload.requestedExternalAccountId ||
@@ -1349,7 +1439,7 @@ export class PublicationBridgeV3Coordinator {
         publicIdentityKey: identity.key,
         publishedAt: observation.publishedAt,
         observedExternalAccountId: proof.data.observedAuthorExternalAccountId,
-        publicAccess: proof.data.publicAccess,
+        publicAccess,
         title: observation.title.trim(),
         body: observation.bodyText,
         bodyTruncated: proof.data.bodyTruncated,
@@ -1499,6 +1589,49 @@ export class PublicationBridgeV3Coordinator {
     >,
     runtime: PublicationBridgeV3RuntimeSnapshot,
   ): Promise<PublicationBridgeV3Response> {
+    try {
+      return await withPublicationInspectionDeadline(
+        (signal, deadlineAt) =>
+          this.inspectPublicationWithinDeadline(
+            request,
+            runtime,
+            signal,
+            deadlineAt,
+          ),
+        {
+          timeoutMs: INSPECTION_COMMAND_TIMEOUT_MS,
+          phase: "COMMAND",
+        },
+      );
+    } catch (error) {
+      const timedOut = isPublicationInspectionTimeoutError(error);
+      return this.commandFailure(
+        request,
+        runtime,
+        bridgeError(
+          timedOut
+            ? "publication.inspection-timeout"
+            : "publication.inspection-failed",
+          timedOut ? "TIMEOUT" : "ADAPTER",
+          timedOut
+            ? "The platform inspection exceeded its end-to-end deadline."
+            : "The platform inspection failed unexpectedly.",
+          timedOut ? "SAFE_TO_RETRY" : "REVIEW_BEFORE_RETRY",
+          timedOut ? "RETRY" : "REVIEW_MANUALLY",
+        ),
+      );
+    }
+  }
+
+  private async inspectPublicationWithinDeadline(
+    request: Extract<
+      PublicationBridgeV3CommandRequest,
+      { command: "publication.inspect" }
+    >,
+    runtime: PublicationBridgeV3RuntimeSnapshot,
+    signal: AbortSignal,
+    commandDeadlineAt: number,
+  ): Promise<PublicationBridgeV3Response> {
     const adapterSnapshot = runtime.adapters.find(
       (candidate) => candidate.platform === request.payload.platform,
     );
@@ -1518,28 +1651,47 @@ export class PublicationBridgeV3Coordinator {
       );
     }
 
+    let verifiedAccountProbe: AdapterAccountProbe | undefined;
     const account = await this.probeAccount(
       request.payload.platform,
       request.payload.requestedExternalAccountId,
+      {
+        signal,
+        deadlineAt: commandDeadlineAt - INSPECTION_COMMAND_RESERVE_MS,
+      },
+      (probe) => {
+        verifiedAccountProbe = probe;
+      },
     );
     if (account.status !== "AVAILABLE") {
+      const accountTimedOut =
+        account.status === "UNAVAILABLE" &&
+        account.reasonCode === "adapter.account-probe-timeout";
       return this.commandFailure(
         request,
         runtime,
         bridgeError(
-          account.status === "LOGIN_REQUIRED"
-            ? "adapter.login-required"
-            : account.status === "ACCOUNT_MISMATCH"
-              ? "adapter.account-mismatch"
-              : "adapter.account-probe-failed",
-          "ADAPTER",
-          "The requested platform account is not available for inspection.",
-          "REVIEW_BEFORE_RETRY",
-          account.status === "LOGIN_REQUIRED"
-            ? "LOGIN"
-            : account.status === "ACCOUNT_MISMATCH"
-              ? "SWITCH_ACCOUNT"
-              : "REVIEW_MANUALLY",
+          accountTimedOut
+            ? "adapter.account-probe-timeout"
+            : account.status === "LOGIN_REQUIRED"
+              ? "adapter.login-required"
+              : account.status === "ACCOUNT_MISMATCH"
+                ? "adapter.account-mismatch"
+                : account.status === "UNAVAILABLE"
+                  ? account.reasonCode
+                  : "adapter.account-probe-failed",
+          accountTimedOut ? "TIMEOUT" : "ADAPTER",
+          accountTimedOut
+            ? "The platform account probe exceeded its deadline."
+            : "The requested platform account is not available for inspection.",
+          accountTimedOut ? "SAFE_TO_RETRY" : "REVIEW_BEFORE_RETRY",
+          accountTimedOut
+            ? "RETRY"
+            : account.status === "LOGIN_REQUIRED"
+              ? "LOGIN"
+              : account.status === "ACCOUNT_MISMATCH"
+                ? "SWITCH_ACCOUNT"
+                : "REVIEW_MANUALLY",
         ),
       );
     }
@@ -1565,20 +1717,32 @@ export class PublicationBridgeV3Coordinator {
     const inspection = await runInternalPublicationInspection(
       internalRequest,
       adapter,
-      { timeoutMs: INSPECTION_TIMEOUT_MS },
+      {
+        timeoutMs: request.payload.locator.publicUrl
+          ? KNOWN_PUBLIC_INSPECTION_TIMEOUT_MS
+          : DISCOVERY_INSPECTION_TIMEOUT_MS,
+        operationContext: {
+          signal,
+          verifiedAccountProbe,
+          deadlineAt: commandDeadlineAt - INSPECTION_COMMAND_RESERVE_MS,
+        },
+      },
     );
     if (!inspection.ok) {
+      const timedOut = inspection.code === "PUBLICATION_INSPECTION_TIMEOUT";
       return this.commandFailure(
         request,
         runtime,
         bridgeError(
-          adapterCode(inspection.code, "inspection-failed"),
-          inspection.code === "PUBLICATION_INSPECTION_TIMEOUT"
-            ? "TIMEOUT"
-            : "ADAPTER",
-          "The platform inspection could not produce trusted evidence.",
-          "REVIEW_BEFORE_RETRY",
-          "REVIEW_MANUALLY",
+          timedOut
+            ? "adapter.publication-inspection-timeout"
+            : adapterCode(inspection.code, "inspection-failed"),
+          timedOut ? "TIMEOUT" : "ADAPTER",
+          timedOut
+            ? "The platform adapter inspection exceeded its deadline."
+            : "The platform inspection could not produce trusted evidence.",
+          timedOut ? "SAFE_TO_RETRY" : "REVIEW_BEFORE_RETRY",
+          timedOut ? "RETRY" : "REVIEW_MANUALLY",
         ),
       );
     }
@@ -1615,6 +1779,9 @@ export class PublicationBridgeV3Coordinator {
         platform: request.payload.platform,
         requestedExternalAccountId: request.payload.requestedExternalAccountId,
         locator: request.payload.locator,
+        ...(request.payload.publicationWindow
+          ? { publicationWindow: request.payload.publicationWindow }
+          : {}),
         observations,
       },
     });

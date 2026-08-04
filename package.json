@@ -39,10 +39,5 @@
   },
   "dependencies": {
     "@modyfi/vite-plugin-yaml": "^1.1.1"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
   }
 }

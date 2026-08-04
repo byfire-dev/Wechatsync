@@ -140,6 +140,37 @@ describe("content publication Bridge v3 relay", () => {
     expect(chromeMock.runtime.sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("returns an immediate transport failure when the runtime response is invalid", async () => {
+    const windowObject = installContentGlobals();
+    chromeMock.runtime.sendMessage.mockImplementation(
+      (_message: unknown, callback?: (response: unknown) => void) => {
+        callback?.(undefined);
+      },
+    );
+    const handleRequest = await loadHandler();
+
+    await handleRequest({
+      source: windowObject,
+      origin: windowObject.location.origin,
+      data: publicationBridgeV3PublishRequestFixture,
+    } as unknown as MessageEvent);
+
+    expect(windowObject.postMessage).toHaveBeenCalledWith(
+      {
+        namespace: publicationBridgeV3PublishRequestFixture.namespace,
+        direction: "TRANSPORT_ERROR",
+        protocolMajor: publicationBridgeV3PublishRequestFixture.protocolMajor,
+        requestId: publicationBridgeV3PublishRequestFixture.requestId,
+        command: publicationBridgeV3PublishRequestFixture.command,
+        error: {
+          code: "BRIDGE_RUNTIME_ERROR",
+          message: "The Publication Bridge transport failed.",
+        },
+      },
+      windowObject.location.origin,
+    );
+  });
+
   it("rejects a foreign source or non-matching page origin before runtime I/O", async () => {
     const windowObject = installContentGlobals();
     const handleRequest = await loadHandler();

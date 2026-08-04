@@ -69,7 +69,54 @@ function accountPayload(groups: Array<{ accounts: unknown[] }>) {
 
 describe('SohuAdapter', () => {
   it('declares exact account binding as an internal capability', () => {
-    expect(new SohuAdapter().meta.capabilities).toContain('account_binding')
+    const adapter = new SohuAdapter()
+    expect(adapter.meta.capabilities).toContain('account_binding')
+    expect(adapter.openPublicationDraft).toBeTypeOf('function')
+  })
+
+  it('opens a draft under the exact requested Sohu sub-account', async () => {
+    const create = vi.fn().mockResolvedValue({ id: 88 })
+    const runtime = createRuntime({
+      fetch: vi.fn().mockResolvedValue(
+        jsonResponse(
+          accountPayload([
+            {
+              accounts: [
+                { id: ACCOUNT_ID, nickName: 'Primary', avatar: '' },
+                {
+                  id: SECOND_ACCOUNT_ID,
+                  nickName: 'Requested',
+                  avatar: '',
+                },
+              ],
+            },
+          ]),
+        ),
+      ),
+      getCookie: vi.fn().mockResolvedValue('test-sp-cm'),
+      tabs: {
+        query: vi.fn(),
+        create,
+        remove: vi.fn(),
+        waitForLoad: vi.fn(),
+        executeScript: vi.fn(),
+      },
+    })
+    const adapter = new SohuAdapter()
+    await adapter.init(runtime)
+
+    await expect(
+      adapter.openPublicationDraft({
+        requestId: 'open-sohu-sub-account',
+        platform: 'sohu',
+        externalAccountId: SECOND_ACCOUNT_ID,
+        platformPostId: POST_ID,
+      }),
+    ).resolves.toEqual({ opened: true })
+    expect(create).toHaveBeenCalledWith(
+      `https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle?spm=smmp.articlelist.0.0&contentStatus=2&id=${POST_ID}&accountId=${SECOND_ACCOUNT_ID}`,
+      true,
+    )
   })
 
   it('finds a usable account when the first account group is empty', async () => {

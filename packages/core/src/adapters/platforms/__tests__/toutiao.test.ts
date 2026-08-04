@@ -76,6 +76,35 @@ function numericAccountResponse(): Response {
 }
 
 describe("ToutiaoAdapter", () => {
+  it("opens only the canonical editor URL for the current account", async () => {
+    const create = vi.fn().mockResolvedValue({ id: 42 });
+    const runtime = createRuntime({
+      fetch: vi.fn().mockResolvedValue(accountResponse()),
+      tabs: {
+        query: vi.fn(),
+        create,
+        remove: vi.fn(),
+        waitForLoad: vi.fn(),
+        executeScript: vi.fn(),
+      },
+    });
+    const adapter = new ToutiaoAdapter();
+    await adapter.init(runtime);
+
+    await expect(
+      adapter.openPublicationDraft({
+        requestId: "open-toutiao",
+        platform: "toutiao",
+        externalAccountId: "7390000000000000001",
+        platformPostId: "7669620929504346651",
+      }),
+    ).resolves.toEqual({ opened: true });
+    expect(create).toHaveBeenCalledWith(
+      "https://mp.toutiao.com/profile_v4/graphic/publish?pgc_id=7669620929504346651",
+      true,
+    );
+  });
+
   it("returns a stable string account identity without exposing payloads", async () => {
     let probeSignal: AbortSignal | undefined;
     const runtime = createRuntime({
@@ -86,6 +115,8 @@ describe("ToutiaoAdapter", () => {
     });
     const adapter = new ToutiaoAdapter();
     await adapter.init(runtime);
+
+    expect(adapter.openPublicationDraft).toBeTypeOf("function");
 
     await expect(adapter.checkAuth()).resolves.toEqual({
       isAuthenticated: true,

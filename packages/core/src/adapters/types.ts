@@ -202,6 +202,19 @@ export interface PlatformAccountBinding extends AdapterAccountBinding {
  */
 export interface AdapterOperationContext {
   signal?: AbortSignal
+
+  /**
+   * Absolute Unix epoch deadline for the current adapter phase. Nested work
+   * must only shorten this deadline and must not start a fresh relative timer.
+   */
+  deadlineAt?: number
+
+  /**
+   * Fresh account evidence produced by the trusted coordinator for this same
+   * operation. Adapters may reuse it to avoid probing the platform twice, but
+   * must still bind the requested external account before using it.
+   */
+  verifiedAccountProbe?: AdapterAccountProbe
 }
 
 /**

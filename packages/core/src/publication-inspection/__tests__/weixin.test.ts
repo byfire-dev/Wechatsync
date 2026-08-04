@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
+import freePublishPublishedListFixture from '../__fixtures__/weixin-appmsgpublish-freepublish-success-sanitized.json'
 import massSendPublishedListFixture from '../__fixtures__/weixin-appmsgpublish-masssend.json'
 import { WEIXIN_APP_MSG_ID_MAX_LENGTH } from '../types'
 import {
   WEIXIN_DRAFT_BODY_TEXT_LIMIT,
+  buildWeixinDraftListRequest,
   buildWeixinPublishedListRequest,
   buildWeixinTempUrlRequest,
   classifyWeixinTempUrl,
@@ -11,13 +13,16 @@ import {
   normalizeWeixinLongPublicArticleUrl,
   normalizeWeixinPublicArticleUrl,
   parseWeixinDraftHtml,
+  parseWeixinDraftListPayload,
   parseWeixinPublishedListPayload,
   parseWeixinPublicArticleHtml,
+  parseWeixinPublicArticlePublishedAt,
   parseWeixinTempUrlPayload,
   resolveWeixinAppMsgId,
   resolveWeixinTempUrl,
   validateWeixinPublicPageResponse,
   validateWeixinTempUrl,
+  WEIXIN_PUBLIC_PAGE_MAX_BYTES,
   WEIXIN_PUBLIC_PAGE_MAX_REDIRECTS,
 } from '../weixin'
 
@@ -176,6 +181,85 @@ describe('WeChat publication-inspection helpers', () => {
     })
   })
 
+  it.each([10, 77] as const)(
+    'builds the authenticated current-draft list_card request for type %s',
+    (type) => {
+      const url = new URL(buildWeixinDraftListRequest('fresh-token', type))
+      expect(url.origin + url.pathname).toBe(
+        'https://mp.weixin.qq.com/cgi-bin/appmsg',
+      )
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        begin: '0',
+        count: '20',
+        type: String(type),
+        action: 'list_card',
+        token: 'fresh-token',
+        lang: 'zh_CN',
+        f: 'json',
+        ajax: '1',
+      })
+    },
+  )
+
+  it.each([
+    ['string app_id', '0009001'],
+    ['numeric app_id', 9001],
+    ['JSON-encoded item list', JSON.stringify([{ app_id: '9001' }])],
+  ])('matches exact current-draft membership from a %s', (_name, item) => {
+    expect(
+      parseWeixinDraftListPayload(
+        {
+          base_resp: { ret: 0 },
+          app_msg_info: {
+            item:
+              typeof item === 'string' && item.startsWith('[')
+                ? item
+                : [{ app_id: item }],
+          },
+        },
+        '9001',
+      ),
+    ).toEqual({ success: true, match: 'DRAFT_PRESENT' })
+  })
+
+  it('does not confuse another current draft with the requested appMsgId', () => {
+    expect(
+      parseWeixinDraftListPayload(
+        {
+          base_resp: { ret: 0 },
+          app_msg_info: { item: [{ app_id: '90010' }, { app_id: 8999 }] },
+        },
+        '9001',
+      ),
+    ).toEqual({ success: true, match: 'NOT_FOUND' })
+  })
+
+  it('fails closed on draft-list API and shape errors without leaking values', () => {
+    expect(
+      parseWeixinDraftListPayload(
+        { base_resp: { ret: 200013, err_msg: 'secret-token' } },
+        '9001',
+      ),
+    ).toEqual({
+      success: false,
+      errorCode: 'WEIXIN_DRAFT_LIST_API_ERROR',
+    })
+
+    const malformed = parseWeixinDraftListPayload(
+      {
+        base_resp: { ret: 0 },
+        app_msg_info: { item: [{ app_id: 'secret-draft-id' }] },
+      },
+      '9001',
+    )
+    expect(malformed).toMatchObject({
+      success: false,
+      errorCode: 'WEIXIN_DRAFT_LIST_RECORD_INVALID',
+    })
+    expect(JSON.stringify(malformed)).not.toContain('secret-draft-id')
+    expect(JSON.stringify(malformed)).not.toContain('secret-token')
+  })
+
   it('matches a free-publish record by nested draft_msgid, not public mid', () => {
     const result = parseWeixinPublishedListPayload(
       {
@@ -214,6 +298,406 @@ describe('WeChat publication-inspection helpers', () => {
     })
   })
 
+  it('matches the schema-only sanitized free-publish fixture by exact draft ID', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        freePublishPublishedListFixture,
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'PUBLISHED',
+      canonicalUrl:
+        'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777000001&idx=1',
+      publishedAt: '2024-07-03T09:46:40.000Z',
+    })
+    expect(
+      parseWeixinPublishedListPayload(
+        freePublishPublishedListFixture,
+        '900000002',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 1,
+      totalCount: 1,
+      newestPublishedAt: '2024-07-03T09:46:40.000Z',
+      oldestPublishedAt: '2024-07-03T09:46:40.000Z',
+    })
+    expect(JSON.stringify(freePublishPublishedListFixture)).not.toMatch(
+      /"(title|author|digest|content|token|ticket|user_name)"\s*:/i,
+    )
+  })
+
+  it.each(['', '   '])(
+    'uses an empty publish_info sentinel with exact inline free-publish evidence: %j',
+    (publishInfo) => {
+      expect(
+        parseWeixinPublishedListPayload(
+          {
+            publish_page: {
+              total_count: 1,
+              publish_list: [
+                {
+                  publish_info: publishInfo,
+                  draft_msgid: '900000001',
+                  publish_status: 200,
+                  create_time: 1_720_000_000,
+                  appmsgex: [
+                    {
+                      itemidx: 1,
+                      content_url: WEIXIN_LONG_A,
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          '900000001',
+          0,
+          10,
+        ),
+      ).toEqual({
+        success: true,
+        match: 'PUBLISHED',
+        canonicalUrl: WEIXIN_LONG_A,
+        publishedAt: '2024-07-03T09:46:40.000Z',
+      })
+    },
+  )
+
+  it.each(['', '   '])(
+    'uses an empty nested publish_info sentinel with exact outer free-publish evidence: %j',
+    (nestedPublishInfo) => {
+      expect(
+        parseWeixinPublishedListPayload(
+          {
+            publish_page: {
+              total_count: 1,
+              publish_list: [
+                {
+                  publish_info: {
+                    publish_info: nestedPublishInfo,
+                    draft_msgid: '900000001',
+                    publish_status: 200,
+                    create_time: 1_720_000_000,
+                    appmsgex: [{ itemidx: 1, content_url: WEIXIN_LONG_A }],
+                  },
+                },
+              ],
+            },
+          },
+          '900000001',
+          0,
+          10,
+        ),
+      ).toEqual({
+        success: true,
+        match: 'PUBLISHED',
+        canonicalUrl: WEIXIN_LONG_A,
+        publishedAt: '2024-07-03T09:46:40.000Z',
+      })
+    },
+  )
+
+  it('keeps exact outer identity with an empty nested sentinel and incomplete evidence in manual review', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: {
+                  publish_info: '',
+                  draft_msgid: '900000001',
+                  publish_status: 200,
+                  create_time: 1_720_000_000,
+                  appmsgex: [
+                    {
+                      itemidx: 1,
+                      content_url: 'https://attacker.example/private-target',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({ success: true, match: 'REVIEW_REQUIRED' })
+  })
+
+  it('does not match an empty nested sentinel without an outer identity', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: {
+                  publish_info: '',
+                  publish_status: 200,
+                  create_time: 1_720_000_000,
+                  appmsgex: [{ itemidx: 1, content_url: WEIXIN_LONG_A }],
+                },
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 1,
+      totalCount: 1,
+      newestPublishedAt: '2024-07-03T09:46:40.000Z',
+      oldestPublishedAt: '2024-07-03T09:46:40.000Z',
+    })
+  })
+
+  it('uses an empty publish_info sentinel with exact inline mass-send evidence', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '',
+                copy_appmsg_id: '900000001',
+                sent_result: { msg_status: 2 },
+                sent_info: { time: 1_720_000_000 },
+                appmsgex: [{ itemidx: 1, content_url: WEIXIN_LONG_A }],
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'PUBLISHED',
+      canonicalUrl: WEIXIN_LONG_A,
+      publishedAt: '2024-07-03T09:46:40.000Z',
+    })
+  })
+
+  it('keeps exact inline identity with incomplete evidence in manual review', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '',
+                draft_msgid: '900000001',
+                publish_status: 200,
+                create_time: 1_720_000_000,
+                appmsgex: [
+                  {
+                    itemidx: 1,
+                    content_url: 'https://attacker.example/private-target',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({ success: true, match: 'REVIEW_REQUIRED' })
+  })
+
+  it('treats an empty publish_info sentinel with another valid inline identity as non-matching', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '',
+                draft_msgid: '900000002',
+                publish_status: 200,
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 1,
+      totalCount: 1,
+    })
+  })
+
+  it('skips an empty published-list placeholder without treating article IDs as draft identity', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '',
+                appmsg_info: [{ itemidx: 1, appmsgid: '900000001' }],
+                appmsgex: [{ itemidx: 1, content_url: WEIXIN_LONG_A }],
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({ success: true, match: 'NOT_FOUND', hasMore: false })
+  })
+
+  it('treats a full page of empty placeholders as the terminal page even when total_count remains larger', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 11,
+            publish_list: Array.from({ length: 10 }, () => ({
+              publish_info: '',
+            })),
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({ success: true, match: 'NOT_FOUND', hasMore: false })
+  })
+
+  it('keeps pagination when a page mixes empty placeholders with materialized records', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 3,
+            publish_list: [
+              { publish_info: '' },
+              { publish_info: { draft_msgid: '900000002' } },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 1,
+      totalCount: 3,
+    })
+  })
+
+  it('lets a nonzero cursor terminate on a full placeholder page before advisory count checks', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 10,
+            publish_list: Array.from({ length: 10 }, () => ({
+              publish_info: '',
+            })),
+          },
+        },
+        '900000001',
+        10,
+        10,
+      ),
+    ).toEqual({ success: true, match: 'NOT_FOUND', hasMore: false })
+  })
+
+  it.each(['before', 'after'] as const)(
+    'continues scanning when an empty placeholder appears $position an exact record',
+    (position) => {
+      const placeholder = { publish_info: '' }
+      const exactRecord = {
+        publish_info: {
+          publish_info: {
+            draft_msgid: '900000001',
+            publish_status: 200,
+            create_time: 1_720_000_000,
+          },
+          appmsgex: [{ itemidx: 1, content_url: WEIXIN_LONG_A }],
+        },
+      }
+      expect(
+        parseWeixinPublishedListPayload(
+          {
+            publish_page: {
+              total_count: 2,
+              publish_list:
+                position === 'before'
+                  ? [placeholder, exactRecord]
+                  : [exactRecord, placeholder],
+            },
+          },
+          '900000001',
+          0,
+          10,
+        ),
+      ).toEqual({
+        success: true,
+        match: 'PUBLISHED',
+        canonicalUrl: WEIXIN_LONG_A,
+        publishedAt: '2024-07-03T09:46:40.000Z',
+      })
+    },
+  )
+
+  it('fails closed for an empty publish_info sentinel with an invalid identity', () => {
+    const result = parseWeixinPublishedListPayload(
+      {
+        publish_page: {
+          total_count: 1,
+          publish_list: [{ publish_info: '', draft_msgid: 'secret-draft-id' }],
+        },
+      },
+      '900000001',
+      0,
+      10,
+    )
+
+    expect(result).toEqual({
+      success: false,
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_INFO_INVALID',
+      shapeFingerprint:
+        'wx-list-row:v2;publish_info=string:empty;inline_identity=invalid',
+    })
+    expect(JSON.stringify(result)).not.toMatch(/secret|900000001/i)
+  })
+
   it('does not accept IDs or links from unrelated nested metadata', () => {
     expect(
       parseWeixinPublishedListPayload(
@@ -246,7 +730,11 @@ describe('WeChat publication-inspection helpers', () => {
     ).toEqual({
       success: true,
       match: 'NOT_FOUND',
-      hasMore: false,
+      hasMore: true,
+      nextBegin: 1,
+      totalCount: 1,
+      newestPublishedAt: '2024-07-03T09:46:40.000Z',
+      oldestPublishedAt: '2024-07-03T09:46:40.000Z',
     })
   })
 
@@ -267,8 +755,8 @@ describe('WeChat publication-inspection helpers', () => {
           publish_page: {
             total_count: 2,
             publish_list: [
-              record('https://mp.weixin.qq.com/s/PublishedOne1', 1_720_000_000),
-              record('https://mp.weixin.qq.com/s/PublishedTwo2', 1_720_000_100),
+              record(WEIXIN_LONG_A, 1_720_000_000),
+              record(WEIXIN_LONG_B, 1_720_000_100),
             ],
           },
         },
@@ -282,7 +770,7 @@ describe('WeChat publication-inspection helpers', () => {
     })
   })
 
-  it('requires review when a mass-send record exposes only a short URL', () => {
+  it('accepts a mass-send record with a canonical short public URL', () => {
     const result = parseWeixinPublishedListPayload(
       massSendPublishedListFixture,
       '900000001',
@@ -292,8 +780,82 @@ describe('WeChat publication-inspection helpers', () => {
 
     expect(result).toEqual({
       success: true,
-      match: 'REVIEW_REQUIRED',
+      match: 'PUBLISHED',
+      canonicalUrl: 'https://mp.weixin.qq.com/s/AbCdEfGh1234',
+      publishedAt: '2024-07-03T09:46:40.000Z',
     })
+  })
+
+  it('accepts duplicate URL fields only when they normalize to one public identity', () => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: {
+                  draft_msgid: '900000001',
+                  publish_status: 200,
+                  create_time: 1_720_000_000,
+                  appmsgex: [
+                    {
+                      itemidx: 1,
+                      content_url: WEIXIN_SHORT_A,
+                      link: `${WEIXIN_SHORT_A}?tracking=ignored`,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'PUBLISHED',
+      canonicalUrl: WEIXIN_SHORT_A,
+      publishedAt: '2024-07-03T09:46:40.000Z',
+    })
+  })
+
+  it.each([
+    {
+      name: 'two different short identities',
+      first: WEIXIN_SHORT_A,
+      second: 'https://mp.weixin.qq.com/s/Different_123',
+    },
+    {
+      name: 'a short and a long identity',
+      first: WEIXIN_SHORT_A,
+      second: WEIXIN_LONG_A,
+    },
+  ])('requires review for $name in one article item', ({ first, second }) => {
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: {
+                  draft_msgid: '900000001',
+                  publish_status: 200,
+                  create_time: 1_720_000_000,
+                  appmsgex: [{ itemidx: 1, content_url: first, link: second }],
+                },
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({ success: true, match: 'REVIEW_REQUIRED' })
   })
 
   it('requires complete status, itemidx=1, public URL, and publication time', () => {
@@ -365,6 +927,8 @@ describe('WeChat publication-inspection helpers', () => {
       success: true,
       match: 'NOT_FOUND',
       hasMore: true,
+      nextBegin: 10,
+      totalCount: 25,
     })
     expect(
       parseWeixinPublishedListPayload(
@@ -386,55 +950,263 @@ describe('WeChat publication-inspection helpers', () => {
       ),
     ).toEqual({
       success: false,
-      errorCode: 'WEIXIN_PUBLISHED_LIST_RESPONSE_INVALID',
+      errorCode: 'WEIXIN_PUBLISHED_LIST_BASE_RET_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;base_resp.ret=object',
     })
   })
 
-  it.each([
-    {
-      name: 'non-object list row',
-      publishPage: { total_count: 1, publish_list: [null] },
-    },
-    {
-      name: 'unparseable publish_info',
-      publishPage: {
-        total_count: 1,
-        publish_list: [{ publish_info: '{not-json' }],
-      },
-    },
-    {
-      name: 'unparseable nested publish_info',
-      publishPage: {
-        total_count: 1,
-        publish_list: [
-          {
-            publish_info: {
-              publish_info: '{not-json',
-              appmsgex: [],
+  it('exposes a newest-first timestamp bound only for fully timestamped pages', () => {
+    const result = parseWeixinPublishedListPayload(
+      {
+        publish_page: {
+          total_count: 20,
+          publish_list: [
+            {
+              publish_info: {
+                draft_msgid: '8002',
+                publish_status: 200,
+                create_time: 1720000200,
+              },
             },
-          },
-        ],
+            {
+              publish_info: {
+                draft_msgid: '8001',
+                publish_status: 200,
+                create_time: 1720000100,
+              },
+            },
+          ],
+        },
       },
-    },
-    {
-      name: 'inconsistent total_count',
-      publishPage: {
-        total_count: 0,
-        publish_list: [{ publish_info: { draft_msgid: 'other' } }],
-      },
-    },
-  ])('rejects an incomplete scan caused by $name', ({ publishPage }) => {
+      '900000001',
+      0,
+      10,
+    )
+
+    expect(result).toEqual({
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 2,
+      totalCount: 20,
+      newestPublishedAt: '2024-07-03T09:50:00.000Z',
+      oldestPublishedAt: '2024-07-03T09:48:20.000Z',
+    })
+
     expect(
       parseWeixinPublishedListPayload(
-        { publish_page: publishPage },
+        {
+          publish_page: {
+            total_count: 20,
+            publish_list: [
+              {
+                publish_info: {
+                  draft_msgid: '8001',
+                  publish_status: 200,
+                  create_time: 1720000100,
+                },
+              },
+              {
+                publish_info: {
+                  draft_msgid: '8002',
+                  publish_status: 200,
+                  create_time: 1720000200,
+                },
+              },
+            ],
+          },
+        },
         '900000001',
         0,
         10,
       ),
     ).toEqual({
-      success: false,
-      errorCode: 'WEIXIN_PUBLISHED_LIST_RESPONSE_INVALID',
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 2,
+      totalCount: 20,
     })
+
+    expect(
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 20,
+            publish_list: [
+              {
+                publish_info: {
+                  draft_msgid: '8002',
+                  publish_status: 200,
+                  create_time: 1720000200,
+                },
+              },
+              {
+                publish_info: {
+                  draft_msgid: '8001',
+                  publish_status: 200,
+                },
+              },
+            ],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      ),
+    ).toEqual({
+      success: true,
+      match: 'NOT_FOUND',
+      hasMore: true,
+      nextBegin: 2,
+      totalCount: 20,
+    })
+  })
+
+  it.each([
+    {
+      name: 'non-object response root',
+      payload: null,
+      errorCode: 'WEIXIN_PUBLISHED_LIST_ROOT_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;root=null',
+    },
+    {
+      name: 'non-object base response',
+      payload: { base_resp: ['secret-account-title-url-token'] },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_BASE_RESPONSE_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;base_resp=array',
+    },
+    {
+      name: 'invalid base response ret',
+      payload: { base_resp: { ret: {} } },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_BASE_RET_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;base_resp.ret=object',
+    },
+    {
+      name: 'missing publish page',
+      payload: {},
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_PAGE_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;publish_page=missing',
+    },
+    {
+      name: 'unparseable publish page',
+      payload: { publish_page: '{secret-account-title-url-token' },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_PAGE_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;publish_page=string:invalid-json',
+    },
+    {
+      name: 'non-array publish list',
+      payload: {
+        publish_page: { publish_list: 'secret-account-title-url-token' },
+      },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_LIST_INVALID',
+      shapeFingerprint:
+        'wx-list-shape:v1;publish_page.publish_list=string:invalid-json',
+    },
+    {
+      name: 'publish list over the requested bound',
+      payload: {
+        publish_page: { publish_list: Array.from({ length: 11 }, () => ({})) },
+      },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_LIST_INVALID',
+      shapeFingerprint:
+        'wx-list-shape:v1;publish_page.publish_list=array:exceeds-requested-count',
+    },
+    {
+      name: 'non-object list row',
+      payload: { publish_page: { total_count: 1, publish_list: [null] } },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_RECORD_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;publish_page.publish_list.row=null',
+    },
+    {
+      name: 'missing publish info',
+      payload: { publish_page: { total_count: 1, publish_list: [{}] } },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_INFO_INVALID',
+      shapeFingerprint:
+        'wx-list-row:v2;publish_info=missing;inline_identity=missing',
+    },
+    {
+      name: 'unparseable publish info',
+      payload: {
+        publish_page: {
+          total_count: 1,
+          publish_list: [{ publish_info: '{secret-account-title-url-token' }],
+        },
+      },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_INFO_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;publish_info=string:invalid-json',
+    },
+    {
+      name: 'unparseable nested publish info',
+      payload: {
+        publish_page: {
+          total_count: 1,
+          publish_list: [
+            {
+              publish_info: {
+                publish_info: '{secret-account-title-url-token',
+                appmsgex: [],
+              },
+            },
+          ],
+        },
+      },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_NESTED_INFO_INVALID',
+      shapeFingerprint:
+        'wx-list-shape:v1;publish_info.publish_info=string:invalid-json',
+    },
+    {
+      name: 'inconsistent total count',
+      payload: {
+        publish_page: {
+          total_count: 0,
+          publish_list: [{ publish_info: { draft_msgid: 'other' } }],
+        },
+      },
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PAGINATION_INVALID',
+      shapeFingerprint:
+        'wx-list-shape:v1;publish_page.total_count=less-than-materialized-page-bound',
+    },
+  ])(
+    'returns a safe structural diagnostic for $name',
+    ({ payload, errorCode, shapeFingerprint }) => {
+      const result = parseWeixinPublishedListPayload(
+        payload,
+        '900000001',
+        0,
+        10,
+      )
+      expect(result).toEqual({ success: false, errorCode, shapeFingerprint })
+      expect(JSON.stringify(result)).not.toContain(
+        'secret-account-title-url-token',
+      )
+    },
+  )
+
+  it('produces the same structural fingerprint for different private values', () => {
+    const resultFor = (privateValue: string) =>
+      parseWeixinPublishedListPayload(
+        {
+          publish_page: {
+            total_count: 1,
+            publish_list: [{ publish_info: `{${privateValue}` }],
+          },
+        },
+        '900000001',
+        0,
+        10,
+      )
+
+    const first = resultFor('private-account-title-url-token-one')
+    const second = resultFor('different-private-data-two')
+
+    expect(first).toEqual(second)
+    expect(first).toEqual({
+      success: false,
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_INFO_INVALID',
+      shapeFingerprint: 'wx-list-shape:v1;publish_info=string:invalid-json',
+    })
+    expect(JSON.stringify(first)).not.toMatch(/private|account|title|token/i)
   })
 
   it('distinguishes login, API, and response-shape failures', () => {
@@ -586,12 +1358,13 @@ describe('WeChat publication-inspection helpers', () => {
     expect(normalizeWeixinLongPublicArticleUrl(url)).toBeNull()
   })
 
-  it('accepts short URLs for classification but never as public-page request targets', () => {
+  it('accepts canonical short and long public-page request targets without redirects', () => {
     expect(normalizeWeixinPublicArticleUrl(WEIXIN_SHORT_A)).toBe(WEIXIN_SHORT_A)
     expect(normalizeWeixinLongPublicArticleUrl(WEIXIN_SHORT_A)).toBeNull()
     expect(normalizeWeixinLongPublicArticleUrl(WEIXIN_LONG_A)).toBe(
       WEIXIN_LONG_A,
     )
+    expect(WEIXIN_PUBLIC_PAGE_MAX_BYTES).toBe(4 * 1024 * 1024)
     expect(WEIXIN_PUBLIC_PAGE_MAX_REDIRECTS).toBe(0)
   })
 
@@ -602,6 +1375,13 @@ describe('WeChat publication-inspection helpers', () => {
       responseUrl: WEIXIN_LONG_A,
       redirected: false,
       expectedCanonical: WEIXIN_LONG_A,
+    },
+    {
+      name: 'the same short URL',
+      candidate: WEIXIN_SHORT_A,
+      responseUrl: WEIXIN_SHORT_A,
+      redirected: false,
+      expectedCanonical: WEIXIN_SHORT_A,
     },
     {
       name: 'an explicit default HTTPS port normalized by URL semantics',
@@ -649,6 +1429,20 @@ describe('WeChat publication-inspection helpers', () => {
       responseUrl: WEIXIN_LONG_A,
       redirected: true,
       errorCode: 'WEIXIN_PUBLIC_REDIRECT_NOT_ALLOWED',
+    },
+    {
+      name: 'a different short identity',
+      candidate: WEIXIN_SHORT_A,
+      responseUrl: 'https://mp.weixin.qq.com/s/Different_123',
+      redirected: false,
+      errorCode: 'WEIXIN_PUBLIC_RESPONSE_IDENTITY_MISMATCH',
+    },
+    {
+      name: 'a short-to-long identity change',
+      candidate: WEIXIN_SHORT_A,
+      responseUrl: WEIXIN_LONG_A,
+      redirected: false,
+      errorCode: 'WEIXIN_PUBLIC_RESPONSE_IDENTITY_MISMATCH',
     },
   ] as const)(
     'rejects $name',
@@ -774,6 +1568,120 @@ describe('WeChat publication-inspection helpers', () => {
       bodyText: 'Public body',
       bodyTruncated: false,
     })
+  })
+
+  it('accepts equal public-page ct and oriCreateTime assignments', () => {
+    expect(
+      parseWeixinPublicArticlePublishedAt(
+        `<script>
+          var ct = "1720000000";
+          oriCreateTime = '1720000000';
+        </script>`,
+        '2026-08-04T00:00:00.000Z',
+      ),
+    ).toEqual({
+      success: true,
+      publishedAt: '2024-07-03T09:46:40.000Z',
+    })
+  })
+
+  it.each([
+    ['ct', '<script>var ct = "1784964127";</script>'],
+    [
+      'oriCreateTime',
+      "<script>var oriCreateTime = '1784964127';</script>",
+    ],
+  ])(
+    'ignores bundled-script ct locals when valid %s metadata is present',
+    (_field, metadata) => {
+      expect(
+        parseWeixinPublicArticlePublishedAt(
+          `<script>
+            function inspect(value) {
+              var ct = serialize(value);
+              return ct;
+            }
+          </script>
+          ${metadata}`,
+          '2026-08-04T00:00:00.000Z',
+        ),
+      ).toEqual({
+        success: true,
+        publishedAt: '2026-07-25T07:22:07.000Z',
+      })
+    },
+  )
+
+  it.each([
+    ['var ct = "1720000000";', 'ct'],
+    ["oriCreateTime = '1720000000';", 'oriCreateTime'],
+  ])('accepts one unique valid %s assignment', (assignment) => {
+    expect(
+      parseWeixinPublicArticlePublishedAt(
+        `<script>${assignment}</script>`,
+        '2026-08-04T00:00:00.000Z',
+      ),
+    ).toEqual({
+      success: true,
+      publishedAt: '2024-07-03T09:46:40.000Z',
+    })
+  })
+
+  it('ignores publication-time lookalikes inside the article body', () => {
+    expect(
+      parseWeixinPublicArticlePublishedAt(
+        `<section id="js_content">
+          <script>var ct = "1720000001";</script>
+        </section>
+        <script>oriCreateTime = "1720000000";</script>`,
+        '2026-08-04T00:00:00.000Z',
+      ),
+    ).toEqual({
+      success: true,
+      publishedAt: '2024-07-03T09:46:40.000Z',
+    })
+  })
+
+  it.each([
+    {
+      name: 'missing assignments',
+      html: '<script>window.notPublicationTime = 1720000000;</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_MISSING',
+    },
+    {
+      name: 'unquoted assignment',
+      html: '<script>var ct = 1720000000;</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_INVALID',
+    },
+    {
+      name: 'wrong-length assignment',
+      html: '<script>var ct = "1720000000000";</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_INVALID',
+    },
+    {
+      name: 'pre-2000 assignment',
+      html: '<script>var ct = "0000000000";</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_INVALID',
+    },
+    {
+      name: 'future assignment',
+      html: '<script>var ct = "1999999999";</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_INVALID',
+    },
+    {
+      name: 'ambiguous ct assignments',
+      html: '<script>var ct = "1720000000";\nvar ct = "1720000001";</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_AMBIGUOUS',
+    },
+    {
+      name: 'conflicting ct and oriCreateTime assignments',
+      html: '<script>var ct = "1720000000";\noriCreateTime = "1720000001";</script>',
+      errorCode: 'WEIXIN_PUBLIC_PUBLISHED_AT_CONFLICT',
+    },
+  ])('fails closed for $name', ({ html, errorCode }) => {
+    expect(
+      parseWeixinPublicArticlePublishedAt(html, '2026-08-04T00:00:00.000Z'),
+    ).toMatchObject({ success: false, errorCode })
   })
 
   it('rejects a changed temporary-page shape explicitly', () => {

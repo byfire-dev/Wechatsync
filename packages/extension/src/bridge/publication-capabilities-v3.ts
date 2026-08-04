@@ -27,13 +27,13 @@ interface PublicationAdapterV3Descriptor {
  * descriptor version changes only when that platform's v3 behavior changes.
  */
 export const PUBLICATION_ADAPTER_V3_DESCRIPTORS = {
-  zhihu: { adapterVersion: "1.0.0", locatorOnlyInspection: true },
-  sohu: { adapterVersion: "1.0.0", locatorOnlyInspection: true },
+  zhihu: { adapterVersion: "1.1.0", locatorOnlyInspection: true },
+  sohu: { adapterVersion: "1.1.0", locatorOnlyInspection: true },
   weixin: { adapterVersion: "1.0.0", locatorOnlyInspection: true },
   // Toutiao's current inspector still requires a title hint that v3 does not
   // carry. Publishing remains available; inspection is deliberately not
   // advertised until it accepts stable locators alone.
-  toutiao: { adapterVersion: "1.0.0", locatorOnlyInspection: false },
+  toutiao: { adapterVersion: "1.1.0", locatorOnlyInspection: false },
 } as const satisfies Record<
   PublicationBridgeV3PlatformId,
   PublicationAdapterV3Descriptor

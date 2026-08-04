@@ -17,6 +17,11 @@ import {
   normalizeAdapterAccountBinding,
   resolveAdapterAccountBinding,
 } from "../account-binding";
+import { openTrustedPublicationDraft } from "../publication-draft-open";
+import type {
+  OpenPublicationDraftRequest,
+  OpenPublicationDraftResult,
+} from "../../publication-inspection/types";
 import { createLogger } from "../../lib/logger";
 import { parseMarkdownImages } from "../../lib/markdown-images";
 import {
@@ -1112,6 +1117,20 @@ export class ToutiaoAdapter extends CodeAdapter {
       publicAccess,
       bodyTruncated: observation.bodyTruncated,
     };
+  }
+
+  async openPublicationDraft(
+    request: OpenPublicationDraftRequest,
+    context?: AdapterOperationContext,
+  ): Promise<OpenPublicationDraftResult> {
+    return openTrustedPublicationDraft({
+      expectedPlatform: "toutiao",
+      request,
+      runtime: this.runtime,
+      probeAccounts: (operationContext) =>
+        this.probeAccounts(operationContext),
+      context,
+    });
   }
 
   async publish(

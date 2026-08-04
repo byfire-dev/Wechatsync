@@ -1,4 +1,4 @@
-import type { PlatformAdapter } from '@wechatsync/core'
+import type { AdapterOperationContext, PlatformAdapter } from '@wechatsync/core'
 import {
   parsePublicationUrl,
   PublicationInspectionObservationSchema,
@@ -47,7 +47,35 @@ export type PublicationInspectionRunnerResult =
       ok: false
       request: PublicationInspectionRequest | null
       code: PublicationInspectionRunnerFailureCode
+      timeoutPhase?: PublicationInspectionTimeoutPhase
     }
+
+export type PublicationInspectionTimeoutPhase =
+  | 'ACCOUNT_PROBE'
+  | 'ADAPTER_INSPECTION'
+  | 'COMMAND'
+
+export class PublicationInspectionTimeoutError extends Error {
+  readonly code = 'PUBLICATION_INSPECTION_TIMEOUT'
+
+  constructor(readonly phase: PublicationInspectionTimeoutPhase) {
+    super('PUBLICATION_INSPECTION_TIMEOUT')
+    this.name = 'PublicationInspectionTimeoutError'
+  }
+}
+
+export function isPublicationInspectionTimeoutError(
+  error: unknown,
+): error is PublicationInspectionTimeoutError {
+  return error instanceof PublicationInspectionTimeoutError
+}
+
+interface PublicationInspectionDeadlineOptions {
+  timeoutMs: number
+  phase: PublicationInspectionTimeoutPhase
+  parentSignal?: AbortSignal
+  deadlineAt?: number
+}
 
 interface PublicationIdentityPolicy {
   platform: PublicationInspectionPlatform
@@ -313,33 +341,58 @@ function normalizeAdapterObservations(
 }
 
 export function withPublicationInspectionDeadline<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
+  operation: (signal: AbortSignal, deadlineAt: number) => Promise<T>,
+  options: PublicationInspectionDeadlineOptions,
 ): Promise<T> {
   const controller = new AbortController()
+  const requestedDeadlineAt = Date.now() + Math.max(0, options.timeoutMs)
+  const inheritedDeadlineAt = options.deadlineAt
+  const deadlineAt =
+    typeof inheritedDeadlineAt === 'number' &&
+    Number.isFinite(inheritedDeadlineAt)
+      ? Math.min(requestedDeadlineAt, inheritedDeadlineAt)
+      : requestedDeadlineAt
   return new Promise<T>((resolve, reject) => {
     let settled = false
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (callback: () => void) => {
       if (settled) return
       settled = true
-      controller.abort()
-      reject(new Error('PUBLICATION_INSPECTION_TIMEOUT'))
-    }, timeoutMs)
+      if (timer !== undefined) clearTimeout(timer)
+      options.parentSignal?.removeEventListener('abort', abortFromParent)
+      callback()
+    }
+    const abortFromParent = () => {
+      const reason = options.parentSignal?.reason ?? new Error('ABORTED')
+      controller.abort(reason)
+      finish(() => reject(reason))
+    }
+
+    if (options.parentSignal?.aborted) {
+      abortFromParent()
+      return
+    }
+    options.parentSignal?.addEventListener('abort', abortFromParent, {
+      once: true,
+    })
+
+    timer = setTimeout(
+      () => {
+        const error = new PublicationInspectionTimeoutError(options.phase)
+        controller.abort(error)
+        finish(() => reject(error))
+      },
+      Math.max(0, deadlineAt - Date.now()),
+    )
 
     Promise.resolve()
-      .then(() => operation(controller.signal))
+      .then(() => operation(controller.signal, deadlineAt))
       .then(
         (value) => {
-          if (settled) return
-          settled = true
-          clearTimeout(timer)
-          resolve(value)
+          finish(() => resolve(value))
         },
         (error) => {
-          if (settled) return
-          settled = true
-          clearTimeout(timer)
-          reject(error)
+          finish(() => reject(error))
         },
       )
   })
@@ -355,6 +408,7 @@ export async function runInternalPublicationInspection(
   options: {
     activePlatforms?: ReadonlySet<PublicationInspectionPlatform>
     timeoutMs?: number
+    operationContext?: AdapterOperationContext
   } = {},
 ): Promise<PublicationInspectionRunnerResult> {
   const parsedRequest =
@@ -382,8 +436,18 @@ export async function runInternalPublicationInspection(
 
   try {
     const value = await withPublicationInspectionDeadline(
-      (signal) => adapter.inspectPublication!(request, { signal }),
-      options.timeoutMs ?? DEFAULT_INSPECTION_TIMEOUT_MS,
+      (signal, deadlineAt) =>
+        adapter.inspectPublication!(request, {
+          ...options.operationContext,
+          signal,
+          deadlineAt,
+        }),
+      {
+        timeoutMs: options.timeoutMs ?? DEFAULT_INSPECTION_TIMEOUT_MS,
+        phase: 'ADAPTER_INSPECTION',
+        parentSignal: options.operationContext?.signal,
+        deadlineAt: options.operationContext?.deadlineAt,
+      },
     )
     const observations = normalizeAdapterObservations(request, value)
     if (!observations) {
@@ -395,15 +459,14 @@ export async function runInternalPublicationInspection(
     }
     return { ok: true, request, observations }
   } catch (error) {
-    const timedOut =
-      error instanceof Error &&
-      error.message === 'PUBLICATION_INSPECTION_TIMEOUT'
+    const timedOut = isPublicationInspectionTimeoutError(error)
     return {
       ok: false,
       request,
       code: timedOut
         ? 'PUBLICATION_INSPECTION_TIMEOUT'
         : 'PUBLICATION_INSPECTION_FAILED',
+      ...(timedOut ? { timeoutPhase: error.phase } : {}),
     }
   }
 }
