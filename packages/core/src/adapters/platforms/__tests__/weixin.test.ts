@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { RuntimeInterface } from '../../../runtime/interface'
-import type { PublicationInspectRequest } from '../../../publication-inspection/types'
-import type { PublicationInspectionObservation as PublicationObservation } from '../../../publication-inspection/domain'
+import type {
+  PublicationInspectionObservation as PublicationObservation,
+  PublicationInspectionRequest as PublicationInspectRequest,
+} from '../../../publication-inspection/domain'
+import { derivePublicationPublicIdentity } from '../../../publication-inspection/url'
 import {
   normalizeWeixinAppMsgId,
+  WEIXIN_PUBLISHED_LIST_MAX_BYTES,
   WEIXIN_PUBLIC_PAGE_MAX_BYTES,
 } from '../../../publication-inspection/weixin'
 import { WeixinAdapter } from '../weixin'
@@ -172,14 +176,48 @@ function emptyPublishedListResponse() {
   })
 }
 
+function publishedHistoryPage(
+  records: Array<{ draftMsgId: string; publishedAt?: string }>,
+  totalCount = records.length,
+) {
+  return jsonResponse({
+    base_resp: { ret: 0 },
+    publish_page: {
+      total_count: totalCount,
+      publish_list: records.map(({ draftMsgId, publishedAt }) => ({
+        publish_info: {
+          draft_msgid: draftMsgId,
+          publish_status: 200,
+          ...(publishedAt
+            ? { create_time: Math.floor(Date.parse(publishedAt) / 1_000) }
+            : {}),
+        },
+      })),
+    },
+  })
+}
+
 function createInspectionRuntime(
   fetchImpl: (url: string, options?: RequestInit) => Promise<Response>,
+  options: { defaultDraftListAppMsgId?: string | null } = {},
 ) {
+  const defaultDraftListAppMsgId =
+    typeof options.defaultDraftListAppMsgId === 'undefined'
+      ? '9001'
+      : options.defaultDraftListAppMsgId
   const add = vi.fn(async () => 'weixin-inspection-rule')
   const remove = vi.fn(async () => {})
   const runtime = {
     type: 'extension',
-    fetch: vi.fn(fetchImpl),
+    fetch: vi.fn(async (url: string, requestOptions?: RequestInit) => {
+      if (defaultDraftListAppMsgId && url.includes('action=list_card')) {
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          app_msg_info: { item: [{ app_id: defaultDraftListAppMsgId }] },
+        })
+      }
+      return fetchImpl(url, requestOptions)
+    }),
     cookies: {},
     storage: {},
     session: {},
@@ -372,6 +410,65 @@ describe('WeixinAdapter draft identity', () => {
 })
 
 describe('WeixinAdapter publication inspection', () => {
+  it('verifies a known public locator directly without scanning published or draft lists', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s/AaBbCcDd_123'
+    const identity = derivePublicationPublicIdentity('weixin', publicUrl)
+    if (!identity) throw new Error('Expected a valid WeChat public identity')
+    const requestedUrls: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      requestedUrls.push(url)
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<script>var ct = "1720000000"; oriCreateTime = \'1720000000\';</script>' +
+            '<h1 id="activity-name">Known public article</h1>' +
+            '<section id="js_content"><p>Verified body.</p></section>',
+          publicUrl,
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication({
+      ...INSPECT_REQUEST,
+      knownPublicLocator: {
+        publicUrl: identity.canonicalUrl,
+        publicIdentityKey: identity.key,
+      },
+    })
+
+    expect(observations).toEqual([
+      expect.objectContaining({
+        outcome: 'PUBLISHED',
+        source: 'PUBLIC_PAGE',
+        canonicalUrl: publicUrl,
+        platformPostId: '9001',
+        title: 'Known public article',
+        bodyText: 'Verified body.',
+        bodyTruncated: false,
+        publishedAt: '2024-07-03T09:46:40.000Z',
+        publicAccess: expect.objectContaining({
+          status: 'CONFIRMED',
+          checkedUrl: publicUrl,
+          checkedPublicIdentityKey: identity.key,
+          httpStatus: 200,
+        }),
+      }),
+    ])
+    expect(requestedUrls).toEqual(['https://mp.weixin.qq.com/', publicUrl])
+    expect(requestedUrls.some((url) => url.includes('appmsgpublish'))).toBe(
+      false,
+    )
+    expect(requestedUrls.some((url) => url.includes('list_card'))).toBe(false)
+    expect(requestedUrls.some((url) => url.includes('get_temp_url'))).toBe(
+      false,
+    )
+  })
+
   it('returns only DRAFT_PRESENT from a fresh authenticated temporary page', async () => {
     const tempUrl = 'http://mp.weixin.qq.com/s?tempkey=memory-only&mid=9001'
     const safeTempUrl =
@@ -384,7 +481,15 @@ describe('WeixinAdapter publication inspection', () => {
           return new Response(authHtml('fresh-token'))
         }
         if (url.includes('/cgi-bin/appmsgpublish?')) {
-          return emptyPublishedListResponse()
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            publish_page: {
+              total_count: 11,
+              publish_list: Array.from({ length: 10 }, () => ({
+                publish_info: '',
+              })),
+            },
+          })
         }
         if (url.includes('action=get_temp_url')) {
           return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
@@ -429,8 +534,367 @@ describe('WeixinAdapter publication inspection', () => {
       credentials: 'include',
       redirect: 'error',
     })
+    expect(
+      calls.filter(({ url }) => url.includes('/cgi-bin/appmsgpublish?')),
+    ).toHaveLength(1)
+    expect(runtime.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('action=list_card'),
+      expect.objectContaining({ credentials: 'include', redirect: 'error' }),
+    )
     expect(add).toHaveBeenCalledTimes(1)
     expect(remove).toHaveBeenCalledWith('weixin-inspection-rule')
+  })
+
+  it('does not treat a temporary preview as a draft without exact current-list membership', async () => {
+    const requestedUrls: string[] = []
+    const { runtime } = createInspectionRuntime(
+      async (url) => {
+        requestedUrls.push(url)
+        if (url === 'https://mp.weixin.qq.com/') {
+          return new Response(authHtml('fresh-token'))
+        }
+        if (url.includes('/cgi-bin/appmsgpublish?')) {
+          return emptyPublishedListResponse()
+        }
+        if (url.includes('action=list_card')) {
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            app_msg_info: { item: [{ app_id: '8999' }] },
+          })
+        }
+        if (url.includes('action=get_temp_url')) {
+          throw new Error('Temporary preview must not be requested')
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      },
+      { defaultDraftListAppMsgId: null },
+    )
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(observations).toEqual([
+      expect.objectContaining({
+        outcome: 'REVIEW_REQUIRED',
+        source: 'DRAFT_LIST',
+        platformPostId: '9001',
+        errorCode: 'WEIXIN_DRAFT_MEMBERSHIP_UNRESOLVED',
+      }),
+    ])
+    expect(
+      requestedUrls.filter((url) => url.includes('action=list_card')),
+    ).toHaveLength(2)
+    expect(
+      requestedUrls.some((url) => url.includes('action=get_temp_url')),
+    ).toBe(false)
+  })
+
+  it('stops published history at the newest-first draft boundary before opening the draft', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=bounded-history'
+    const listBegins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        listBegins.push(new URL(url).searchParams.get('begin') ?? '')
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 100,
+            publish_list: [
+              {
+                publish_info: {
+                  draft_msgid: '8999',
+                  publish_status: 200,
+                  create_time: 1720000000,
+                },
+              },
+              ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+            ],
+          },
+        })
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">Bounded draft</h1><div id="js_content">Draft body</div>',
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication({
+      ...INSPECT_REQUEST,
+      articleHint: {
+        ...INSPECT_REQUEST.articleHint,
+        publishedAfter: '2024-07-03T10:00:00.000Z',
+      },
+    })
+
+    expect(listBegins).toEqual(['0'])
+    expect(observations).toEqual([
+      expect.objectContaining({
+        outcome: 'DRAFT_PRESENT',
+        platformPostId: '9001',
+        title: 'Bounded draft',
+      }),
+    ])
+  })
+
+  it('does not derive the publication cutoff from draft.draftedAt alone', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=drafted-at-only'
+    const listBegins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = new URL(url).searchParams.get('begin') ?? ''
+        listBegins.push(begin)
+        return begin === '0'
+          ? publishedHistoryPage(
+              [{ draftMsgId: '8999', publishedAt: '2024-07-03T09:00:00.000Z' }],
+              1,
+            )
+          : emptyPublishedListResponse()
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">Drafted-at only</h1><div id="js_content">Draft body</div>',
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(listBegins).toEqual(['0', '1'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      platformPostId: '9001',
+    })
+  })
+
+  it.each([
+    {
+      name: 'keeps scanning at the exact ten-minute boundary',
+      publishedAfter: '2024-07-03T10:00:00.000Z',
+      expectedBegins: ['0', '1'],
+    },
+    {
+      name: 'cuts off when the newest record is strictly older than the ten-minute boundary',
+      publishedAfter: '2024-07-03T10:00:00.001Z',
+      expectedBegins: ['0'],
+    },
+  ])('$name', async ({ publishedAfter, expectedBegins }) => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=clock-skew-boundary'
+    const listBegins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = new URL(url).searchParams.get('begin') ?? ''
+        listBegins.push(begin)
+        return begin === '0'
+          ? publishedHistoryPage(
+              [{ draftMsgId: '8999', publishedAt: '2024-07-03T09:50:00.000Z' }],
+              1,
+            )
+          : emptyPublishedListResponse()
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">Clock skew boundary</h1><div id="js_content">Draft body</div>',
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication({
+      ...INSPECT_REQUEST,
+      articleHint: { ...INSPECT_REQUEST.articleHint, publishedAfter },
+    })
+
+    expect(listBegins).toEqual(expectedBegins)
+    expect(observations[0]).toMatchObject({ outcome: 'DRAFT_PRESENT' })
+  })
+
+  it('requires exact current-draft membership when windowed history has no trustworthy timestamps', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=untimestamped-history'
+    const listBegins: string[] = []
+    const { runtime } = createInspectionRuntime(
+      async (url) => {
+        if (url === 'https://mp.weixin.qq.com/') {
+          return new Response(authHtml('fresh-token'))
+        }
+        if (url.includes('/cgi-bin/appmsgpublish?')) {
+          const begin = new URL(url).searchParams.get('begin') ?? ''
+          listBegins.push(begin)
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            publish_page: {
+              total_count: 100,
+              publish_list: [
+                { publish_info: { draft_msgid: '8999' } },
+                ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+              ],
+            },
+          })
+        }
+        if (url.includes('action=list_card')) {
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            app_msg_info: { item: [{ app_id: '9001' }] },
+          })
+        }
+        if (url.includes('action=get_temp_url')) {
+          return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+        }
+        if (url === tempUrl) {
+          return new Response(
+            '<h1 id="activity-name">Untimestamped draft</h1><div id="js_content">Draft body</div>',
+          )
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      },
+      { defaultDraftListAppMsgId: null },
+    )
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication({
+      ...INSPECT_REQUEST,
+      articleHint: {
+        ...INSPECT_REQUEST.articleHint,
+        publishedAfter: '2026-08-03T10:00:00.000Z',
+      },
+    })
+
+    expect(listBegins).toEqual(['0'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      platformPostId: '9001',
+      title: 'Untimestamped draft',
+    })
+  })
+
+  it('requires exact current-draft membership when timestamps reverse across pages', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=cross-page-order'
+    const listBegins: string[] = []
+    const { runtime } = createInspectionRuntime(
+      async (url) => {
+        if (url === 'https://mp.weixin.qq.com/') {
+          return new Response(authHtml('fresh-token'))
+        }
+        if (url.includes('/cgi-bin/appmsgpublish?')) {
+          const begin = new URL(url).searchParams.get('begin') ?? ''
+          listBegins.push(begin)
+          if (begin === '0') {
+            return publishedHistoryPage(
+              [
+                { draftMsgId: '8999', publishedAt: '2024-07-03T10:00:00.000Z' },
+                { draftMsgId: '8998', publishedAt: '2024-07-03T09:40:00.000Z' },
+              ],
+              3,
+            )
+          }
+          if (begin === '2') {
+            return publishedHistoryPage(
+              [{ draftMsgId: '8997', publishedAt: '2024-07-03T09:45:00.000Z' }],
+              3,
+            )
+          }
+          return emptyPublishedListResponse()
+        }
+        if (url.includes('action=list_card')) {
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            app_msg_info: { item: [{ app_id: 9001 }] },
+          })
+        }
+        if (url.includes('action=get_temp_url')) {
+          return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+        }
+        if (url === tempUrl) {
+          return new Response(
+            '<h1 id="activity-name">Cross-page order</h1><div id="js_content">Draft body</div>',
+          )
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      },
+      { defaultDraftListAppMsgId: null },
+    )
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication({
+      ...INSPECT_REQUEST,
+      articleHint: {
+        ...INSPECT_REQUEST.articleHint,
+        publishedAfter: '2024-07-03T10:00:00.000Z',
+      },
+    })
+
+    expect(listBegins).toEqual(['0', '2'])
+    expect(observations[0]).toMatchObject({ outcome: 'DRAFT_PRESENT' })
+  })
+
+  it('accepts an exact published identity before applying the time cutoff', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=780&idx=1'
+    const listBegins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        listBegins.push(new URL(url).searchParams.get('begin') ?? '')
+        return publishedListResponse(publicUrl)
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Exact match wins</h1><div id="js_content">Published body</div>',
+          publicUrl,
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication({
+      ...INSPECT_REQUEST,
+      articleHint: {
+        ...INSPECT_REQUEST.articleHint,
+        publishedAfter: '2026-08-03T10:00:00.000Z',
+      },
+    })
+
+    expect(listBegins).toEqual(['0'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      canonicalUrl: publicUrl,
+      title: 'Exact match wins',
+    })
   })
 
   it('passes one operation signal to every verification fetch', async () => {
@@ -466,6 +930,41 @@ describe('WeixinAdapter publication inspection', () => {
     expect(
       receivedSignals.every((signal) => signal === controller.signal),
     ).toBe(true)
+  })
+
+  it('stops an adaptive sparse-page scan as soon as the operation is aborted', async () => {
+    const controller = new AbortController()
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = new URL(url).searchParams.get('begin') ?? ''
+        begins.push(begin)
+        controller.abort()
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 11,
+            publish_list: [
+              { publish_info: { draft_msgid: '8999' } },
+              ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+            ],
+          },
+        })
+      }
+      throw new Error('No request is allowed after abort')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    await expect(
+      adapter.inspectPublication(INSPECT_REQUEST, {
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(begins).toEqual(['0'])
   })
 
   it('resolves and rejects a conflicting appMsgId before authentication', async () => {
@@ -524,6 +1023,141 @@ describe('WeixinAdapter publication inspection', () => {
     expect(authCount).toBe(2)
     expect(detailCalls[0]).toContain('token=fresh-token-1')
     expect(detailCalls[1]).toContain('token=fresh-token-2')
+  })
+
+  it('reuses the same-operation verified account session without probing twice', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s/AaBbCcDd_456'
+    const identity = derivePublicationPublicIdentity('weixin', publicUrl)
+    if (!identity) throw new Error('Expected a valid WeChat public identity')
+    let authCount = 0
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        authCount += 1
+        return new Response(authHtml('verified-token'))
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<script>var ct = "1720000000"; oriCreateTime = "1720000000";</script>' +
+            '<h1 id="activity-name">Verified session article</h1>' +
+            '<section id="js_content"><p>Verified body.</p></section>',
+          publicUrl,
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+    const verifiedAccountProbe = await adapter.probeAccounts()
+
+    const observations = await adapter.inspectPublication(
+      {
+        ...INSPECT_REQUEST,
+        knownPublicLocator: {
+          publicUrl: identity.canonicalUrl,
+          publicIdentityKey: identity.key,
+        },
+      },
+      { verifiedAccountProbe },
+    )
+
+    expect(authCount).toBe(1)
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      canonicalUrl: publicUrl,
+    })
+  })
+
+  it('refreshes authentication when verified account evidence does not match', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s/AaBbCcDd_789'
+    const identity = derivePublicationPublicIdentity('weixin', publicUrl)
+    if (!identity) throw new Error('Expected a valid WeChat public identity')
+    let authCount = 0
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        authCount += 1
+        return new Response(authHtml(`fresh-token-${authCount}`))
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<script>var ct = "1720000000"; oriCreateTime = "1720000000";</script>' +
+            '<h1 id="activity-name">Refreshed session article</h1>' +
+            '<section id="js_content"><p>Verified body.</p></section>',
+          publicUrl,
+        )
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+    await adapter.probeAccounts()
+
+    const observations = await adapter.inspectPublication(
+      {
+        ...INSPECT_REQUEST,
+        knownPublicLocator: {
+          publicUrl: identity.canonicalUrl,
+          publicIdentityKey: identity.key,
+        },
+      },
+      {
+        verifiedAccountProbe: {
+          status: 'AUTHENTICATED',
+          accounts: [{ externalAccountId: 'gh_different_account' }],
+        },
+      },
+    )
+
+    expect(authCount).toBe(2)
+    expect(observations[0]).toMatchObject({ outcome: 'PUBLISHED' })
+  })
+
+  it('returns an explicit review result before a published scan exhausts its adapter deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      let publishedSignal: AbortSignal | undefined
+      const { runtime } = createInspectionRuntime(async (url, options) => {
+        if (url === 'https://mp.weixin.qq.com/') {
+          return new Response(authHtml('fresh-token'))
+        }
+        if (url.includes('/cgi-bin/appmsgpublish?')) {
+          publishedSignal = options?.signal as AbortSignal | undefined
+          return new Promise<Response>((_resolve, reject) => {
+            publishedSignal?.addEventListener(
+              'abort',
+              () => reject(publishedSignal?.reason),
+              { once: true },
+            )
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+      const adapter = new WeixinAdapter()
+      await adapter.init(runtime)
+      const pending = adapter.inspectPublication(INSPECT_REQUEST, {
+        deadlineAt: Date.now() + 10_000,
+      })
+
+      await vi.advanceTimersByTimeAsync(1_999)
+      let settled = false
+      void pending.then(() => {
+        settled = true
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await expect(pending).resolves.toEqual([
+        expect.objectContaining({
+          outcome: 'REVIEW_REQUIRED',
+          source: 'PUBLISHED_LIST',
+          errorCode: 'WEIXIN_PUBLISHED_SCAN_DEADLINE',
+        }),
+      ])
+      expect(publishedSignal?.aborted).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('stops before draft detail when the active account does not match', async () => {
@@ -635,8 +1269,160 @@ describe('WeixinAdapter publication inspection', () => {
     })
   })
 
-  it('requires review for a published-list short URL without requesting it', async () => {
-    const shortUrl = 'https://mp.weixin.qq.com/s/ShortAbC_123'
+  it('advances mixed published-list pages by materialized records without skipping the target', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=778&idx=1'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = new URL(url).searchParams.get('begin') ?? ''
+        begins.push(begin)
+        if (begin === '0') {
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            publish_page: {
+              total_count: 2,
+              publish_list: [
+                { publish_info: { draft_msgid: '8999' } },
+                ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+              ],
+            },
+          })
+        }
+        if (begin === '1') return publishedListResponse(publicUrl)
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Published after mixed page</h1>' +
+            '<section id="js_content"><p>Published body</p></section>',
+          publicUrl,
+        )
+      }
+      throw new Error('Unexpected request')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(['0', '1'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9001',
+      canonicalUrl: publicUrl,
+      title: 'Published after mixed page',
+    })
+  })
+
+  it('uses the reported record count to scan beyond five sparse pages before falling back to draft detail', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=sparse-pages'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = Number(new URL(url).searchParams.get('begin'))
+        begins.push(String(begin))
+        if (begin >= 11) {
+          return jsonResponse({
+            base_resp: { ret: 0 },
+            publish_page: {
+              total_count: 11,
+              publish_list: Array.from({ length: 10 }, () => ({
+                publish_info: '',
+              })),
+            },
+          })
+        }
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 11,
+            publish_list: [
+              { publish_info: { draft_msgid: String(8_000 + begin) } },
+              ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+            ],
+          },
+        })
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">Sparse page draft</h1>' +
+            '<section id="js_content">Draft body</section>',
+        )
+      }
+      throw new Error('Unexpected request')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(
+      Array.from({ length: 12 }, (_, index) => String(index)),
+    )
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      platformPostId: '9001',
+      title: 'Sparse page draft',
+    })
+  })
+
+  it('rechecks the advisory boundary and observes a target added while scanning', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=779&idx=1'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = Number(new URL(url).searchParams.get('begin'))
+        begins.push(String(begin))
+        if (begin === 6) return publishedListResponse(publicUrl)
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 6,
+            publish_list: [
+              { publish_info: { draft_msgid: String(8_500 + begin) } },
+              ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+            ],
+          },
+        })
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Published during scan</h1>' +
+            '<section id="js_content">Published body</section>',
+          publicUrl,
+        )
+      }
+      throw new Error('Draft fallback must not run')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(['0', '1', '2', '3', '4', '5', '6'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      canonicalUrl: publicUrl,
+      title: 'Published during scan',
+    })
+  })
+
+  it('accepts an empty publish_info sentinel only with exact inline identity and evidence', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
     const calls: string[] = []
     const { runtime } = createInspectionRuntime(async (url) => {
       calls.push(url)
@@ -644,9 +1430,30 @@ describe('WeixinAdapter publication inspection', () => {
         return new Response(authHtml('fresh-token'))
       }
       if (url.includes('/cgi-bin/appmsgpublish?')) {
-        return publishedListResponse(shortUrl)
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '',
+                draft_msgid: '9001',
+                publish_status: 200,
+                create_time: 1_720_000_000,
+                appmsgex: [{ itemidx: 1, content_url: publicUrl }],
+              },
+            ],
+          },
+        })
       }
-      throw new Error('A short public URL must not be requested')
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Published title</h1>' +
+            '<section id="js_content">Published body</section>',
+          publicUrl,
+        )
+      }
+      throw new Error('Draft fallback must not run')
     })
     const adapter = new WeixinAdapter()
     await adapter.init(runtime)
@@ -654,16 +1461,70 @@ describe('WeixinAdapter publication inspection', () => {
     const observations = await adapter.inspectPublication(INSPECT_REQUEST)
 
     expect(observations[0]).toMatchObject({
-      outcome: 'REVIEW_REQUIRED',
-      source: 'PUBLISHED_LIST',
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
       platformPostId: '9001',
-      errorCode: 'WEIXIN_PUBLISHED_EVIDENCE_INCOMPLETE',
+      canonicalUrl: publicUrl,
+      title: 'Published title',
+      bodyText: 'Published body',
     })
     expect(calls).toEqual([
       'https://mp.weixin.qq.com/',
       expect.stringContaining('/cgi-bin/appmsgpublish?'),
+      publicUrl,
     ])
-    expect(JSON.stringify(observations)).not.toContain(shortUrl)
+  })
+
+  it('verifies a direct short public URL with a decoded body between 2 and 4 MiB', async () => {
+    const shortUrl = 'https://mp.weixin.qq.com/s/ShortAbC_123'
+    const calls: Array<{ url: string; options?: RequestInit }> = []
+    const { runtime } = createInspectionRuntime(async (url, options) => {
+      calls.push({ url, options })
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        return publishedListResponse(shortUrl)
+      }
+      if (url === shortUrl) {
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Published title</h1>' +
+            `<section id="js_content">${'x'.repeat(3 * 1024 * 1024)}</section>`,
+          shortUrl,
+        )
+      }
+      throw new Error('Draft fallback must not run')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      platformPostId: '9001',
+      canonicalUrl: shortUrl,
+      title: 'Published title',
+      bodyTruncated: true,
+      publicAccess: {
+        status: 'CONFIRMED',
+        checkedUrl: shortUrl,
+        checkedPublicIdentityKey: 'weixin:short:v1:ShortAbC_123',
+        checkedAt: expect.any(String),
+        httpStatus: 200,
+      },
+    })
+    expect(calls.map(({ url }) => url)).toEqual([
+      'https://mp.weixin.qq.com/',
+      expect.stringContaining('/cgi-bin/appmsgpublish?'),
+      shortUrl,
+    ])
+    expect(calls[2]?.options).toMatchObject({
+      credentials: 'omit',
+      redirect: 'error',
+      cache: 'no-store',
+    })
   })
 
   it('fails closed if a runtime exposes an opaque manual redirect response', async () => {
@@ -803,6 +1664,23 @@ describe('WeixinAdapter publication inspection', () => {
       bodyTruncated: false,
     })
 
+    const validShortObservation: PublicationObservation = {
+      ...validObservation,
+      canonicalUrl: 'https://mp.weixin.qq.com/s/ShortAbC_123',
+      publicAccess: {
+        ...validObservation.publicAccess,
+        checkedUrl: 'https://mp.weixin.qq.com/s/ShortAbC_123',
+        checkedPublicIdentityKey: 'weixin:short:v1:ShortAbC_123',
+      },
+    }
+    expect(
+      adapter.provePublishedObservation(INSPECT_REQUEST, validShortObservation),
+    ).toEqual({
+      observedAuthorExternalAccountId: ACCOUNT_ID,
+      publicAccess: validShortObservation.publicAccess,
+      bodyTruncated: false,
+    })
+
     for (const invalidObservation of [
       {
         ...validObservation,
@@ -815,6 +1693,20 @@ describe('WeixinAdapter publication inspection', () => {
       {
         ...validObservation,
         canonicalUrl: 'https://mp.weixin.qq.com/s/ShortAbC_123',
+      },
+      {
+        ...validShortObservation,
+        publicAccess: {
+          ...validShortObservation.publicAccess,
+          checkedPublicIdentityKey: 'weixin:short:v1:Different_123',
+        },
+      },
+      {
+        ...validShortObservation,
+        publicAccess: {
+          ...validShortObservation.publicAccess,
+          checkedUrl: 'https://mp.weixin.qq.com/s/Different_123',
+        },
       },
       {
         ...validObservation,
@@ -931,7 +1823,9 @@ describe('WeixinAdapter publication inspection', () => {
         return new Response(authHtml('fresh-token'))
       }
       if (url.includes('/cgi-bin/appmsgpublish?')) {
-        return new Response('not json')
+        return new Response('<html>secret-account-title-url-token</html>', {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        })
       }
       throw new Error('Unexpected request')
     })
@@ -944,9 +1838,15 @@ describe('WeixinAdapter publication inspection', () => {
         outcome: 'REVIEW_REQUIRED',
         source: 'PUBLISHED_LIST',
         platformPostId: '9001',
-        errorCode: 'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
+        errorCode: 'WEIXIN_PUBLISHED_LIST_JSON_INVALID',
+        errorMessage: expect.stringContaining(
+          'wx-list-shape:v1;response_body=invalid-json;content_type=html',
+        ),
       }),
     ])
+    expect(JSON.stringify(observations)).not.toContain(
+      'secret-account-title-url-token',
+    )
     const observation = observations[0]
     expect(observation).not.toHaveProperty('canonicalUrl')
     expect(observation).not.toHaveProperty('title')
@@ -955,25 +1855,77 @@ describe('WeixinAdapter publication inspection', () => {
 
   it.each([
     {
+      name: 'exceeds the decoded byte limit',
+      response: () =>
+        new Response('', {
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': String(WEIXIN_PUBLISHED_LIST_MAX_BYTES + 1),
+          },
+        }),
+      errorCode: 'WEIXIN_PUBLISHED_LIST_BODY_TOO_LARGE',
+      fingerprint: 'wx-list-shape:v1;response_body=too-large;content_type=json',
+    },
+    {
+      name: 'has no readable body',
+      response: () =>
+        new Response(null, { headers: { 'Content-Type': 'application/json' } }),
+      errorCode: 'WEIXIN_PUBLISHED_LIST_BODY_READ_ERROR',
+      fingerprint: 'wx-list-shape:v1;response_body=missing;content_type=json',
+    },
+  ])(
+    'returns a bounded diagnostic when the published-list response $name',
+    async ({ response, errorCode, fingerprint }) => {
+      const { runtime } = createInspectionRuntime(async (url) => {
+        if (url === 'https://mp.weixin.qq.com/') {
+          return new Response(authHtml('fresh-token'))
+        }
+        if (url.includes('/cgi-bin/appmsgpublish?')) return response()
+        throw new Error('No fallback request is allowed')
+      })
+      const adapter = new WeixinAdapter()
+      await adapter.init(runtime)
+
+      const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+      expect(observations[0]).toMatchObject({
+        outcome: 'REVIEW_REQUIRED',
+        source: 'PUBLISHED_LIST',
+        platformPostId: '9001',
+        errorCode,
+        errorMessage: expect.stringContaining(fingerprint),
+      })
+      expect(runtime.fetch).toHaveBeenCalledTimes(2)
+    },
+  )
+
+  it.each([
+    {
       name: 'request failure',
       response: () => {
         throw new Error('secret request URL')
       },
       errorCode: 'WEIXIN_PUBLISHED_LIST_FETCH_ERROR',
+      fingerprint: undefined,
     },
     {
       name: 'HTTP failure',
       response: () => new Response('', { status: 503 }),
       errorCode: 'WEIXIN_PUBLISHED_LIST_FETCH_ERROR',
+      fingerprint: undefined,
     },
     {
       name: 'response-shape failure',
       response: () =>
         jsonResponse({
           base_resp: { ret: 0 },
-          publish_page: { publish_list: 'not-an-array' },
+          publish_page: {
+            publish_list: 'secret-account-title-url-token',
+          },
         }),
-      errorCode: 'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_LIST_INVALID',
+      fingerprint:
+        'wx-list-shape:v1;publish_page.publish_list=string:invalid-json',
     },
     {
       name: 'record parse failure',
@@ -982,14 +1934,15 @@ describe('WeixinAdapter publication inspection', () => {
           base_resp: { ret: 0 },
           publish_page: {
             total_count: 1,
-            publish_list: [{ publish_info: '{not-json' }],
+            publish_list: [{ publish_info: '{secret-account-title-url-token' }],
           },
         }),
-      errorCode: 'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_INFO_INVALID',
+      fingerprint: 'wx-list-shape:v1;publish_info=string:invalid-json',
     },
   ])(
     'requires review without leaking fields after a published-list $name',
-    async ({ response, errorCode }) => {
+    async ({ response, errorCode, fingerprint }) => {
       const { runtime } = createInspectionRuntime(async (url) => {
         if (url === 'https://mp.weixin.qq.com/') {
           return new Response(authHtml('fresh-token'))
@@ -1015,12 +1968,189 @@ describe('WeixinAdapter publication inspection', () => {
       expect(observations[0]).not.toHaveProperty('canonicalUrl')
       expect(observations[0]).not.toHaveProperty('title')
       expect(observations[0]).not.toHaveProperty('bodyText')
+      if (fingerprint) {
+        expect(observations[0]?.errorMessage).toContain(fingerprint)
+      }
       expect(JSON.stringify(observations)).not.toContain('secret request URL')
+      expect(JSON.stringify(observations)).not.toContain(
+        'secret-account-title-url-token',
+      )
       expect(runtime.fetch).toHaveBeenCalledTimes(2)
     },
   )
 
-  it('requires review when published-list pagination reaches its cap', async () => {
+  it('fails closed when the first record beyond the record cap matches the target', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s/record-101-must-not-open'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = Number(new URL(url).searchParams.get('begin'))
+        begins.push(String(begin))
+        if (begin === 100) {
+          return jsonResponse({
+            publish_page: {
+              total_count: 100,
+              publish_list: [
+                {
+                  publish_info: {
+                    draft_msgid: '9001',
+                    publish_status: 200,
+                    create_time: 1_720_000_000,
+                    appmsgex: [{ itemidx: 1, content_url: publicUrl }],
+                  },
+                },
+              ],
+            },
+          })
+        }
+        return jsonResponse({
+          publish_page: {
+            total_count: 100,
+            publish_list: Array.from({ length: 10 }, (_, index) => ({
+              publish_info: {
+                draft_msgid: String(10_000 + begin + index),
+                publish_status: 200,
+              },
+            })),
+          },
+        })
+      }
+      throw new Error('Public-page and draft fallback must not run')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(
+      Array.from({ length: 11 }, (_, index) => String(index * 10)),
+    )
+    expect(observations[0]).toMatchObject({
+      outcome: 'REVIEW_REQUIRED',
+      source: 'PUBLISHED_LIST',
+      errorCode: 'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+    })
+    expect(runtime.fetch).not.toHaveBeenCalledWith(publicUrl, expect.anything())
+  })
+
+  it('allows draft fallback after exactly 100 records and an empty sentinel', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=record-cap-sentinel'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = Number(new URL(url).searchParams.get('begin'))
+        begins.push(String(begin))
+        if (begin === 100) {
+          return jsonResponse({
+            publish_page: {
+              total_count: 100,
+              publish_list: Array.from({ length: 10 }, () => ({
+                publish_info: '',
+              })),
+            },
+          })
+        }
+        return jsonResponse({
+          publish_page: {
+            total_count: 100,
+            publish_list: Array.from({ length: 10 }, (_, index) => ({
+              publish_info: {
+                draft_msgid: String(11_000 + begin + index),
+                publish_status: 200,
+              },
+            })),
+          },
+        })
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">Record cap draft</h1>' +
+            '<section id="js_content">Draft body</section>',
+        )
+      }
+      throw new Error('Unexpected request')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(
+      Array.from({ length: 11 }, (_, index) => String(index * 10)),
+    )
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      title: 'Record cap draft',
+    })
+  })
+
+  it('allows draft fallback when the twentieth request is an empty sentinel', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=request-cap-sentinel'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = Number(new URL(url).searchParams.get('begin'))
+        begins.push(String(begin))
+        return jsonResponse({
+          publish_page: {
+            total_count: 19,
+            publish_list:
+              begin === 19
+                ? Array.from({ length: 10 }, () => ({ publish_info: '' }))
+                : [
+                    {
+                      publish_info: {
+                        draft_msgid: String(12_000 + begin),
+                        publish_status: 200,
+                      },
+                    },
+                    ...Array.from({ length: 9 }, () => ({
+                      publish_info: '',
+                    })),
+                  ],
+          },
+        })
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">Request cap draft</h1>' +
+            '<section id="js_content">Draft body</section>',
+        )
+      }
+      throw new Error('Unexpected request')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(
+      Array.from({ length: 20 }, (_, index) => String(index)),
+    )
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      title: 'Request cap draft',
+    })
+  })
+
+  it('requires review when the twentieth request still has a materialized record', async () => {
     const begins: string[] = []
     const { runtime } = createInspectionRuntime(async (url) => {
       if (url === 'https://mp.weixin.qq.com/') {
@@ -1032,14 +2162,17 @@ describe('WeixinAdapter publication inspection', () => {
         return jsonResponse({
           publish_page: {
             total_count: 100,
-            publish_list: Array.from({ length: 10 }, (_, index) => ({
-              publish_info: {
-                draft_msgid: String(
-                  Number(parsed.searchParams.get('begin')) + index + 1,
-                ),
-                publish_status: 200,
+            publish_list: [
+              {
+                publish_info: {
+                  draft_msgid: String(
+                    Number(parsed.searchParams.get('begin')) + 1,
+                  ),
+                  publish_status: 200,
+                },
               },
-            })),
+              ...Array.from({ length: 9 }, () => ({ publish_info: '' })),
+            ],
           },
         })
       }
@@ -1050,7 +2183,9 @@ describe('WeixinAdapter publication inspection', () => {
 
     const observations = await adapter.inspectPublication(INSPECT_REQUEST)
 
-    expect(begins).toEqual(['0', '10', '20', '30', '40'])
+    expect(begins).toEqual(
+      Array.from({ length: 20 }, (_, index) => String(index)),
+    )
     expect(observations[0]).toMatchObject({
       outcome: 'REVIEW_REQUIRED',
       source: 'PUBLISHED_LIST',
@@ -1062,19 +2197,113 @@ describe('WeixinAdapter publication inspection', () => {
     expect(observations[0]).not.toHaveProperty('bodyText')
   })
 
+  it('treats a reported count above the cap as advisory and finds an early target', async () => {
+    const publicUrl = 'https://mp.weixin.qq.com/s/high-count-early-target'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = new URL(url).searchParams.get('begin') ?? ''
+        begins.push(begin)
+        if (begin === '1') return publishedListResponse(publicUrl)
+        return jsonResponse({
+          publish_page: {
+            total_count: 101,
+            publish_list: [
+              { publish_info: { draft_msgid: '8999', publish_status: 200 } },
+            ],
+          },
+        })
+      }
+      if (url === publicUrl) {
+        return publicHtmlResponse(
+          '<h1 id="activity-name">High count target</h1>' +
+            '<section id="js_content">Published body</section>',
+          publicUrl,
+        )
+      }
+      throw new Error('Unexpected request')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(['0', '1'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      canonicalUrl: publicUrl,
+      title: 'High count target',
+    })
+  })
+
+  it('allows an empty sentinel even when the reported count exceeds the cap', async () => {
+    const tempUrl = 'https://mp.weixin.qq.com/s?tempkey=high-count-sentinel'
+    const begins: string[] = []
+    const { runtime } = createInspectionRuntime(async (url) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        return new Response(authHtml('fresh-token'))
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        const begin = new URL(url).searchParams.get('begin') ?? ''
+        begins.push(begin)
+        return jsonResponse({
+          publish_page: {
+            total_count: 101,
+            publish_list:
+              begin === '0'
+                ? [
+                    {
+                      publish_info: {
+                        draft_msgid: '8999',
+                        publish_status: 200,
+                      },
+                    },
+                  ]
+                : Array.from({ length: 10 }, () => ({ publish_info: '' })),
+          },
+        })
+      }
+      if (url.includes('action=get_temp_url')) {
+        return jsonResponse({ base_resp: { ret: 0 }, temp_url: tempUrl })
+      }
+      if (url === tempUrl) {
+        return new Response(
+          '<h1 id="activity-name">High count draft</h1>' +
+            '<section id="js_content">Draft body</section>',
+        )
+      }
+      throw new Error('Unexpected request')
+    })
+    const adapter = new WeixinAdapter()
+    await adapter.init(runtime)
+
+    const observations = await adapter.inspectPublication(INSPECT_REQUEST)
+
+    expect(begins).toEqual(['0', '1'])
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      title: 'High count draft',
+    })
+  })
+
   it.each([
     {
       tempUrl: 'https://attacker.example/s?tempkey=must-not-leak',
       page: '<h1 id="activity-name">Title</h1><div id="js_content">Body</div>',
       errorCode: 'WEIXIN_TEMP_URL_HOST_MISMATCH',
-      expectedFetchCount: 3,
+      expectedFetchCount: 5,
       outcome: 'PARSE_ERROR',
     },
     {
       tempUrl: 'https://mp.weixin.qq.com/s?tempkey=memory-only',
       page: '<main>changed page structure</main>',
       errorCode: 'WEIXIN_DRAFT_STATE_REVIEW_REQUIRED',
-      expectedFetchCount: 4,
+      expectedFetchCount: 6,
       outcome: 'REVIEW_REQUIRED',
     },
   ])(

@@ -6,13 +6,15 @@
   var PUBLICATION_BRIDGE_NAMESPACE_V3 = 'byfire.publication-bridge';
   var PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3 = 3;
   var PUBLICATION_BRIDGE_REQUEST_ID_MAX_LENGTH_V3 = 128;
-  // Account resolution and inspection can each consume a bounded 12 seconds.
-  // Keep the page transport deadline above the longest sequential read path.
+  // Keep the page transport deadline above the coordinator's end-to-end
+  // command deadline so structured failures can cross the page boundary.
   var PUBLICATION_BRIDGE_TIMEOUT_MS_V3 = 30000;
+  var PUBLICATION_INSPECT_TIMEOUT_MS_V3 = 40000;
   var BRIDGE_REQUEST_DIRECTION = 'PAGE_TO_EXTENSION';
   var BRIDGE_RESPONSE_DIRECTION = 'EXTENSION_TO_PAGE';
   var PUBLICATION_BRIDGE_REQUEST_DIRECTION_V3 = 'REQUEST';
   var PUBLICATION_BRIDGE_RESPONSE_DIRECTION_V3 = 'RESPONSE';
+  var PUBLICATION_BRIDGE_TRANSPORT_ERROR_DIRECTION_V3 = 'TRANSPORT_ERROR';
 
   var poster = {
     versionNumber: 1001,
@@ -80,6 +82,12 @@
     );
   }
 
+  function publicationBridgeTimeoutMsV3(command) {
+    return command === 'publication.inspect'
+      ? PUBLICATION_INSPECT_TIMEOUT_MS_V3
+      : PUBLICATION_BRIDGE_TIMEOUT_MS_V3;
+  }
+
   function callPublicationBridgeV3(request, cb) {
     var callback = typeof cb === 'function' ? cb : function() {};
     if (!isPublicationBridgeRequestV3(request)) {
@@ -112,7 +120,7 @@
         code: 'BRIDGE_REQUEST_TIMEOUT',
         message: 'The Publication Bridge request timed out.',
       });
-    }, PUBLICATION_BRIDGE_TIMEOUT_MS_V3);
+    }, publicationBridgeTimeoutMsV3(request.command));
 
     window.postMessage(request, location.origin);
   }
@@ -223,6 +231,34 @@
 
   window.addEventListener('message', function(evt) {
     try {
+      if (
+        evt.source === window &&
+        evt.origin === location.origin &&
+        evt.data &&
+        typeof evt.data === 'object' &&
+        evt.data.namespace === PUBLICATION_BRIDGE_NAMESPACE_V3 &&
+        evt.data.direction === PUBLICATION_BRIDGE_TRANSPORT_ERROR_DIRECTION_V3 &&
+        evt.data.protocolMajor === PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3
+      ) {
+        var publicationBridgeTransportCallback =
+          publicationBridgeEventCbV3[evt.data.requestId];
+        if (
+          !publicationBridgeTransportCallback ||
+          publicationBridgeTransportCallback.command !== evt.data.command ||
+          !evt.data.error ||
+          typeof evt.data.error !== 'object' ||
+          typeof evt.data.error.code !== 'string' ||
+          typeof evt.data.error.message !== 'string'
+        ) return;
+
+        if (publicationBridgeTransportCallback.timeoutId !== undefined) {
+          clearTimeout(publicationBridgeTransportCallback.timeoutId);
+        }
+        delete publicationBridgeEventCbV3[evt.data.requestId];
+        publicationBridgeTransportCallback.callback(evt.data.error);
+        return;
+      }
+
       if (
         evt.source === window &&
         evt.origin === location.origin &&

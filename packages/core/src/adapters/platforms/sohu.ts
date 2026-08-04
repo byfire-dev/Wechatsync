@@ -6,6 +6,7 @@ import type { Article, AuthResult, SyncResult, PlatformMeta } from '../../types'
 import type {
   AdapterAccount,
   AdapterAccountProbe,
+  AdapterOperationContext,
   PreprocessConfig,
   PublicationPublishedProof,
   PublishOptions,
@@ -15,6 +16,11 @@ import {
   normalizeAdapterAccountBinding,
   resolveAdapterAccountBinding,
 } from '../account-binding'
+import { openTrustedPublicationDraft } from '../publication-draft-open'
+import type {
+  OpenPublicationDraftRequest,
+  OpenPublicationDraftResult,
+} from '../../publication-inspection/types'
 import type {
   PublicationInspectionObservation as PublicationObservation,
   PublicationInspectionRequest as PublicationInspectRequest,
@@ -115,15 +121,20 @@ export class SohuAdapter extends CodeAdapter {
    * A malformed row invalidates the complete probe so it cannot be mistaken
    * for a safe single-account session.
    */
-  async probeAccounts(): Promise<AdapterAccountProbe> {
+  async probeAccounts(
+    context?: AdapterOperationContext,
+  ): Promise<AdapterAccountProbe> {
+    context?.signal?.throwIfAborted()
     try {
       const response = await this.runtime.fetch(
         `https://mp.sohu.com/mpbp/bp/account/list?_=${Date.now()}`,
         {
           method: 'GET',
           credentials: 'include',
+          signal: context?.signal,
         },
       )
+      context?.signal?.throwIfAborted()
       if (!response.ok) {
         return {
           status: 'PROBE_FAILED',
@@ -195,6 +206,7 @@ export class SohuAdapter extends CodeAdapter {
       })
       return { status: 'AUTHENTICATED', accounts }
     } catch {
+      context?.signal?.throwIfAborted()
       logger.debug('Sohu account probe failed')
       return {
         status: 'PROBE_FAILED',
@@ -310,6 +322,20 @@ export class SohuAdapter extends CodeAdapter {
       publicAccess: observation.publicAccess,
       bodyTruncated: observation.bodyTruncated,
     }
+  }
+
+  async openPublicationDraft(
+    request: OpenPublicationDraftRequest,
+    context?: AdapterOperationContext,
+  ): Promise<OpenPublicationDraftResult> {
+    return openTrustedPublicationDraft({
+      expectedPlatform: 'sohu',
+      request,
+      runtime: this.runtime,
+      probeAccounts: (operationContext) =>
+        this.probeAccounts(operationContext),
+      context,
+    })
   }
 
   /**

@@ -1,0 +1,31 @@
+{
+  "base_resp": {
+    "err_msg": "ok",
+    "ret": 0
+  },
+  "publish_page": {
+    "total_count": 1,
+    "publish_count": 1,
+    "masssend_count": 0,
+    "publish_list": [
+      {
+        "publish_type": 1,
+        "publish_info": {
+          "publish_info": {
+            "draft_msgid": "900000001",
+            "publish_status": 200,
+            "create_time": 1720000000
+          },
+          "appmsgex": [
+            {
+              "itemidx": 1,
+              "content_url": "https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777000001&idx=1"
+            }
+          ],
+          "publish_type": 1
+        }
+      }
+    ],
+    "featured_count": 0
+  }
+}

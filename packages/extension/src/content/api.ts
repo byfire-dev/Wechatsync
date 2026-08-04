@@ -53,6 +53,7 @@ import {
 } from '../bridge/sync-result'
 
 const logger = createLogger('Wechatsync')
+const PUBLICATION_BRIDGE_TRANSPORT_ERROR_DIRECTION_V3 = 'TRANSPORT_ERROR'
 
 const BRIDGE_CAPABILITIES = [
   'account_identity',
@@ -140,6 +141,26 @@ function postBridgeResponse(
   targetOrigin: string,
 ) {
   window.postMessage(response, targetOrigin)
+}
+
+function postPublicationBridgeTransportFailureV3(
+  request: PublicationBridgeV3Request,
+  targetOrigin: string,
+) {
+  window.postMessage(
+    {
+      namespace: request.namespace,
+      direction: PUBLICATION_BRIDGE_TRANSPORT_ERROR_DIRECTION_V3,
+      protocolMajor: request.protocolMajor,
+      requestId: request.requestId,
+      command: request.command,
+      error: {
+        code: 'BRIDGE_RUNTIME_ERROR',
+        message: 'The Publication Bridge transport failed.',
+      },
+    },
+    targetOrigin,
+  )
 }
 
 function createBridgeFailure(
@@ -352,6 +373,7 @@ export async function handlePublicationBridgeRequestV3(
     }
   } catch (error) {
     logger.error('Publication Bridge request failed:', error)
+    postPublicationBridgeTransportFailureV3(request, evt.origin)
   }
 }
 

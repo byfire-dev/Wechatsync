@@ -97,6 +97,18 @@ export type PublicationInspectionPublicAccess = z.infer<
   typeof PublicationInspectionPublicAccessSchema
 >
 
+export const PublicationInspectionKnownPublicLocatorSchema = z
+  .object({
+    publicUrl: z.string().url().max(4_096),
+    publicIdentityKey: z
+      .string()
+      .trim()
+      .min(3)
+      .max(500)
+      .regex(/^\S+$/),
+  })
+  .strict()
+
 export const PublicationInspectionRequestSchema = z
   .object({
     requestId: z.string().trim().min(1).max(128),
@@ -116,9 +128,28 @@ export const PublicationInspectionRequestSchema = z
         publishedBefore: z.string().datetime({ offset: true }).optional(),
       })
       .strict(),
+    knownPublicLocator: PublicationInspectionKnownPublicLocatorSchema.optional(),
     limit: z.number().int().min(1).max(20),
   })
   .strict()
+  .superRefine((value, ctx) => {
+    if (!value.knownPublicLocator) return
+    const identity = derivePublicationPublicIdentity(
+      value.platform,
+      value.knownPublicLocator.publicUrl,
+    )
+    if (
+      !identity ||
+      identity.canonicalUrl !== value.knownPublicLocator.publicUrl ||
+      identity.key !== value.knownPublicLocator.publicIdentityKey
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['knownPublicLocator'],
+        message: 'known public locator must contain one canonical platform identity',
+      })
+    }
+  })
 
 export type PublicationInspectionRequest = z.infer<
   typeof PublicationInspectionRequestSchema

@@ -303,19 +303,29 @@ describe('Bridge v2 account projection', () => {
         externalAccountId: 'account-toutiao',
         displayName: 'Creator A',
         homepage: 'https://mp.toutiao.com/profile_v4/index',
-        capabilities: ['account_identity'],
+        capabilities: ['account_identity', 'draft_open'],
       },
       {
         platform: 'zhihu',
         externalAccountId: 'account-zhihu',
         displayName: 'Zhihu Creator',
-        capabilities: ['account_identity', 'publication_inspect', 'public_url'],
+        capabilities: [
+          'account_identity',
+          'draft_open',
+          'publication_inspect',
+          'public_url',
+        ],
       },
       {
         platform: 'sohu',
         externalAccountId: '120000001',
         displayName: 'Sohu Creator',
-        capabilities: ['account_identity', 'publication_inspect', 'public_url'],
+        capabilities: [
+          'account_identity',
+          'draft_open',
+          'publication_inspect',
+          'public_url',
+        ],
       },
       {
         platform: 'weixin',
@@ -361,7 +371,7 @@ describe('Bridge v2 account projection', () => {
     expect(accounts[0]).toMatchObject({
       platform: 'toutiao',
       externalAccountId: 'first',
-      capabilities: ['account_identity'],
+      capabilities: ['account_identity', 'draft_open'],
     })
   })
 
@@ -405,7 +415,7 @@ describe('Bridge v2 account projection', () => {
           platform: 'toutiao',
           externalAccountId: '7390000000000000001',
           displayName: 'Toutiao',
-          capabilities: ['account_identity'],
+          capabilities: ['account_identity', 'draft_open'],
         },
       ],
       probes: [
@@ -439,13 +449,26 @@ describe('Bridge v2 account projection', () => {
 })
 
 describe('Bridge v2 authenticated draft opening', () => {
+  it('fails closed when an adapter does not expose the draft-open capability', async () => {
+    await expect(
+      runOpenPublicationDraft(openDraftPayload, {
+        probeAccounts: vi.fn(),
+      }),
+    ).rejects.toThrow('PUBLICATION_DRAFT_OPEN_NOT_SUPPORTED')
+  })
+
   it('re-authenticates, binds the account, and returns only opened=true', async () => {
     const events: string[] = []
-    const checkAuth = vi.fn(async () => {
-      events.push('auth')
+    const probeAccounts = vi.fn(async () => {
+      events.push('probe')
       return {
-        isAuthenticated: true,
-        userId: openDraftPayload.externalAccountId,
+        status: 'AUTHENTICATED' as const,
+        accounts: [
+          {
+            externalAccountId: openDraftPayload.externalAccountId,
+            displayName: 'Bound account',
+          },
+        ],
       }
     })
     const openPublicationDraft = vi.fn(async () => {
@@ -455,28 +478,38 @@ describe('Bridge v2 authenticated draft opening', () => {
 
     await expect(
       runOpenPublicationDraft(openDraftPayload, {
-        checkAuth,
+        probeAccounts,
         openPublicationDraft,
       }),
     ).resolves.toEqual({ opened: true })
-    expect(events).toEqual(['auth', 'open'])
+    expect(events).toEqual(['probe', 'open'])
     expect(openPublicationDraft).toHaveBeenCalledWith(
       openDraftPayload,
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        verifiedAccountProbe: expect.objectContaining({
+          status: 'AUTHENTICATED',
+        }),
+      }),
     )
   })
 
   it('uses one end-to-end deadline for authentication and tab opening', async () => {
     vi.useFakeTimers()
     try {
-      let authSignal: AbortSignal | undefined
+      let probeSignal: AbortSignal | undefined
       let openSignal: AbortSignal | undefined
-      const checkAuth = vi.fn(async (context) => {
-        authSignal = context?.signal
+      const probeAccounts = vi.fn(async (context) => {
+        probeSignal = context?.signal
         await new Promise((resolve) => setTimeout(resolve, 7))
         return {
-          isAuthenticated: true,
-          userId: openDraftPayload.externalAccountId,
+          status: 'AUTHENTICATED' as const,
+          accounts: [
+            {
+              externalAccountId: openDraftPayload.externalAccountId,
+              displayName: 'Bound account',
+            },
+          ],
         }
       })
       const openPublicationDraft = vi.fn((_request, context) => {
@@ -491,7 +524,7 @@ describe('Bridge v2 authenticated draft opening', () => {
       })
       const result = runOpenPublicationDraft(
         openDraftPayload,
-        { checkAuth, openPublicationDraft },
+        { probeAccounts, openPublicationDraft },
         10,
       )
       const rejection = expect(result).rejects.toThrow(
@@ -500,7 +533,7 @@ describe('Bridge v2 authenticated draft opening', () => {
 
       await vi.advanceTimersByTimeAsync(7)
       expect(openPublicationDraft).toHaveBeenCalledTimes(1)
-      expect(openSignal).toBe(authSignal)
+      expect(openSignal).toBe(probeSignal)
 
       await vi.advanceTimersByTimeAsync(3)
       await rejection
@@ -515,9 +548,14 @@ describe('Bridge v2 authenticated draft opening', () => {
 
     await expect(
       runOpenPublicationDraft(openDraftPayload, {
-        checkAuth: vi.fn().mockResolvedValue({
-          isAuthenticated: true,
-          userId: 'another-account',
+        probeAccounts: vi.fn().mockResolvedValue({
+          status: 'AUTHENTICATED',
+          accounts: [
+            {
+              externalAccountId: 'another-account',
+              displayName: 'Another account',
+            },
+          ],
         }),
         openPublicationDraft,
       }),
@@ -527,9 +565,14 @@ describe('Bridge v2 authenticated draft opening', () => {
 
   it('rejects over-broad results and redacts adapter exception details', async () => {
     const adapter = {
-      checkAuth: vi.fn().mockResolvedValue({
-        isAuthenticated: true,
-        userId: openDraftPayload.externalAccountId,
+      probeAccounts: vi.fn().mockResolvedValue({
+        status: 'AUTHENTICATED',
+        accounts: [
+          {
+            externalAccountId: openDraftPayload.externalAccountId,
+            displayName: 'Bound account',
+          },
+        ],
       }),
       openPublicationDraft: vi.fn(),
     }

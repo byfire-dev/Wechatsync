@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { AdapterOperationContext } from '@wechatsync/core'
 import { ZhihuAdapter } from '../../core/src/adapters/platforms/zhihu'
 import type { PublicationInspectRequest } from '@wechatsync/core/publication-inspection'
 import { ExtensionRuntime } from '../src/runtime/extension'
@@ -75,11 +76,14 @@ function htmlResponse(url: string, body: string, status = 200): Response {
   } as Response
 }
 
-async function inspectWith(fetchMock: ReturnType<typeof vi.fn>) {
+async function inspectWith(
+  fetchMock: ReturnType<typeof vi.fn>,
+  context?: AdapterOperationContext,
+) {
   vi.stubGlobal('fetch', fetchMock)
   const adapter = new ZhihuAdapter()
   await adapter.init(new ExtensionRuntime())
-  return adapter.inspectPublication(request)
+  return adapter.inspectPublication(request, context)
 }
 
 afterEach(() => {
@@ -87,6 +91,38 @@ afterEach(() => {
 })
 
 describe('ZhihuAdapter with ExtensionRuntime', () => {
+  it('reuses the coordinator account proof and forwards its cancellation signal', async () => {
+    const controller = new AbortController()
+    let runtimeSignal: AbortSignal | null = null
+    const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
+      expect(url).toBe(PUBLIC_URL)
+      runtimeSignal = options?.signal ?? null
+      return htmlResponse(PUBLIC_URL, publishedHtml)
+    })
+
+    const observations = await inspectWith(fetchMock, {
+      signal: controller.signal,
+      verifiedAccountProbe: {
+        status: 'AUTHENTICATED',
+        accounts: [
+          {
+            externalAccountId: ACCOUNT_ID,
+            displayName: 'Verified Zhihu account',
+          },
+        ],
+      },
+    })
+
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({ outcome: 'PUBLISHED' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(runtimeSignal).toBeInstanceOf(AbortSignal)
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      'https://www.zhihu.com/api/v4/me',
+      expect.anything(),
+    )
+  })
+
   it('uses authentication for identity but anonymous credentials for public evidence', async () => {
     const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
       if (url === 'https://www.zhihu.com/api/v4/me') {

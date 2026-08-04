@@ -15,6 +15,11 @@ import {
   normalizeAdapterExternalAccountId,
   resolveAdapterAccountBinding,
 } from '../account-binding'
+import { openTrustedPublicationDraft } from '../publication-draft-open'
+import type {
+  OpenPublicationDraftRequest,
+  OpenPublicationDraftResult,
+} from '../../publication-inspection/types'
 import type {
   PublicationInspectionObservation as PublicationObservation,
   PublicationInspectionRequest as PublicationInspectRequest,
@@ -188,10 +193,32 @@ export class ZhihuAdapter extends CodeAdapter {
 
   async inspectPublication(
     request: PublicationInspectRequest,
+    context?: AdapterOperationContext,
   ): Promise<PublicationObservation[]> {
+    const verifiedAccount =
+      context?.verifiedAccountProbe?.status === 'AUTHENTICATED'
+        ? context.verifiedAccountProbe.accounts.find(
+            (account) =>
+              account.externalAccountId === request.externalAccountId,
+          )
+        : undefined
+
     return inspectZhihuPublication(request, {
-      checkAuth: () => this.checkAuth(),
-      fetch: (url, options) => this.runtime.fetch(url, options),
+      checkAuth: verifiedAccount
+        ? async () => ({
+            isAuthenticated: true,
+            userId: verifiedAccount.externalAccountId,
+            username: verifiedAccount.displayName,
+            ...(verifiedAccount.avatarUrl
+              ? { avatar: verifiedAccount.avatarUrl }
+              : {}),
+          })
+        : () => this.checkAuth(context),
+      fetch: (url, options) =>
+        this.runtime.fetch(url, {
+          ...options,
+          signal: context?.signal,
+        }),
     })
   }
 
@@ -232,6 +259,20 @@ export class ZhihuAdapter extends CodeAdapter {
       publicAccess,
       bodyTruncated: observation.bodyTruncated,
     }
+  }
+
+  async openPublicationDraft(
+    request: OpenPublicationDraftRequest,
+    context?: AdapterOperationContext,
+  ): Promise<OpenPublicationDraftResult> {
+    return openTrustedPublicationDraft({
+      expectedPlatform: 'zhihu',
+      request,
+      runtime: this.runtime,
+      probeAccounts: (operationContext) =>
+        this.probeAccounts(operationContext),
+      context,
+    })
   }
 
   async publish(

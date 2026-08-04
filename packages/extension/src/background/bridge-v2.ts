@@ -20,6 +20,7 @@ import {
   type SyncerAccountsV2Detailed,
 } from '@wechatsync/core/publication-inspection'
 import type { PlatformAdapter } from '@wechatsync/core'
+import { resolveAdapterAccountBinding } from '@wechatsync/core/adapters'
 
 import {
   DEFAULT_BRIDGE_ALLOWED_ORIGINS,
@@ -33,9 +34,19 @@ import {
 
 const BRIDGE_ORIGIN = DEFAULT_BRIDGE_ALLOWED_ORIGINS[0]
 const ACCOUNT_CAPABILITIES = {
-  toutiao: ['account_identity'],
-  zhihu: ['account_identity', 'publication_inspect', 'public_url'],
-  sohu: ['account_identity', 'publication_inspect', 'public_url'],
+  toutiao: ['account_identity', 'draft_open'],
+  zhihu: [
+    'account_identity',
+    'draft_open',
+    'publication_inspect',
+    'public_url',
+  ],
+  sohu: [
+    'account_identity',
+    'draft_open',
+    'publication_inspect',
+    'public_url',
+  ],
   weixin: [
     'account_identity',
     'draft_open',
@@ -52,7 +63,6 @@ const ACTIVE_INSPECTION_PLATFORMS = new Set<PublicationPlatform>([
   'sohu',
   'weixin',
 ])
-const ACTIVE_DRAFT_OPEN_PLATFORMS = new Set<PublicationPlatform>(['weixin'])
 const GET_ACCOUNTS_KEYS = new Set(['platforms', 'forceRefresh'])
 const INSPECT_KEYS = new Set([
   'requestId',
@@ -597,7 +607,7 @@ export function createUnsupportedPublicationObservation(
 
 type PublicationDraftOpenerAdapter = Pick<
   PlatformAdapter,
-  'checkAuth' | 'openPublicationDraft'
+  'probeAccounts' | 'openPublicationDraft'
 >
 
 function createInspectionFailure(
@@ -681,35 +691,41 @@ export async function runOpenPublicationDraft(
   adapter: PublicationDraftOpenerAdapter | null,
   timeoutMs = INSPECTION_TIMEOUT_MS,
 ): Promise<OpenPublicationDraftResult> {
-  if (
-    !ACTIVE_DRAFT_OPEN_PLATFORMS.has(request.platform) ||
-    !adapter?.openPublicationDraft
-  ) {
+  if (!adapter?.probeAccounts || !adapter.openPublicationDraft) {
     throw draftOpenFailure('PUBLICATION_DRAFT_OPEN_NOT_SUPPORTED')
   }
 
   try {
     return await withInspectionDeadline(async (signal) => {
-      let auth
+      let probe
       try {
-        auth = await adapter.checkAuth({ signal })
+        probe = await adapter.probeAccounts!({ signal })
       } catch {
         throw draftOpenFailure('ACCOUNT_AUTH_CHECK_FAILED')
       }
 
-      if (!auth.isAuthenticated) {
-        throw draftOpenFailure('LOGIN_REQUIRED')
-      }
-      if (!auth.userId) {
-        throw draftOpenFailure('ACCOUNT_ID_MISSING')
-      }
-      if (auth.userId !== request.externalAccountId) {
-        throw draftOpenFailure('ACCOUNT_MISMATCH')
+      const selection = resolveAdapterAccountBinding(probe, {
+        externalAccountId: request.externalAccountId,
+      })
+      if (!selection.ok) {
+        if (selection.errorCode === 'ACCOUNT_NOT_AUTHENTICATED') {
+          throw draftOpenFailure('LOGIN_REQUIRED')
+        }
+        if (
+          selection.errorCode === 'ACCOUNT_BINDING_NOT_FOUND' ||
+          selection.errorCode === 'INVALID_ACCOUNT_BINDING'
+        ) {
+          throw draftOpenFailure('ACCOUNT_MISMATCH')
+        }
+        throw draftOpenFailure('ACCOUNT_AUTH_CHECK_FAILED')
       }
 
       let value: unknown
       try {
-        value = await adapter.openPublicationDraft!(request, { signal })
+        value = await adapter.openPublicationDraft!(request, {
+          signal,
+          verifiedAccountProbe: probe,
+        })
       } catch (error) {
         const code = error instanceof Error ? error.message : ''
         throw draftOpenFailure(

@@ -101,8 +101,21 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
         return jsonResponse({
           base_resp: { ret: 0 },
           publish_page: {
-            total_count: 0,
-            publish_list: [],
+            total_count: 11,
+            publish_list: Array.from({ length: 10 }, () => ({
+              publish_info: '',
+            })),
+          },
+        })
+      }
+      if (url.includes('/cgi-bin/appmsg?') && url.includes('action=list_card')) {
+        const draftType = new URL(url).searchParams.get('type')
+        events.push(`fetch:draft-list:${draftType}`)
+        expect(url).toContain(`token=${TOKEN}`)
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          app_msg_info: {
+            item: draftType === '77' ? [{ app_id: POST_ID }] : [],
           },
         })
       }
@@ -158,6 +171,8 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
       'fetch:auth',
       'rule:add',
       'fetch:published-list',
+      'fetch:draft-list:77',
+      'fetch:draft-list:10',
       'fetch:detail',
       'fetch:temp',
       'rule:remove',
@@ -275,10 +290,64 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
     expect(JSON.stringify(observations)).not.toContain(TOKEN)
   })
 
-  it('does not request a published-list short URL in the MV3 runtime', async () => {
+  it('preserves empty publish_info inline evidence through the MV3 runtime', async () => {
+    const events: string[] = []
+    const publicUrl = 'https://mp.weixin.qq.com/s?__biz=MzA1AA&mid=777&idx=1'
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        events.push('fetch:auth')
+        return new Response(authHtml())
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        events.push('fetch:published-list')
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '',
+                draft_msgid: POST_ID,
+                publish_status: 200,
+                create_time: 1_720_000_000,
+                appmsgex: [{ itemidx: 1, content_url: publicUrl }],
+              },
+            ],
+          },
+        })
+      }
+      if (url === publicUrl) {
+        events.push('fetch:public')
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Published title</h1>' +
+            '<section id="js_content">Published body</section>',
+          publicUrl,
+        )
+      }
+      throw new Error('Draft fallback must not run')
+    })
+
+    const { observations } = await inspectWith(fetchMock, events)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      platformPostId: POST_ID,
+      canonicalUrl: publicUrl,
+    })
+    expect(events).toEqual([
+      'fetch:auth',
+      'rule:add',
+      'fetch:published-list',
+      'fetch:public',
+      'rule:remove',
+    ])
+  })
+
+  it('verifies a direct published-list short URL in the MV3 runtime', async () => {
     const events: string[] = []
     const shortUrl = 'https://mp.weixin.qq.com/s/ShortAbC_123'
-    const fetchMock = vi.fn(async (url: string) => {
+    const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
       if (url === 'https://mp.weixin.qq.com/') {
         events.push('fetch:auth')
         return new Response(authHtml())
@@ -309,7 +378,68 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
           },
         })
       }
-      throw new Error('A short public URL must not leave the service worker')
+      if (url === shortUrl) {
+        events.push('fetch:public')
+        expect(options).toMatchObject({
+          credentials: 'omit',
+          redirect: 'error',
+          cache: 'no-store',
+        })
+        return publicHtmlResponse(
+          '<h1 id="activity-name">Published title</h1>' +
+            '<section id="js_content">Published body</section>',
+          shortUrl,
+        )
+      }
+      throw new Error('Draft fallback must not run')
+    })
+
+    const { observations } = await inspectWith(fetchMock, events)
+
+    expect(observations[0]).toMatchObject({
+      outcome: 'PUBLISHED',
+      source: 'PUBLIC_PAGE',
+      platformPostId: POST_ID,
+      canonicalUrl: shortUrl,
+      publicAccess: {
+        status: 'CONFIRMED',
+        checkedUrl: shortUrl,
+        checkedPublicIdentityKey: 'weixin:short:v1:ShortAbC_123',
+        checkedAt: expect.any(String),
+        httpStatus: 200,
+      },
+    })
+    expect(events).toEqual([
+      'fetch:auth',
+      'rule:add',
+      'fetch:published-list',
+      'fetch:public',
+      'rule:remove',
+    ])
+  })
+
+  it('preserves a safe published-list shape diagnostic through the MV3 runtime', async () => {
+    const events: string[] = []
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === 'https://mp.weixin.qq.com/') {
+        events.push('fetch:auth')
+        return new Response(authHtml())
+      }
+      if (url.includes('/cgi-bin/appmsgpublish?')) {
+        events.push('fetch:published-list')
+        return jsonResponse({
+          base_resp: { ret: 0 },
+          publish_page: {
+            total_count: 1,
+            publish_list: [
+              {
+                publish_info: '{secret-account-title-url-token',
+              },
+            ],
+          },
+        })
+      }
+      throw new Error('No draft fallback is allowed')
     })
 
     const { observations } = await inspectWith(fetchMock, events)
@@ -318,7 +448,10 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
       outcome: 'REVIEW_REQUIRED',
       source: 'PUBLISHED_LIST',
       platformPostId: POST_ID,
-      errorCode: 'WEIXIN_PUBLISHED_EVIDENCE_INCOMPLETE',
+      errorCode: 'WEIXIN_PUBLISHED_LIST_PUBLISH_INFO_INVALID',
+      errorMessage: expect.stringContaining(
+        'wx-list-shape:v1;publish_info=string:invalid-json',
+      ),
     })
     expect(events).toEqual([
       'fetch:auth',
@@ -326,7 +459,10 @@ describe('WeixinAdapter with ExtensionRuntime', () => {
       'fetch:published-list',
       'rule:remove',
     ])
-    expect(JSON.stringify(observations)).not.toContain(shortUrl)
+    expect(JSON.stringify(observations)).not.toContain(TOKEN)
+    expect(JSON.stringify(observations)).not.toContain(
+      'secret-account-title-url-token',
+    )
   })
 
   it('rejects a conflicting request appMsgId before authentication', async () => {

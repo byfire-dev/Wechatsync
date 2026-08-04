@@ -18,6 +18,10 @@ import {
   type PublicationBridgeV3CoordinatorDependencies,
   type PublicationBridgeV3StateStore,
 } from "../src/background/bridge-v3";
+import {
+  PublicationInspectionTimeoutError,
+  withPublicationInspectionDeadline,
+} from "../src/background/publication-inspection-runner";
 
 const NOW = "2026-08-02T08:00:00.000Z";
 const OBSERVED_AT = "2026-08-02T07:59:30.000Z";
@@ -125,11 +129,7 @@ function createAdapter(platform: PlatformId): PlatformAdapter {
       publicAccess,
       bodyTruncated: false,
     }),
-    ...(platform === "weixin"
-      ? {
-          openPublicationDraft: vi.fn().mockResolvedValue({ opened: true }),
-        }
-      : {}),
+    openPublicationDraft: vi.fn().mockResolvedValue({ opened: true }),
   };
 }
 
@@ -186,14 +186,17 @@ function createHarness(options: HarnessOptions = {}) {
   };
 }
 
-function negotiationRequest(requestId = "request-negotiate") {
+function negotiationRequest(
+  requestId = "request-negotiate",
+  supportedContractVersions: string[] = [PUBLICATION_BRIDGE_CONTRACT_VERSION],
+) {
   return PublicationBridgeV3RequestSchema.parse({
     namespace: PUBLICATION_BRIDGE_NAMESPACE,
     direction: "REQUEST",
     protocolMajor: PUBLICATION_BRIDGE_PROTOCOL_MAJOR,
     command: "bridge.negotiate",
     requestId,
-    supportedContractVersions: [PUBLICATION_BRIDGE_CONTRACT_VERSION],
+    supportedContractVersions,
   });
 }
 
@@ -201,12 +204,13 @@ function commandRequest(
   sessionId: string,
   command: Exclude<PublicationBridgeV3Request["command"], "bridge.negotiate">,
   fields: Record<string, unknown>,
+  contractVersion: "3.0" | "3.1" = PUBLICATION_BRIDGE_CONTRACT_VERSION,
 ) {
   return PublicationBridgeV3RequestSchema.parse({
     namespace: PUBLICATION_BRIDGE_NAMESPACE,
     direction: "REQUEST",
     protocolMajor: PUBLICATION_BRIDGE_PROTOCOL_MAJOR,
-    contractVersion: PUBLICATION_BRIDGE_CONTRACT_VERSION,
+    contractVersion,
     sessionId,
     command,
     ...fields,
@@ -266,8 +270,12 @@ async function exchange(
 
 async function negotiate(
   coordinator: PublicationBridgeV3Coordinator,
+  supportedContractVersions: string[] = [PUBLICATION_BRIDGE_CONTRACT_VERSION],
 ): Promise<string> {
-  const response = await exchange(coordinator, negotiationRequest());
+  const response = await exchange(
+    coordinator,
+    negotiationRequest("request-negotiate", supportedContractVersions),
+  );
   if (response.command !== "bridge.negotiate" || !response.ok) {
     throw new Error("Expected a successful Bridge v3 negotiation");
   }
@@ -283,13 +291,16 @@ interface StoredStateSnapshot {
 describe("PublicationBridgeV3Coordinator negotiation and account resolution", () => {
   it("negotiates the live four-platform publish runtime without overstating Toutiao inspection", async () => {
     const { coordinator } = createHarness();
-    const response = await exchange(coordinator, negotiationRequest());
+    const response = await exchange(
+      coordinator,
+      negotiationRequest("request-negotiate", ["3.0", "3.1"]),
+    );
 
     expect(response).toMatchObject({
       command: "bridge.negotiate",
       ok: true,
       result: {
-        selectedContractVersion: "3.0",
+        selectedContractVersion: "3.1",
         sessionId: "session-fixture",
         runtime: {
           extensionVersion: "2.0.30",
@@ -304,10 +315,11 @@ describe("PublicationBridgeV3Coordinator negotiation and account resolution", ()
             (["zhihu", "sohu", "weixin", "toutiao"] as const).map((platform) =>
               expect.objectContaining({
                 platform,
-                adapterVersion: "1.0.0",
+                adapterVersion: platform === "weixin" ? "1.0.0" : "1.1.0",
                 capabilities: expect.arrayContaining([
                   "adapter.account.identity",
                   "adapter.draft.publish",
+                  "adapter.draft.open",
                 ]),
               }),
             ),
@@ -327,6 +339,40 @@ describe("PublicationBridgeV3Coordinator negotiation and account resolution", ()
     expect(response.result.runtime.bridgeCapabilities).not.toContain(
       "bridge.publication.operation-events",
     );
+  });
+
+  it("binds every command to the contract version selected for its session", async () => {
+    const { coordinator } = createHarness();
+    const sessionId = await negotiate(coordinator, ["3.0"]);
+
+    const response = await exchange(
+      coordinator,
+      commandRequest(
+        sessionId,
+        "accounts.resolve",
+        {
+          requestId: "request-cross-version-session",
+          payload: {
+            targets: [
+              {
+                platform: "zhihu",
+                expectedExternalAccountId: "zhihu-account",
+              },
+            ],
+          },
+        },
+        "3.1",
+      ),
+    );
+
+    expect(response).toMatchObject({
+      contractVersion: "3.1",
+      ok: false,
+      error: {
+        code: "bridge.session-invalid",
+        stage: "NEGOTIATION",
+      },
+    });
   });
 
   it("projects AVAILABLE, LOGIN_REQUIRED, ACCOUNT_MISMATCH and UNAVAILABLE probes", async () => {
@@ -550,9 +596,10 @@ describe("PublicationBridgeV3Coordinator durable publication lifecycle", () => {
     await exchange(first.coordinator, publishRequest(firstSessionId));
     await first.coordinator.runPublicationOperation("operation-publish-1");
 
-    const template = first.store.snapshot<StoredStateSnapshot>().operations[
-      "operation-publish-1"
-    ];
+    const template =
+      first.store.snapshot<StoredStateSnapshot>().operations[
+        "operation-publish-1"
+      ];
     const operations: StoredStateSnapshot["operations"] = {};
     for (let index = 0; index <= 100; index += 1) {
       const operationId = `operation-history-${index}`;
@@ -598,9 +645,8 @@ describe("PublicationBridgeV3Coordinator durable publication lifecycle", () => {
     const firstSessionId = await negotiate(first.coordinator);
     await exchange(first.coordinator, publishRequest(firstSessionId));
 
-    const syncToPlatform = vi.fn<
-      PublicationBridgeV3CoordinatorDependencies["syncToPlatform"]
-    >();
+    const syncToPlatform =
+      vi.fn<PublicationBridgeV3CoordinatorDependencies["syncToPlatform"]>();
     const upgraded = createHarness({
       store,
       syncToPlatform,
@@ -751,9 +797,7 @@ describe("PublicationBridgeV3Coordinator durable publication lifecycle", () => {
       expect(replay).toBeNull();
       expect(syncToPlatform).toHaveBeenCalledTimes(1);
       expect(
-        store.snapshot<StoredStateSnapshot>().operations[
-          "operation-publish-1"
-        ],
+        store.snapshot<StoredStateSnapshot>().operations["operation-publish-1"],
       ).toEqual(firstRun);
       expect(
         store.snapshot<StoredStateSnapshot>().tasks["operation-publish-1"],
@@ -776,7 +820,8 @@ describe("PublicationBridgeV3Coordinator durable publication lifecycle", () => {
       };
       return new Proxy(result, {
         get(target, property, receiver) {
-          if (property === "postId") throw new Error("malformed adapter result");
+          if (property === "postId")
+            throw new Error("malformed adapter result");
           return Reflect.get(target, property, receiver);
         },
       });
@@ -949,8 +994,102 @@ describe("PublicationBridgeV3Coordinator durable publication lifecycle", () => {
 });
 
 describe("PublicationBridgeV3Coordinator inspection and draft-open commands", () => {
+  it("maps and echoes the v3.1 publication window without weakening its timestamp", async () => {
+    const publishedNotBefore = "2026-08-02T07:55:00.000Z";
+    const { adapters, coordinator } = createHarness();
+    const sessionId = await negotiate(coordinator, ["3.1"]);
+
+    const response = await exchange(
+      coordinator,
+      commandRequest(
+        sessionId,
+        "publication.inspect",
+        {
+          requestId: "request-inspect-v31-window",
+          operationId: "operation-inspect-v31-window",
+          payload: {
+            platform: "zhihu",
+            requestedExternalAccountId: "zhihu-account",
+            locator: { platformPostId: "123456" },
+            publicationWindow: {
+              publishedNotBefore,
+              basis: "DISPATCH_STARTED_AT",
+            },
+          },
+        },
+        "3.1",
+      ),
+    );
+
+    expect(adapters.zhihu.inspectPublication).toHaveBeenCalledWith(
+      expect.objectContaining({
+        draft: expect.objectContaining({
+          platformPostId: "123456",
+          draftedAt: publishedNotBefore,
+        }),
+        articleHint: expect.objectContaining({
+          publishedAfter: publishedNotBefore,
+        }),
+      }),
+      expect.any(Object),
+    );
+    expect(response).toMatchObject({
+      contractVersion: "3.1",
+      command: "publication.inspect",
+      ok: true,
+      result: {
+        publicationWindow: {
+          publishedNotBefore,
+          basis: "DISPATCH_STARTED_AT",
+        },
+      },
+    });
+  });
+
+  it("keeps v3.0 inspection compatible when no publication window is sent", async () => {
+    const { adapters, coordinator } = createHarness();
+    const sessionId = await negotiate(coordinator, ["3.0"]);
+
+    const response = await exchange(
+      coordinator,
+      commandRequest(
+        sessionId,
+        "publication.inspect",
+        {
+          requestId: "request-inspect-v30-no-window",
+          operationId: "operation-inspect-v30-no-window",
+          payload: {
+            platform: "zhihu",
+            requestedExternalAccountId: "zhihu-account",
+            locator: { platformPostId: "123456" },
+          },
+        },
+        "3.0",
+      ),
+    );
+
+    const inspectPublication = vi.mocked(adapters.zhihu.inspectPublication!);
+    const internalRequest = inspectPublication.mock.calls[0]?.[0];
+    expect(internalRequest).toMatchObject({
+      draft: {
+        platformPostId: "123456",
+        draftedAt: "1970-01-01T00:00:00.000Z",
+      },
+    });
+    expect(internalRequest?.articleHint).not.toHaveProperty("publishedAfter");
+    expect(response).toMatchObject({
+      contractVersion: "3.0",
+      command: "publication.inspect",
+      ok: true,
+    });
+    if (response.command !== "publication.inspect" || !response.ok) {
+      throw new Error("Expected a successful v3.0 inspection");
+    }
+    expect(response.result).not.toHaveProperty("publicationWindow");
+  });
+
   it("returns a contract-valid published inspection and rejects Toutiao locator-only inspection", async () => {
-    const { coordinator } = createHarness();
+    const { adapters, coordinator } = createHarness();
     const sessionId = await negotiate(coordinator);
     const inspectZhihu = commandRequest(sessionId, "publication.inspect", {
       requestId: "request-inspect-zhihu",
@@ -992,6 +1131,19 @@ describe("PublicationBridgeV3Coordinator inspection and draft-open commands", ()
         ],
       },
     });
+    expect(adapters.zhihu.probeAccounts).toHaveBeenCalledTimes(1);
+    expect(adapters.zhihu.inspectPublication).toHaveBeenCalledWith(
+      expect.objectContaining({
+        knownPublicLocator: {
+          publicUrl: "https://zhuanlan.zhihu.com/p/123456",
+          publicIdentityKey: "zhihu:post:v1:123456",
+        },
+      }),
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        verifiedAccountProbe: authenticatedAccount("zhihu"),
+      }),
+    );
 
     const toutiao = await exchange(
       coordinator,
@@ -1015,53 +1167,460 @@ describe("PublicationBridgeV3Coordinator inspection and draft-open commands", ()
     });
   });
 
-  it("opens a Weixin draft without exposing an editor URL and fails closed elsewhere", async () => {
+  it.each([
+    {
+      name: "a public URL and identity key for different articles",
+      platform: "zhihu" as const,
+      requestedExternalAccountId: "zhihu-account",
+      platformPostId: "123456",
+      publicUrl: "https://zhuanlan.zhihu.com/p/123456",
+      publicIdentityKey: "zhihu:post:v1:654321",
+    },
+    {
+      name: "a non-canonical public URL even when its identity key is correct",
+      platform: "sohu" as const,
+      requestedExternalAccountId: "sohu-account",
+      platformPostId: "1054312481",
+      publicUrl: "https://m.sohu.com/a/1054312481_120219780/",
+      publicIdentityKey: "sohu:post:v1:1054312481:120219780",
+    },
+  ])("fails closed before adapter inspection for $name", async (testCase) => {
     const { adapters, coordinator } = createHarness();
     const sessionId = await negotiate(coordinator);
-    const openWeixin = commandRequest(sessionId, "publication.openDraft", {
-      requestId: "request-open-weixin",
-      operationId: "operation-open-weixin",
-      payload: {
-        platform: "weixin",
-        requestedExternalAccountId: "weixin-account",
-        draftReference: "9001001",
-      },
-    });
 
-    const opened = await exchange(coordinator, openWeixin);
-    expect(opened).toMatchObject({
-      command: "publication.openDraft",
-      ok: true,
-      result: {
-        platform: "weixin",
-        observedExternalAccountId: "weixin-account",
-        draftReference: "9001001",
-        opened: true,
-      },
-    });
-    expect(adapters.weixin.openPublicationDraft).toHaveBeenCalledWith(
-      expect.objectContaining({
-        platform: "weixin",
-        externalAccountId: "weixin-account",
-        platformPostId: "9001001",
-      }),
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(JSON.stringify(opened)).not.toContain("token=");
-
-    const unavailable = await exchange(
+    const response = await exchange(
       coordinator,
-      commandRequest(sessionId, "publication.openDraft", {
-        requestId: "request-open-sohu",
-        operationId: "operation-open-sohu",
+      commandRequest(sessionId, "publication.inspect", {
+        requestId: `request-inspect-invalid-public-locator-${testCase.platform}`,
+        operationId: `operation-inspect-invalid-public-locator-${testCase.platform}`,
         payload: {
-          platform: "sohu",
-          requestedExternalAccountId: "sohu-account",
-          draftReference: "sohu-draft-1",
+          platform: testCase.platform,
+          requestedExternalAccountId: testCase.requestedExternalAccountId,
+          locator: {
+            platformPostId: testCase.platformPostId,
+            publicUrl: testCase.publicUrl,
+            publicIdentityKey: testCase.publicIdentityKey,
+          },
         },
       }),
     );
-    expect(unavailable).toMatchObject({
+
+    expect(response).toMatchObject({
+      command: "publication.inspect",
+      ok: false,
+      error: {
+        code: "publication.stable-locator-required",
+        stage: "PROTOCOL",
+        retryPolicy: "DO_NOT_RETRY",
+        requiredUserAction: "REVIEW_MANUALLY",
+      },
+    });
+    expect(
+      adapters[testCase.platform].inspectPublication,
+    ).not.toHaveBeenCalled();
+  });
+
+  it("projects blocked public-access reason codes into the v3 namespace", async () => {
+    const adapters = createAdapters();
+    const canonicalUrl = "https://zhuanlan.zhihu.com/p/123456";
+    const blockedPublicAccess = {
+      status: "BLOCKED_BY_PLATFORM" as const,
+      checkedUrl: canonicalUrl,
+      checkedPublicIdentityKey: "zhihu:post:v1:123456",
+      checkedAt: OBSERVED_AT,
+      httpStatus: 403,
+      reasonCode: "ZHIHU_ANONYMOUS_HTTP_403",
+    };
+    adapters.zhihu.inspectPublication = vi.fn().mockResolvedValue([
+      {
+        observationKey: "published:blocked:123456",
+        platform: "zhihu",
+        externalAccountId: "zhihu-account",
+        outcome: "PUBLISHED",
+        source: "AUTHENTICATED_PUBLIC_PAGE",
+        platformPostId: "123456",
+        canonicalUrl,
+        title: "Verified Zhihu article",
+        publishedAt: PUBLISHED_AT,
+        bodyText: "Verified authenticated article body.",
+        bodyTruncated: false,
+        publicAccess: blockedPublicAccess,
+        observedAt: OBSERVED_AT,
+      },
+    ]);
+    adapters.zhihu.provePublishedObservation = vi.fn().mockReturnValue({
+      observedAuthorExternalAccountId: "zhihu-account",
+      publicAccess: blockedPublicAccess,
+      bodyTruncated: false,
+    });
+    const { coordinator } = createHarness({ adapters });
+    const sessionId = await negotiate(coordinator);
+
+    const response = await exchange(
+      coordinator,
+      commandRequest(sessionId, "publication.inspect", {
+        requestId: "request-inspect-zhihu-blocked-public-access",
+        operationId: "operation-inspect-zhihu-blocked-public-access",
+        payload: {
+          platform: "zhihu",
+          requestedExternalAccountId: "zhihu-account",
+          locator: {
+            platformPostId: "123456",
+            publicUrl: canonicalUrl,
+            publicIdentityKey: "zhihu:post:v1:123456",
+          },
+        },
+      }),
+    );
+
+    expect(response).toMatchObject({
+      command: "publication.inspect",
+      ok: true,
+      result: {
+        observations: [
+          {
+            kind: "PUBLISHED",
+            source: "AUTHENTICATED_PAGE",
+            publicAccess: {
+              status: "BLOCKED_BY_PLATFORM",
+              reasonCode: "adapter.zhihu-anonymous-http-403",
+              httpStatus: 403,
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  it("allows the discovery adapter its full child budget after a slow account probe", async () => {
+    vi.useFakeTimers();
+    try {
+      const adapters = createAdapters();
+      adapters.zhihu.probeAccounts = vi.fn(
+        () =>
+          new Promise<AdapterAccountProbe>((resolve) => {
+            setTimeout(() => resolve(authenticatedAccount("zhihu")), 7_900);
+          }),
+      );
+      adapters.zhihu.inspectPublication = vi.fn(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(
+              () =>
+                resolve([
+                  {
+                    observationKey: "published:123456",
+                    platform: "zhihu",
+                    externalAccountId: "zhihu-account",
+                    outcome: "PUBLISHED",
+                    source: "PUBLIC_PAGE",
+                    platformPostId: "123456",
+                    canonicalUrl: "https://zhuanlan.zhihu.com/p/123456",
+                    title: "Verified Zhihu article",
+                    publishedAt: PUBLISHED_AT,
+                    bodyText: "Verified public article body.",
+                    bodyTruncated: false,
+                    publicAccess: {
+                      status: "CONFIRMED",
+                      checkedUrl: "https://zhuanlan.zhihu.com/p/123456",
+                      checkedPublicIdentityKey: "zhihu:post:v1:123456",
+                      checkedAt: OBSERVED_AT,
+                      httpStatus: 200,
+                    },
+                    observedAt: OBSERVED_AT,
+                  },
+                ]),
+              21_900,
+            );
+          }),
+      );
+      const { coordinator } = createHarness({ adapters });
+      const sessionId = await negotiate(coordinator);
+      const pending = exchange(
+        coordinator,
+        commandRequest(sessionId, "publication.inspect", {
+          requestId: "request-inspect-discovery-budget",
+          operationId: "operation-inspect-discovery-budget",
+          payload: {
+            platform: "zhihu",
+            requestedExternalAccountId: "zhihu-account",
+            locator: { platformPostId: "123456" },
+          },
+        }),
+      );
+
+      await vi.advanceTimersByTimeAsync(29_799);
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toMatchObject({
+        ok: true,
+        result: { observations: [{ kind: "PUBLISHED" }] },
+      });
+      expect(adapters.zhihu.probeAccounts).toHaveBeenCalledTimes(1);
+      expect(adapters.zhihu.inspectPublication).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns the account-probe timeout metadata at the eight-second boundary", async () => {
+    vi.useFakeTimers();
+    try {
+      const adapters = createAdapters();
+      let probeSignal: AbortSignal | undefined;
+      adapters.zhihu.probeAccounts = vi.fn(
+        (context) =>
+          new Promise((_resolve, reject) => {
+            probeSignal = context?.signal;
+            context?.signal?.addEventListener(
+              "abort",
+              () => reject(context.signal?.reason),
+              { once: true },
+            );
+          }),
+      );
+      const { coordinator } = createHarness({ adapters });
+      const sessionId = await negotiate(coordinator);
+      const pending = exchange(
+        coordinator,
+        commandRequest(sessionId, "publication.inspect", {
+          requestId: "request-inspect-account-timeout",
+          operationId: "operation-inspect-account-timeout",
+          payload: {
+            platform: "zhihu",
+            requestedExternalAccountId: "zhihu-account",
+            locator: { platformPostId: "123456" },
+          },
+        }),
+      );
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      await expect(pending).resolves.toMatchObject({
+        ok: false,
+        error: {
+          code: "adapter.account-probe-timeout",
+          stage: "TIMEOUT",
+          retryPolicy: "SAFE_TO_RETRY",
+          requiredUserAction: "RETRY",
+        },
+      });
+      expect(probeSignal?.aborted).toBe(true);
+      expect(adapters.zhihu.inspectPublication).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      name: "known-public",
+      timeoutMs: 18_000,
+      locator: {
+        platformPostId: "123456",
+        publicUrl: "https://zhuanlan.zhihu.com/p/123456",
+        publicIdentityKey: "zhihu:post:v1:123456",
+      },
+    },
+    {
+      name: "discovery",
+      timeoutMs: 22_000,
+      locator: { platformPostId: "123456" },
+    },
+  ])(
+    "returns typed adapter timeout metadata for $name inspection",
+    async ({ name, timeoutMs, locator }) => {
+      vi.useFakeTimers();
+      try {
+        const adapters = createAdapters();
+        let inspectionSignal: AbortSignal | undefined;
+        adapters.zhihu.inspectPublication = vi.fn(
+          (_request, context) =>
+            new Promise((_resolve, reject) => {
+              inspectionSignal = context?.signal;
+              context?.signal?.addEventListener(
+                "abort",
+                () => reject(context.signal?.reason),
+                { once: true },
+              );
+            }),
+        );
+        const { coordinator } = createHarness({ adapters });
+        const sessionId = await negotiate(coordinator);
+        const pending = exchange(
+          coordinator,
+          commandRequest(sessionId, "publication.inspect", {
+            requestId: `request-inspect-${name}-timeout`,
+            operationId: `operation-inspect-${name}-timeout`,
+            payload: {
+              platform: "zhihu",
+              requestedExternalAccountId: "zhihu-account",
+              locator,
+            },
+          }),
+        );
+
+        await vi.advanceTimersByTimeAsync(timeoutMs);
+        await expect(pending).resolves.toMatchObject({
+          ok: false,
+          error: {
+            code: "adapter.publication-inspection-timeout",
+            stage: "TIMEOUT",
+            retryPolicy: "SAFE_TO_RETRY",
+            requiredUserAction: "RETRY",
+          },
+        });
+        expect(inspectionSignal?.aborted).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("returns command-phase timeout metadata when coordinator work exceeds the safety envelope", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = createHarness();
+      const sessionId = await negotiate(harness.coordinator);
+      let inspectionLookupCount = 0;
+      harness.dependencies.getAdapter = vi.fn(async (platform) => {
+        if (platform !== "zhihu") {
+          return harness.adapters[platform as PlatformId] ?? null;
+        }
+        inspectionLookupCount += 1;
+        // The command first refreshes the runtime snapshot, then probes the
+        // account. Stall only the subsequent adapter lookup before execution.
+        if (inspectionLookupCount <= 2) return harness.adapters.zhihu;
+        return new Promise<PlatformAdapter | null>(() => {});
+      });
+      const pending = exchange(
+        harness.coordinator,
+        commandRequest(sessionId, "publication.inspect", {
+          requestId: "request-inspect-command-timeout",
+          operationId: "operation-inspect-command-timeout",
+          payload: {
+            platform: "zhihu",
+            requestedExternalAccountId: "zhihu-account",
+            locator: { platformPostId: "123456" },
+          },
+        }),
+      );
+
+      await vi.advanceTimersByTimeAsync(32_000);
+      await expect(pending).resolves.toMatchObject({
+        ok: false,
+        error: {
+          code: "publication.inspection-timeout",
+          stage: "TIMEOUT",
+          retryPolicy: "SAFE_TO_RETRY",
+          requiredUserAction: "RETRY",
+        },
+      });
+      expect(inspectionLookupCount).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves a parent command timeout phase through a child deadline", async () => {
+    const parent = new AbortController();
+    const pending = withPublicationInspectionDeadline(
+      (signal) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        }),
+      {
+        timeoutMs: 22_000,
+        phase: "ADAPTER_INSPECTION",
+        parentSignal: parent.signal,
+      },
+    );
+    const commandTimeout = new PublicationInspectionTimeoutError("COMMAND");
+
+    parent.abort(commandTimeout);
+
+    await expect(pending).rejects.toBe(commandTimeout);
+    expect(commandTimeout).toMatchObject({
+      code: "PUBLICATION_INSPECTION_TIMEOUT",
+      phase: "COMMAND",
+    });
+  });
+
+  it.each([
+    ["zhihu" as const, "2067551877672219379"],
+    ["sohu" as const, "1058083143"],
+    ["weixin" as const, "9001001"],
+    ["toutiao" as const, "7669620929504346651"],
+  ])(
+    "opens a %s draft without exposing an editor URL",
+    async (platform, draftReference) => {
+      const { adapters, coordinator } = createHarness();
+      const sessionId = await negotiate(coordinator);
+      const openRequest = commandRequest(sessionId, "publication.openDraft", {
+        requestId: `request-open-${platform}`,
+        operationId: `operation-open-${platform}`,
+        payload: {
+          platform,
+          requestedExternalAccountId: `${platform}-account`,
+          draftReference,
+        },
+      });
+
+      const opened = await exchange(coordinator, openRequest);
+      expect(opened).toMatchObject({
+        command: "publication.openDraft",
+        ok: true,
+        result: {
+          platform,
+          observedExternalAccountId: `${platform}-account`,
+          draftReference,
+          opened: true,
+        },
+      });
+      expect(adapters[platform].openPublicationDraft).toHaveBeenCalledWith(
+        expect.objectContaining({
+          platform,
+          externalAccountId: `${platform}-account`,
+          platformPostId: draftReference,
+        }),
+        expect.objectContaining({
+          signal: expect.any(AbortSignal),
+          verifiedAccountProbe: expect.objectContaining({
+            status: "AUTHENTICATED",
+          }),
+        }),
+      );
+      expect(JSON.stringify(opened)).not.toContain("token=");
+    },
+  );
+
+  it("fails closed when the live adapter does not expose draft opening", async () => {
+    const adapters = createAdapters();
+    delete adapters.sohu.openPublicationDraft;
+    const { coordinator } = createHarness({ adapters });
+    const sessionId = await negotiate(coordinator);
+
+    const response = await exchange(
+      coordinator,
+      commandRequest(sessionId, "publication.openDraft", {
+        requestId: "request-open-sohu-unavailable",
+        operationId: "operation-open-sohu-unavailable",
+        payload: {
+          platform: "sohu",
+          requestedExternalAccountId: "sohu-account",
+          draftReference: "1058083143",
+        },
+      }),
+    );
+
+    expect(response).toMatchObject({
       ok: false,
       error: {
         code: "adapter.draft-open-unavailable",

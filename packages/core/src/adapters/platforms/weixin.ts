@@ -26,18 +26,24 @@ import {
 } from '../../publication-inspection/domain'
 import { derivePublicationPublicIdentity } from '../../publication-inspection/url'
 import {
+  buildWeixinDraftListRequest,
   buildWeixinPublishedListRequest,
   buildWeixinTempUrlRequest,
   normalizeWeixinAppMsgId,
+  normalizeWeixinPublicArticleUrl,
   parseWeixinDraftHtml,
+  parseWeixinDraftListPayload,
   parseWeixinPublishedListPayload,
   parseWeixinPublicArticleHtml,
+  parseWeixinPublicArticlePublishedAt,
   parseWeixinTempUrlPayload,
-  normalizeWeixinLongPublicArticleUrl,
   resolveWeixinAppMsgId,
   resolveWeixinTempUrl,
   validateWeixinPublicPageResponse,
-  WEIXIN_PUBLISHED_LIST_MAX_PAGES,
+  WEIXIN_DRAFT_LIST_MAX_BYTES,
+  WEIXIN_PUBLISHED_LIST_MAX_BYTES,
+  WEIXIN_PUBLISHED_LIST_MAX_RECORDS,
+  WEIXIN_PUBLISHED_LIST_MAX_REQUESTS,
   WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
   WEIXIN_PUBLIC_PAGE_MAX_BYTES,
 } from '../../publication-inspection/weixin'
@@ -52,6 +58,33 @@ import {
 import juice from 'juice'
 
 const logger = createLogger('Weixin')
+export const WEIXIN_PUBLICATION_WINDOW_CLOCK_SKEW_MS = 10 * 60 * 1000
+const WEIXIN_PUBLISHED_SCAN_POST_RESERVE_MS = 8_000
+
+type SafeResponseContentType = 'json' | 'html' | 'text' | 'missing' | 'other'
+
+function classifySafeResponseContentType(
+  response: Response,
+): SafeResponseContentType {
+  const rawContentType = response.headers.get('content-type')
+  if (!rawContentType) return 'missing'
+  const mediaType = rawContentType.split(';', 1)[0]?.trim().toLowerCase()
+  if (mediaType === 'application/json' || mediaType?.endsWith('+json')) {
+    return 'json'
+  }
+  if (mediaType === 'text/html' || mediaType === 'application/xhtml+xml') {
+    return 'html'
+  }
+  if (mediaType?.startsWith('text/')) return 'text'
+  return 'other'
+}
+
+function publishedListShapeMessage(
+  message: string,
+  shapeFingerprint: string,
+): string {
+  return `${message} Safe response shape: ${shapeFingerprint}.`
+}
 
 function normalizeAccountDisplayName(value: unknown, fallback: string): string {
   if (typeof value !== 'string') return fallback
@@ -89,7 +122,61 @@ interface WeixinMeta {
 type WeixinPublishedLookup =
   | { kind: 'PUBLISHED'; observation: PublicationObservation }
   | { kind: 'REVIEW_REQUIRED'; observation: PublicationObservation }
+  | { kind: 'CHECK_DRAFT_MEMBERSHIP'; observation: PublicationObservation }
   | { kind: 'FALLBACK_TO_DRAFT' }
+
+type WeixinDeadlineResult<T> =
+  | { completed: true; value: T }
+  | { completed: false }
+
+async function runWeixinPublishedScanStep<T>(
+  operation: (signal?: AbortSignal) => Promise<T>,
+  parentSignal: AbortSignal | undefined,
+  deadlineAt: number | undefined,
+): Promise<WeixinDeadlineResult<T>> {
+  if (typeof deadlineAt !== 'number' || !Number.isFinite(deadlineAt)) {
+    return { completed: true, value: await operation(parentSignal) }
+  }
+
+  const controller = new AbortController()
+  return new Promise<WeixinDeadlineResult<T>>((resolve, reject) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      if (timer !== undefined) clearTimeout(timer)
+      parentSignal?.removeEventListener('abort', abortFromParent)
+      callback()
+    }
+    const abortFromParent = () => {
+      const reason = parentSignal?.reason ?? new Error('ABORTED')
+      controller.abort(reason)
+      finish(() => reject(reason))
+    }
+
+    if (parentSignal?.aborted) {
+      abortFromParent()
+      return
+    }
+    parentSignal?.addEventListener('abort', abortFromParent, { once: true })
+
+    timer = setTimeout(
+      () => {
+        controller.abort(new Error('WEIXIN_PUBLISHED_SCAN_DEADLINE'))
+        finish(() => resolve({ completed: false }))
+      },
+      Math.max(0, deadlineAt - Date.now()),
+    )
+
+    Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (value) => finish(() => resolve({ completed: true, value })),
+        (error) => finish(() => reject(error)),
+      )
+  })
+}
 
 type WeixinPublicPageFetchResult =
   | {
@@ -195,7 +282,7 @@ export class WeixinAdapter extends CodeAdapter {
     const fetched = await fetchWithValidatedNoRedirects({
       fetch: (url, options) => this.runtime.fetch(url, options),
       initialUrl: candidateUrl,
-      validateUrl: normalizeWeixinLongPublicArticleUrl,
+      validateUrl: normalizeWeixinPublicArticleUrl,
       request: {
         method: 'GET',
         credentials: 'omit',
@@ -278,6 +365,200 @@ export class WeixinAdapter extends CodeAdapter {
       checkedAt: new Date().toISOString(),
       httpStatus: response.status,
       html: body.text,
+    }
+  }
+
+  private async inspectPublicArticle(
+    request: PublicationInspectRequest,
+    appMsgId: string,
+    candidateUrl: string,
+    publishedAt: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<WeixinPublishedLookup> {
+    const publicPage = await this.fetchPublicArticlePage(candidateUrl, signal)
+    if (!publicPage.success) {
+      return {
+        kind: 'REVIEW_REQUIRED',
+        observation: this.createInspectionError(
+          request,
+          'REVIEW_REQUIRED',
+          publicPage.errorCode,
+          publicPage.errorMessage,
+          appMsgId,
+          'PUBLIC_PAGE',
+        ),
+      }
+    }
+
+    const knownLocator = request.knownPublicLocator
+    if (
+      knownLocator &&
+      (publicPage.canonicalUrl !== knownLocator.publicUrl ||
+        publicPage.checkedPublicIdentityKey !== knownLocator.publicIdentityKey)
+    ) {
+      return {
+        kind: 'REVIEW_REQUIRED',
+        observation: this.createInspectionError(
+          request,
+          'REVIEW_REQUIRED',
+          'WEIXIN_PUBLIC_IDENTITY_MISMATCH',
+          'The WeChat public article does not match the requested public identity.',
+          appMsgId,
+          'PUBLIC_PAGE',
+        ),
+      }
+    }
+
+    const article = parseWeixinPublicArticleHtml(publicPage.html)
+    if (!article.success) {
+      return {
+        kind: 'REVIEW_REQUIRED',
+        observation: this.createInspectionError(
+          request,
+          'REVIEW_REQUIRED',
+          'WEIXIN_PUBLIC_PAGE_CONTENT_INVALID',
+          'The matched WeChat public article could not be verified.',
+          appMsgId,
+          'PUBLIC_PAGE',
+        ),
+      }
+    }
+
+    const pageTime = publishedAt
+      ? { success: true as const, publishedAt }
+      : parseWeixinPublicArticlePublishedAt(
+          publicPage.html,
+          publicPage.checkedAt,
+        )
+    if (!pageTime.success) {
+      return {
+        kind: 'REVIEW_REQUIRED',
+        observation: this.createInspectionError(
+          request,
+          'REVIEW_REQUIRED',
+          pageTime.errorCode,
+          pageTime.errorMessage,
+          appMsgId,
+          'PUBLIC_PAGE',
+        ),
+      }
+    }
+
+    return {
+      kind: 'PUBLISHED',
+      observation: PublicationInspectionObservationSchema.parse({
+        observationKey: `weixin:${request.requestId}:public-page`,
+        platform: 'weixin',
+        externalAccountId: request.externalAccountId,
+        outcome: 'PUBLISHED',
+        source: 'PUBLIC_PAGE',
+        platformPostId: appMsgId,
+        canonicalUrl: publicPage.canonicalUrl,
+        title: article.title,
+        publishedAt: pageTime.publishedAt,
+        bodyText: article.bodyText,
+        bodyTruncated: article.bodyTruncated,
+        publicAccess: {
+          status: 'CONFIRMED',
+          checkedUrl: publicPage.checkedUrl,
+          checkedPublicIdentityKey: publicPage.checkedPublicIdentityKey,
+          checkedAt: publicPage.checkedAt,
+          httpStatus: publicPage.httpStatus,
+        },
+        observedAt: new Date().toISOString(),
+      }),
+    }
+  }
+
+  private async inspectCurrentDraftMembership(
+    request: PublicationInspectRequest,
+    appMsgId: string,
+    token: string,
+    signal?: AbortSignal,
+  ): Promise<
+    { matched: true } | { matched: false; observation: PublicationObservation }
+  > {
+    signal?.throwIfAborted()
+    const responses = await Promise.allSettled(
+      ([77, 10] as const).map((type) =>
+        this.runtime.fetch(buildWeixinDraftListRequest(token, type), {
+          method: 'GET',
+          credentials: 'include',
+          redirect: 'error',
+          signal,
+          headers: {
+            Accept: 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+        }),
+      ),
+    )
+    signal?.throwIfAborted()
+
+    let diagnosticCode = 'WEIXIN_DRAFT_MEMBERSHIP_UNRESOLVED'
+    let diagnosticMessage =
+      'The current WeChat draft list did not confirm this exact draft ID.'
+    for (const settled of responses) {
+      if (settled.status === 'rejected') {
+        diagnosticCode = 'WEIXIN_DRAFT_LIST_FETCH_ERROR'
+        diagnosticMessage = 'The WeChat current-draft list request failed.'
+        continue
+      }
+      const response = settled.value
+      if (!response.ok) {
+        await discardResponseBody(response)
+        diagnosticCode = 'WEIXIN_DRAFT_LIST_FETCH_ERROR'
+        diagnosticMessage = 'The WeChat current-draft list request failed.'
+        continue
+      }
+      const body = await readBoundedResponseText(
+        response,
+        WEIXIN_DRAFT_LIST_MAX_BYTES,
+      )
+      signal?.throwIfAborted()
+      if (!body.success) {
+        diagnosticCode =
+          body.errorCode === 'SAFE_RESPONSE_BODY_TOO_LARGE'
+            ? 'WEIXIN_DRAFT_LIST_BODY_TOO_LARGE'
+            : 'WEIXIN_DRAFT_LIST_BODY_READ_ERROR'
+        diagnosticMessage =
+          'The WeChat current-draft list response could not be read safely.'
+        continue
+      }
+      let payload: unknown
+      try {
+        payload = JSON.parse(body.text)
+      } catch {
+        diagnosticCode = 'WEIXIN_DRAFT_LIST_JSON_INVALID'
+        diagnosticMessage =
+          'The WeChat current-draft list response is not valid JSON.'
+        continue
+      }
+      const lookup = parseWeixinDraftListPayload(payload, appMsgId)
+      if (lookup.success && lookup.match === 'DRAFT_PRESENT') {
+        return { matched: true }
+      }
+      if (!lookup.success) {
+        diagnosticCode = lookup.errorCode
+        diagnosticMessage = lookup.shapeFingerprint
+          ? publishedListShapeMessage(
+              'The WeChat current-draft list has an unsupported structure.',
+              lookup.shapeFingerprint,
+            )
+          : 'The WeChat current-draft list request failed.'
+      }
+    }
+
+    return {
+      matched: false,
+      observation: this.createInspectionError(
+        request,
+        'REVIEW_REQUIRED',
+        diagnosticCode,
+        diagnosticMessage,
+        appMsgId,
+        'DRAFT_LIST',
+      ),
     }
   }
 
@@ -395,28 +676,73 @@ export class WeixinAdapter extends CodeAdapter {
     appMsgId: string,
     token: string,
     signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<WeixinPublishedLookup> {
     signal?.throwIfAborted()
-    for (let page = 0; page < WEIXIN_PUBLISHED_LIST_MAX_PAGES; page += 1) {
-      const begin = page * WEIXIN_PUBLISHED_LIST_PAGE_SIZE
-      let listResponse: Response
+    const scanDeadlineAt =
+      typeof deadlineAt === 'number' && Number.isFinite(deadlineAt)
+        ? deadlineAt - WEIXIN_PUBLISHED_SCAN_POST_RESERVE_MS
+        : undefined
+    let begin = 0
+    // WeChat may pad each count=10 response with empty publish_info rows, so
+    // one request can advance by only one materialized publication. Derive the
+    // request budget from total_count while retaining independent hard caps.
+    let requestBudget = 1
+    let requestsMade = 0
+    const requestedPublishedBoundary = request.articleHint.publishedAfter
+      ? Date.parse(request.articleHint.publishedAfter)
+      : Number.NaN
+    const safePublishedBoundary = Number.isFinite(requestedPublishedBoundary)
+      ? requestedPublishedBoundary - WEIXIN_PUBLICATION_WINDOW_CLOCK_SKEW_MS
+      : Number.NaN
+    let publishedHistoryOrderTrusted = true
+    let previousPageOldestPublishedAt: number | null = null
+    while (
+      requestsMade < requestBudget &&
+      requestsMade < WEIXIN_PUBLISHED_LIST_MAX_REQUESTS
+    ) {
+      requestsMade += 1
+      let pageResult: WeixinDeadlineResult<{
+        listResponse: Response
+        listBody:
+          | { success: true; text: string }
+          | {
+              success: false
+              errorCode: BoundedResponseTextErrorCode
+            }
+      }>
       try {
-        listResponse = await this.runtime.fetch(
-          buildWeixinPublishedListRequest(
-            token,
-            begin,
-            WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
-          ),
-          {
-            method: 'GET',
-            credentials: 'include',
-            redirect: 'error',
-            signal,
-            headers: {
-              Accept: 'application/json, text/javascript, */*; q=0.01',
-              'X-Requested-With': 'XMLHttpRequest',
-            },
+        pageResult = await runWeixinPublishedScanStep(
+          async (pageSignal) => {
+            const listResponse = await this.runtime.fetch(
+              buildWeixinPublishedListRequest(
+                token,
+                begin,
+                WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
+              ),
+              {
+                method: 'GET',
+                credentials: 'include',
+                redirect: 'error',
+                signal: pageSignal,
+                headers: {
+                  Accept: 'application/json, text/javascript, */*; q=0.01',
+                  'X-Requested-With': 'XMLHttpRequest',
+                },
+              },
+            )
+            if (!listResponse.ok) {
+              await discardResponseBody(listResponse)
+              throw new Error('WEIXIN_PUBLISHED_LIST_HTTP_ERROR')
+            }
+            const listBody = await readBoundedResponseText(
+              listResponse,
+              WEIXIN_PUBLISHED_LIST_MAX_BYTES,
+            )
+            return { listResponse, listBody }
           },
+          signal,
+          scanDeadlineAt,
         )
       } catch {
         signal?.throwIfAborted()
@@ -428,25 +754,53 @@ export class WeixinAdapter extends CodeAdapter {
         )
       }
 
-      if (!listResponse.ok) {
+      if (!pageResult.completed) {
         return this.createPublishedListReview(
           request,
           appMsgId,
-          'WEIXIN_PUBLISHED_LIST_FETCH_ERROR',
-          'The WeChat published-list request failed.',
+          'WEIXIN_PUBLISHED_SCAN_DEADLINE',
+          'The WeChat published-list scan stopped before the adapter deadline so the result can be reviewed safely.',
+        )
+      }
+
+      const { listResponse, listBody } = pageResult.value
+      signal?.throwIfAborted()
+      if (!listBody.success) {
+        const bodyShape =
+          listBody.errorCode === 'SAFE_RESPONSE_BODY_TOO_LARGE'
+            ? 'too-large'
+            : listBody.errorCode === 'SAFE_RESPONSE_BODY_MISSING'
+              ? 'missing'
+              : 'read-error'
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          listBody.errorCode === 'SAFE_RESPONSE_BODY_TOO_LARGE'
+            ? 'WEIXIN_PUBLISHED_LIST_BODY_TOO_LARGE'
+            : 'WEIXIN_PUBLISHED_LIST_BODY_READ_ERROR',
+          publishedListShapeMessage(
+            'The WeChat published-list response body could not be read safely.',
+            `wx-list-shape:v1;response_body=${bodyShape};content_type=${classifySafeResponseContentType(listResponse)}`,
+          ),
         )
       }
 
       let listPayload: unknown
       try {
-        listPayload = await listResponse.json()
+        listPayload = JSON.parse(listBody.text)
       } catch {
         signal?.throwIfAborted()
+        const shapeFingerprint =
+          `wx-list-shape:v1;response_body=invalid-json;content_type=` +
+          classifySafeResponseContentType(listResponse)
         return this.createPublishedListReview(
           request,
           appMsgId,
-          'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
-          'The WeChat published-list response could not be parsed.',
+          'WEIXIN_PUBLISHED_LIST_JSON_INVALID',
+          publishedListShapeMessage(
+            'The WeChat published-list response is not valid JSON.',
+            shapeFingerprint,
+          ),
         )
       }
 
@@ -455,17 +809,25 @@ export class WeixinAdapter extends CodeAdapter {
         appMsgId,
         begin,
         WEIXIN_PUBLISHED_LIST_PAGE_SIZE,
+        Math.max(0, WEIXIN_PUBLISHED_LIST_MAX_RECORDS - begin),
       )
       if (!lookup.success) {
+        if (lookup.errorCode !== 'WEIXIN_PUBLISHED_LIST_API_ERROR') {
+          return this.createPublishedListReview(
+            request,
+            appMsgId,
+            lookup.errorCode,
+            publishedListShapeMessage(
+              'The WeChat published-list response has an unsupported structure.',
+              lookup.shapeFingerprint,
+            ),
+          )
+        }
         return this.createPublishedListReview(
           request,
           appMsgId,
-          lookup.errorCode === 'WEIXIN_PUBLISHED_LIST_API_ERROR'
-            ? 'WEIXIN_PUBLISHED_LIST_FETCH_ERROR'
-            : 'WEIXIN_PUBLISHED_LIST_PARSE_ERROR',
-          lookup.errorCode === 'WEIXIN_PUBLISHED_LIST_API_ERROR'
-            ? 'The WeChat published-list request failed.'
-            : 'The WeChat published-list response could not be parsed.',
+          'WEIXIN_PUBLISHED_LIST_FETCH_ERROR',
+          'The WeChat published-list request failed.',
         )
       }
       if (lookup.match === 'REVIEW_REQUIRED') {
@@ -476,70 +838,118 @@ export class WeixinAdapter extends CodeAdapter {
           'The WeChat published record matched this draft but did not contain complete publication evidence.',
         )
       }
+      if (lookup.match === 'SCAN_INCOMPLETE') {
+        if (Number.isFinite(safePublishedBoundary)) {
+          return {
+            kind: 'CHECK_DRAFT_MEMBERSHIP',
+            observation: this.createInspectionError(
+              request,
+              'REVIEW_REQUIRED',
+              'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+              'The WeChat published-list scan reached its record limit before all records were checked.',
+              appMsgId,
+              'PUBLISHED_LIST',
+            ),
+          }
+        }
+        return this.createPublishedListReview(
+          request,
+          appMsgId,
+          'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+          'The WeChat published-list scan reached its record limit before all records were checked.',
+        )
+      }
       if (lookup.match === 'NOT_FOUND') {
         if (!lookup.hasMore) return { kind: 'FALLBACK_TO_DRAFT' }
+        const newestPublishedAt = lookup.newestPublishedAt
+          ? Date.parse(lookup.newestPublishedAt)
+          : Number.NaN
+        const oldestPublishedAt = lookup.oldestPublishedAt
+          ? Date.parse(lookup.oldestPublishedAt)
+          : Number.NaN
+        if (
+          !Number.isFinite(newestPublishedAt) ||
+          !Number.isFinite(oldestPublishedAt) ||
+          (previousPageOldestPublishedAt !== null &&
+            newestPublishedAt > previousPageOldestPublishedAt)
+        ) {
+          publishedHistoryOrderTrusted = false
+        }
+        // When list ordering cannot support the publication window, only an
+        // exact current-draft membership can safely resolve the lifecycle.
+        if (
+          Number.isFinite(safePublishedBoundary) &&
+          !publishedHistoryOrderTrusted
+        ) {
+          return {
+            kind: 'CHECK_DRAFT_MEMBERSHIP',
+            observation: this.createInspectionError(
+              request,
+              'REVIEW_REQUIRED',
+              'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+              'The WeChat published history could not prove a complete newest-first scan.',
+              appMsgId,
+              'PUBLISHED_LIST',
+            ),
+          }
+        }
+        if (publishedHistoryOrderTrusted) {
+          previousPageOldestPublishedAt = oldestPublishedAt
+        }
+        // appmsgpublish is newest-first. Once an entirely timestamped page is
+        // already older than the trusted pre-dispatch boundary (including a
+        // conservative clock-skew window), the draft's appMsgId cannot appear
+        // on any remaining page. Exact identity matching above always wins;
+        // time is only a safe pagination stop hint.
+        if (
+          Number.isFinite(safePublishedBoundary) &&
+          publishedHistoryOrderTrusted &&
+          newestPublishedAt < safePublishedBoundary
+        ) {
+          return { kind: 'FALLBACK_TO_DRAFT' }
+        }
+        if (
+          lookup.nextBegin <= begin ||
+          lookup.nextBegin > WEIXIN_PUBLISHED_LIST_MAX_RECORDS
+        ) {
+          break
+        }
+        begin = lookup.nextBegin
+        requestBudget =
+          typeof lookup.totalCount === 'number'
+            ? Math.min(
+                WEIXIN_PUBLISHED_LIST_MAX_REQUESTS,
+                // total_count is advisory; reserve one request for the strict
+                // empty-page sentinel so a concurrent publication cannot be
+                // skipped exactly at the reported boundary.
+                requestsMade + (lookup.totalCount - lookup.nextBegin) + 1,
+              )
+            : WEIXIN_PUBLISHED_LIST_MAX_REQUESTS
         continue
       }
 
-      const publicPage = await this.fetchPublicArticlePage(
+      return this.inspectPublicArticle(
+        request,
+        appMsgId,
         lookup.canonicalUrl,
+        lookup.publishedAt,
         signal,
       )
-      if (!publicPage.success) {
-        return {
-          kind: 'REVIEW_REQUIRED',
-          observation: this.createInspectionError(
-            request,
-            'REVIEW_REQUIRED',
-            publicPage.errorCode,
-            publicPage.errorMessage,
-            appMsgId,
-            'PUBLIC_PAGE',
-          ),
-        }
-      }
-
-      const article = parseWeixinPublicArticleHtml(publicPage.html)
-      if (!article.success) {
-        return {
-          kind: 'REVIEW_REQUIRED',
-          observation: this.createInspectionError(
-            request,
-            'REVIEW_REQUIRED',
-            'WEIXIN_PUBLIC_PAGE_CONTENT_INVALID',
-            'The matched WeChat public article could not be verified.',
-            appMsgId,
-            'PUBLIC_PAGE',
-          ),
-        }
-      }
-
-      return {
-        kind: 'PUBLISHED',
-        observation: PublicationInspectionObservationSchema.parse({
-          observationKey: `weixin:${request.requestId}:public-page`,
-          platform: 'weixin',
-          externalAccountId: request.externalAccountId,
-          outcome: 'PUBLISHED',
-          source: 'PUBLIC_PAGE',
-          platformPostId: appMsgId,
-          canonicalUrl: publicPage.canonicalUrl,
-          title: article.title,
-          publishedAt: lookup.publishedAt,
-          bodyText: article.bodyText,
-          bodyTruncated: article.bodyTruncated,
-          publicAccess: {
-            status: 'CONFIRMED',
-            checkedUrl: publicPage.checkedUrl,
-            checkedPublicIdentityKey: publicPage.checkedPublicIdentityKey,
-            checkedAt: publicPage.checkedAt,
-            httpStatus: publicPage.httpStatus,
-          },
-          observedAt: new Date().toISOString(),
-        }),
-      }
     }
 
+    if (Number.isFinite(safePublishedBoundary)) {
+      return {
+        kind: 'CHECK_DRAFT_MEMBERSHIP',
+        observation: this.createInspectionError(
+          request,
+          'REVIEW_REQUIRED',
+          'WEIXIN_PUBLISHED_SCAN_INCOMPLETE',
+          'The WeChat published-list scan reached its page limit before all records were checked.',
+          appMsgId,
+          'PUBLISHED_LIST',
+        ),
+      }
+    }
     return this.createPublishedListReview(
       request,
       appMsgId,
@@ -586,58 +996,118 @@ export class WeixinAdapter extends CodeAdapter {
     }
     const appMsgId = resolvedId.appMsgId
 
-    // Always refresh the session. Inspection must never reuse the token left by
-    // publish(), a prior auth check, or an earlier inspection.
-    const auth = await this.checkAuth(context)
-    if (!auth.isAuthenticated) {
-      return [
-        this.createInspectionError(
-          request,
-          auth.error ? 'FETCH_ERROR' : 'LOGIN_REQUIRED',
-          auth.error ? 'WEIXIN_AUTH_FETCH_ERROR' : 'WEIXIN_LOGIN_REQUIRED',
-          auth.error
-            ? 'The WeChat authentication check failed.'
-            : 'Log in to WeChat Official Accounts before inspecting this draft.',
-          appMsgId,
-        ),
-      ]
-    }
+    const verifiedAccount =
+      context?.verifiedAccountProbe?.status === 'AUTHENTICATED'
+        ? context.verifiedAccountProbe.accounts.find(
+            (account) =>
+              account.externalAccountId === request.externalAccountId,
+          )
+        : undefined
+    const cachedExternalAccountId = normalizeAdapterExternalAccountId(
+      this.weixinMeta?.userName,
+    )
+    const cachedToken = this.weixinMeta?.token
 
-    if (!auth.userId || !this.weixinMeta?.token) {
-      return [
-        this.createInspectionError(
-          request,
-          'PARSE_ERROR',
-          'WEIXIN_AUTH_RESPONSE_INVALID',
-          'The WeChat authentication response is missing stable account data.',
-          appMsgId,
-        ),
-      ]
-    }
+    let token: string
+    if (
+      verifiedAccount &&
+      cachedExternalAccountId === request.externalAccountId &&
+      cachedToken
+    ) {
+      // The coordinator just produced this account proof with the same adapter
+      // instance. Reuse only the token that is still bound to that exact
+      // account; any missing or mismatched fact falls through to a fresh probe.
+      token = cachedToken
+    } else {
+      const auth = await this.checkAuth(context)
+      if (!auth.isAuthenticated) {
+        return [
+          this.createInspectionError(
+            request,
+            auth.error ? 'FETCH_ERROR' : 'LOGIN_REQUIRED',
+            auth.error ? 'WEIXIN_AUTH_FETCH_ERROR' : 'WEIXIN_LOGIN_REQUIRED',
+            auth.error
+              ? 'The WeChat authentication check failed.'
+              : 'Log in to WeChat Official Accounts before inspecting this draft.',
+            appMsgId,
+          ),
+        ]
+      }
 
-    if (auth.userId !== request.externalAccountId) {
-      return [
-        this.createInspectionError(
-          request,
-          'ACCOUNT_MISMATCH',
-          'WEIXIN_ACCOUNT_MISMATCH',
-          'The active WeChat account does not match the bound account.',
-          appMsgId,
-        ),
-      ]
-    }
+      const activeExternalAccountId = normalizeAdapterExternalAccountId(
+        auth.userId,
+      )
+      if (!activeExternalAccountId || !this.weixinMeta?.token) {
+        return [
+          this.createInspectionError(
+            request,
+            'PARSE_ERROR',
+            'WEIXIN_AUTH_RESPONSE_INVALID',
+            'The WeChat authentication response is missing stable account data.',
+            appMsgId,
+          ),
+        ]
+      }
 
-    const token = this.weixinMeta.token
+      if (activeExternalAccountId !== request.externalAccountId) {
+        return [
+          this.createInspectionError(
+            request,
+            'ACCOUNT_MISMATCH',
+            'WEIXIN_ACCOUNT_MISMATCH',
+            'The active WeChat account does not match the bound account.',
+            appMsgId,
+          ),
+        ]
+      }
+
+      token = this.weixinMeta.token
+    }
 
     try {
       return await this.withHeaderRules(this.HEADER_RULES, async () => {
+        if (request.knownPublicLocator) {
+          const knownPublic = await this.inspectPublicArticle(
+            request,
+            appMsgId,
+            request.knownPublicLocator.publicUrl,
+            undefined,
+            signal,
+          )
+          if (knownPublic.kind === 'FALLBACK_TO_DRAFT') {
+            return [
+              this.createInspectionError(
+                request,
+                'REVIEW_REQUIRED',
+                'WEIXIN_PUBLIC_INSPECTION_UNRESOLVED',
+                'The known WeChat public article could not be resolved.',
+                appMsgId,
+                'PUBLIC_PAGE',
+              ),
+            ]
+          }
+          return [knownPublic.observation]
+        }
+
         const publishedLookup = await this.inspectPublishedRecords(
           request,
           appMsgId,
           token,
           signal,
+          context?.deadlineAt,
         )
-        if (publishedLookup.kind !== 'FALLBACK_TO_DRAFT') {
+        if (
+          publishedLookup.kind === 'CHECK_DRAFT_MEMBERSHIP' ||
+          publishedLookup.kind === 'FALLBACK_TO_DRAFT'
+        ) {
+          const membership = await this.inspectCurrentDraftMembership(
+            request,
+            appMsgId,
+            token,
+            signal,
+          )
+          if (!membership.matched) return [membership.observation]
+        } else {
           return [publishedLookup.observation]
         }
 
@@ -819,7 +1289,16 @@ export class WeixinAdapter extends CodeAdapter {
       request.draft.draftUrl,
     )
     const normalizedCanonicalUrl = observation.canonicalUrl
-      ? normalizeWeixinLongPublicArticleUrl(observation.canonicalUrl)
+      ? normalizeWeixinPublicArticleUrl(observation.canonicalUrl)
+      : null
+    const canonicalPublicIdentity = observation.canonicalUrl
+      ? derivePublicationPublicIdentity('weixin', observation.canonicalUrl)
+      : null
+    const checkedPublicIdentity = observation.publicAccess?.checkedUrl
+      ? derivePublicationPublicIdentity(
+          'weixin',
+          observation.publicAccess.checkedUrl,
+        )
       : null
     if (
       request.platform !== 'weixin' ||
@@ -832,6 +1311,11 @@ export class WeixinAdapter extends CodeAdapter {
       observation.platformPostId !== appMsgIdResolution.appMsgId ||
       !observation.canonicalUrl ||
       normalizedCanonicalUrl !== observation.canonicalUrl ||
+      !canonicalPublicIdentity ||
+      !checkedPublicIdentity ||
+      checkedPublicIdentity.key !== canonicalPublicIdentity.key ||
+      observation.publicAccess?.checkedPublicIdentityKey !==
+        canonicalPublicIdentity.key ||
       !observation.publishedAt ||
       !observation.title?.trim() ||
       !observation.bodyText?.trim() ||
