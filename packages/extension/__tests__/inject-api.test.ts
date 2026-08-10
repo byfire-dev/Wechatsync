@@ -5,6 +5,8 @@ import {
   publicationBridgeV3NegotiationRequestFixture,
   publicationBridgeV3NegotiationResponseFixture,
   publicationBridgeV3PublishRequestFixture,
+  publicationBridgeV31InspectRequestFixture,
+  publicationBridgeV32InspectRequestFixture,
 } from '@byfire-dev/publication-bridge-contract/v3/testing'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -341,7 +343,7 @@ describe('injected publication Bridge v3 API', () => {
     expect(postMessage).toHaveBeenCalledTimes(1)
   })
 
-  it('uses a 40 second transport timeout only for publication inspection', () => {
+  it('keeps the legacy fixed timeout behavior for pre-3.2 inspection', () => {
     const { setTimeoutMock, windowObject } = createInjectedApiHarness()
     const poster = windowObject.$poster as {
       callPublicationBridgeV3(
@@ -356,9 +358,8 @@ describe('injected publication Bridge v3 API', () => {
     )
     poster.callPublicationBridgeV3(
       {
-        ...publicationBridgeV3NegotiationRequestFixture,
+        ...publicationBridgeV31InspectRequestFixture,
         requestId: 'req-inspect-transport-timeout',
-        command: 'publication.inspect',
       },
       vi.fn(),
     )
@@ -373,6 +374,158 @@ describe('injected publication Bridge v3 API', () => {
       expect.any(Function),
       40000,
     )
+  })
+
+  it('uses the v3.2 top-level deadline and aborts through a normal cancel request exactly once', () => {
+    const {
+      listeners,
+      location,
+      postMessage,
+      setTimeoutMock,
+      windowObject,
+    } = createInjectedApiHarness()
+    const deadlineAt = new Date(Date.now() + 12_345).toISOString()
+    const request = {
+      ...publicationBridgeV32InspectRequestFixture,
+      requestId: 'req-inspect-abort-001',
+      operationId: 'operation-inspect-abort-001',
+      deadlineAt,
+    }
+    const callback = vi.fn()
+    const abortController = new AbortController()
+    const poster = windowObject.$poster as {
+      callPublicationBridgeV3(
+        request: typeof request,
+        cb: typeof callback,
+        options: { signal: AbortSignal },
+      ): { cancel(reason?: 'CALLER_ABORTED' | 'DEADLINE_EXCEEDED'): boolean }
+    }
+
+    const handle = poster.callPublicationBridgeV3(request, callback, {
+      signal: abortController.signal,
+    })
+    const scheduledDelay = setTimeoutMock.mock.calls[0]?.[1]
+    expect(scheduledDelay).toBeGreaterThanOrEqual(12_340)
+    expect(scheduledDelay).toBeLessThanOrEqual(12_345)
+
+    abortController.abort()
+    expect(callback).toHaveBeenCalledWith({
+      code: 'BRIDGE_REQUEST_ABORTED',
+      message: 'The Publication Bridge request was cancelled.',
+    })
+    expect(postMessage).toHaveBeenNthCalledWith(1, request, location.origin)
+    expect(postMessage).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        namespace: 'byfire.publication-bridge',
+        direction: 'REQUEST',
+        contractVersion: '3.2',
+        sessionId: request.sessionId,
+        operationId: request.operationId,
+        command: 'bridge.cancel',
+        payload: {
+          targetRequestId: request.requestId,
+          targetCommand: 'publication.inspect',
+          reason: 'CALLER_ABORTED',
+        },
+      }),
+      location.origin,
+    )
+    expect(handle.cancel()).toBe(false)
+
+    listeners[0]?.({
+      source: windowObject,
+      origin: location.origin,
+      data: {
+        namespace: request.namespace,
+        direction: 'RESPONSE',
+        protocolMajor: request.protocolMajor,
+        contractVersion: request.contractVersion,
+        sessionId: request.sessionId,
+        requestId: request.requestId,
+        operationId: request.operationId,
+        command: request.command,
+        ok: false,
+        runtime: { extensionVersion: '2.0.35', bridgeCapabilities: [], adapters: [] },
+        error: {
+          code: 'publication.inspection-cancelled',
+          stage: 'TRANSPORT',
+          message: 'cancelled',
+          retryPolicy: 'SAFE_TO_RETRY',
+          requiredUserAction: 'RETRY',
+        },
+      },
+    })
+    expect(callback).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends DEADLINE_EXCEEDED when the v3.2 page deadline fires', () => {
+    const { location, postMessage, timeoutCallbacks, windowObject } =
+      createInjectedApiHarness()
+    const request = {
+      ...publicationBridgeV32InspectRequestFixture,
+      requestId: 'req-inspect-deadline-001',
+      operationId: 'operation-inspect-deadline-001',
+      deadlineAt: new Date(Date.now() + 5_000).toISOString(),
+    }
+    const callback = vi.fn()
+    const poster = windowObject.$poster as {
+      callPublicationBridgeV3(
+        request: typeof request,
+        cb: typeof callback,
+      ): { cancel(reason?: 'CALLER_ABORTED' | 'DEADLINE_EXCEEDED'): boolean }
+    }
+
+    const handle = poster.callPublicationBridgeV3(request, callback)
+    const timeoutCallback = [...timeoutCallbacks.values()][0]
+    timeoutCallback?.()
+
+    expect(callback).toHaveBeenCalledWith({
+      code: 'BRIDGE_REQUEST_TIMEOUT',
+      message: 'The Publication Bridge request timed out.',
+    })
+    expect(postMessage).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        command: 'bridge.cancel',
+        payload: expect.objectContaining({ reason: 'DEADLINE_EXCEEDED' }),
+      }),
+      location.origin,
+    )
+    expect(handle.cancel()).toBe(false)
+    expect(callback).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles a synchronously aborted v3.2 call before posting the request', () => {
+    const { postMessage, setTimeoutMock, windowObject } = createInjectedApiHarness()
+    const request = {
+      ...publicationBridgeV32InspectRequestFixture,
+      requestId: 'req-inspect-pre-aborted-001',
+      operationId: 'operation-inspect-pre-aborted-001',
+      deadlineAt: new Date(Date.now() + 5_000).toISOString(),
+    }
+    const callback = vi.fn()
+    const controller = new AbortController()
+    controller.abort()
+    const poster = windowObject.$poster as {
+      callPublicationBridgeV3(
+        request: typeof request,
+        cb: typeof callback,
+        options: { signal: AbortSignal },
+      ): { cancel(): boolean }
+    }
+
+    const handle = poster.callPublicationBridgeV3(request, callback, {
+      signal: controller.signal,
+    })
+
+    expect(callback).toHaveBeenCalledWith({
+      code: 'BRIDGE_REQUEST_ABORTED',
+      message: 'The Publication Bridge request was cancelled.',
+    })
+    expect(postMessage).not.toHaveBeenCalled()
+    expect(setTimeoutMock).not.toHaveBeenCalled()
+    expect(handle.cancel()).toBe(false)
   })
 
   it('ignores foreign or mismatched responses, then times out and cleans up', () => {

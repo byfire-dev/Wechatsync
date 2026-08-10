@@ -28,6 +28,8 @@ const OBSERVED_AT = "2026-08-02T07:59:30.000Z";
 const PUBLISHED_AT = "2026-08-02T07:58:00.000Z";
 const VALID_DIGEST = `sha256:${"1".repeat(64)}`;
 const OTHER_DIGEST = `sha256:${"2".repeat(64)}`;
+const CALLER_A = { tabId: 42, documentId: "document-a" };
+const CALLER_B = { tabId: 42, documentId: "document-b" };
 
 function clone<T>(value: T): T {
   return value === undefined ? value : structuredClone(value);
@@ -204,7 +206,7 @@ function commandRequest(
   sessionId: string,
   command: Exclude<PublicationBridgeV3Request["command"], "bridge.negotiate">,
   fields: Record<string, unknown>,
-  contractVersion: "3.0" | "3.1" = PUBLICATION_BRIDGE_CONTRACT_VERSION,
+  contractVersion: "3.0" | "3.1" | "3.2" = PUBLICATION_BRIDGE_CONTRACT_VERSION,
 ) {
   return PublicationBridgeV3RequestSchema.parse({
     namespace: PUBLICATION_BRIDGE_NAMESPACE,
@@ -213,6 +215,12 @@ function commandRequest(
     contractVersion,
     sessionId,
     command,
+    ...(command === "publication.inspect" && contractVersion === "3.2"
+      ? {
+          deadlineAt:
+            fields.deadlineAt ?? new Date(Date.now() + 32_000).toISOString(),
+        }
+      : {}),
     ...fields,
   });
 }
@@ -315,7 +323,12 @@ describe("PublicationBridgeV3Coordinator negotiation and account resolution", ()
             (["zhihu", "sohu", "weixin", "toutiao"] as const).map((platform) =>
               expect.objectContaining({
                 platform,
-                adapterVersion: platform === "weixin" ? "1.0.0" : "1.1.0",
+                adapterVersion:
+                  platform === "weixin"
+                    ? "1.0.0"
+                    : platform === "sohu"
+                      ? "1.2.0"
+                      : "1.1.0",
                 capabilities: expect.arrayContaining([
                   "adapter.account.identity",
                   "adapter.draft.publish",
@@ -339,6 +352,31 @@ describe("PublicationBridgeV3Coordinator negotiation and account resolution", ()
     expect(response.result.runtime.bridgeCapabilities).not.toContain(
       "bridge.publication.operation-events",
     );
+    expect(response.result.runtime.bridgeCapabilities).not.toContain(
+      "bridge.request.cancel",
+    );
+  });
+
+  it("advertises request cancellation only after selecting wire 3.2", async () => {
+    const { coordinator } = createHarness();
+    const response = await exchange(
+      coordinator,
+      negotiationRequest("request-negotiate-v32-capability", ["3.2"]),
+    );
+
+    expect(response).toMatchObject({
+      command: "bridge.negotiate",
+      ok: true,
+      result: {
+        selectedContractVersion: "3.2",
+        runtime: {
+          bridgeCapabilities: expect.arrayContaining([
+            "bridge.request.cancel",
+            "bridge.publication.inspect",
+          ]),
+        },
+      },
+    });
   });
 
   it("binds every command to the contract version selected for its session", async () => {
@@ -991,60 +1029,452 @@ describe("PublicationBridgeV3Coordinator durable publication lifecycle", () => {
       },
     });
   });
-});
 
-describe("PublicationBridgeV3Coordinator inspection and draft-open commands", () => {
-  it("maps and echoes the v3.1 publication window without weakening its timestamp", async () => {
-    const publishedNotBefore = "2026-08-02T07:55:00.000Z";
-    const { adapters, coordinator } = createHarness();
-    const sessionId = await negotiate(coordinator, ["3.1"]);
+  it("never applies an inspection cancellation to an external publish operation", async () => {
+    let releasePublish: (() => void) | undefined;
+    const publishGate = new Promise<void>((resolve) => {
+      releasePublish = resolve;
+    });
+    const syncToPlatform = vi.fn<
+      PublicationBridgeV3CoordinatorDependencies["syncToPlatform"]
+    >(async (platform, _article, options) => {
+      await options.beforeDispatch();
+      await publishGate;
+      return {
+        platform,
+        success: true,
+        outcome: "SUCCEEDED",
+        postId: `${platform}-post-1`,
+        externalAccountId: options.accountBinding.externalAccountId,
+        timestamp: Date.parse(NOW),
+      };
+    });
+    const { coordinator } = createHarness({ syncToPlatform });
+    const sessionId = await negotiate(coordinator, ["3.2"]);
+    const publish = publishRequest(sessionId);
+    await exchange(coordinator, publish);
+    const running = coordinator.runPublicationOperation(publish.operationId);
+    await vi.waitFor(() => expect(syncToPlatform).toHaveBeenCalledTimes(1));
 
-    const response = await exchange(
-      coordinator,
-      commandRequest(
-        sessionId,
-        "publication.inspect",
-        {
-          requestId: "request-inspect-v31-window",
-          operationId: "operation-inspect-v31-window",
-          payload: {
-            platform: "zhihu",
-            requestedExternalAccountId: "zhihu-account",
-            locator: { platformPostId: "123456" },
-            publicationWindow: {
-              publishedNotBefore,
-              basis: "DISPATCH_STARTED_AT",
-            },
-          },
+    const cancellation = commandRequest(
+      sessionId,
+      "bridge.cancel",
+      {
+        requestId: "request-cancel-must-not-touch-publish",
+        operationId: publish.operationId,
+        payload: {
+          targetRequestId: publish.requestId,
+          targetCommand: "publication.inspect",
+          reason: "CALLER_ABORTED",
         },
-        "3.1",
-      ),
+      },
+      "3.2",
     );
+    await expect(
+      coordinator.handle(cancellation, { caller: CALLER_A }),
+    ).resolves.toMatchObject({
+      command: "bridge.cancel",
+      ok: true,
+      result: { disposition: "CANCELLED" },
+    });
 
-    expect(adapters.zhihu.inspectPublication).toHaveBeenCalledWith(
-      expect.objectContaining({
-        draft: expect.objectContaining({
-          platformPostId: "123456",
-          draftedAt: publishedNotBefore,
-        }),
-        articleHint: expect.objectContaining({
-          publishedAfter: publishedNotBefore,
-        }),
+    releasePublish?.();
+    await running;
+    const completed = await exchange(
+      coordinator,
+      commandRequest(sessionId, "publication.getOperation", {
+        requestId: "request-get-operation-after-cancel",
+        operationId: publish.operationId,
+        payload: {},
       }),
-      expect.any(Object),
     );
-    expect(response).toMatchObject({
-      contractVersion: "3.1",
-      command: "publication.inspect",
+    expect(completed).toMatchObject({
       ok: true,
       result: {
-        publicationWindow: {
-          publishedNotBefore,
-          basis: "DISPATCH_STARTED_AT",
+        operation: {
+          state: "COMPLETED",
+          targets: [{ outcome: "SUCCEEDED" }],
         },
       },
     });
   });
+});
+
+describe("PublicationBridgeV3Coordinator inspection and draft-open commands", () => {
+  it("keeps one active executor per inspection identity and cancels only the matching caller document", async () => {
+    const adapters = createAdapters();
+    let inspectionSignal: AbortSignal | undefined;
+    adapters.zhihu.inspectPublication = vi.fn(
+      (_request, context) =>
+        new Promise((_resolve, reject) => {
+          inspectionSignal = context?.signal;
+          context?.signal?.addEventListener(
+            "abort",
+            () => reject(context.signal?.reason),
+            { once: true },
+          );
+        }),
+    );
+    const { coordinator } = createHarness({ adapters });
+    const sessionId = await negotiate(coordinator, ["3.2"]);
+    const inspect = commandRequest(
+      sessionId,
+      "publication.inspect",
+      {
+        requestId: "request-inspect-cancellable",
+        operationId: "operation-inspect-cancellable",
+        deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+        payload: {
+          platform: "zhihu",
+          requestedExternalAccountId: "zhihu-account",
+          locator: { platformPostId: "123456" },
+        },
+      },
+      "3.2",
+    );
+    const pending = coordinator.handle(inspect, { caller: CALLER_A });
+    await vi.waitFor(() => {
+      expect(adapters.zhihu.inspectPublication).toHaveBeenCalledTimes(1);
+    });
+
+    const duplicate = await coordinator.handle(inspect, { caller: CALLER_A });
+    expect(duplicate).toMatchObject({
+      command: "publication.inspect",
+      ok: false,
+      error: {
+        code: "bridge.request-already-active",
+        stage: "PROTOCOL",
+        retryPolicy: "DO_NOT_RETRY",
+      },
+    });
+    expect(adapters.zhihu.inspectPublication).toHaveBeenCalledTimes(1);
+
+    const cancel = (requestId: string) =>
+      commandRequest(
+        sessionId,
+        "bridge.cancel",
+        {
+          requestId,
+          operationId: inspect.operationId,
+          payload: {
+            targetRequestId: inspect.requestId,
+            targetCommand: "publication.inspect",
+            reason: "CALLER_ABORTED",
+          },
+        },
+        "3.2",
+      );
+
+    const wrongCaller = await coordinator.handle(cancel("request-cancel-wrong"), {
+      caller: CALLER_B,
+    });
+    expect(wrongCaller).toMatchObject({
+      command: "bridge.cancel",
+      ok: true,
+      result: { disposition: "CANCELLED" },
+    });
+    expect(inspectionSignal?.aborted).toBe(false);
+
+    const cancelled = await coordinator.handle(cancel("request-cancel-first"), {
+      caller: CALLER_A,
+    });
+    expect(cancelled).toMatchObject({
+      command: "bridge.cancel",
+      ok: true,
+      result: {
+        targetRequestId: inspect.requestId,
+        reason: "CALLER_ABORTED",
+        disposition: "CANCELLED",
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      command: "publication.inspect",
+      ok: false,
+      error: {
+        code: "publication.inspection-cancelled",
+        stage: "TRANSPORT",
+        retryPolicy: "SAFE_TO_RETRY",
+      },
+    });
+    expect(inspectionSignal?.aborted).toBe(true);
+
+    const repeated = await coordinator.handle(cancel("request-cancel-second"), {
+      caller: CALLER_A,
+    });
+    expect(repeated).toMatchObject({
+      ok: true,
+      result: { disposition: "ALREADY_CANCELLED" },
+    });
+  });
+
+  it("validates the exact session wire and capability before cancelling an inspection", async () => {
+    const adapters = createAdapters();
+    const originalInspection = adapters.zhihu.inspectPublication;
+    let inspectionSignal: AbortSignal | undefined;
+    let releaseInspection: (() => void) | undefined;
+    const inspectionGate = new Promise<void>((resolve) => {
+      releaseInspection = resolve;
+    });
+    adapters.zhihu.inspectPublication = vi.fn(async (request, context) => {
+      inspectionSignal = context?.signal;
+      await inspectionGate;
+      return originalInspection?.(request, context) ?? [];
+    });
+    const { coordinator } = createHarness({ adapters });
+    const sessionId = await negotiate(coordinator, ["3.1"]);
+    const inspect = commandRequest(
+      sessionId,
+      "publication.inspect",
+      {
+        requestId: "request-inspect-v31-not-cancellable",
+        operationId: "operation-inspect-v31-not-cancellable",
+        payload: {
+          platform: "zhihu",
+          requestedExternalAccountId: "zhihu-account",
+          locator: { platformPostId: "123456" },
+        },
+      },
+      "3.1",
+    );
+    const pending = coordinator.handle(inspect, { caller: CALLER_A });
+    await vi.waitFor(() => {
+      expect(adapters.zhihu.inspectPublication).toHaveBeenCalledTimes(1);
+    });
+
+    // The cancel envelope itself is valid 3.2, but it deliberately presents
+    // the id of a session negotiated on 3.1. It must be rejected before the
+    // matching active controller or tombstone can be touched.
+    const crossWireCancel = commandRequest(
+      sessionId,
+      "bridge.cancel",
+      {
+        requestId: "request-cancel-v31-cross-wire",
+        operationId: inspect.operationId,
+        payload: {
+          targetRequestId: inspect.requestId,
+          targetCommand: "publication.inspect",
+          reason: "CALLER_ABORTED",
+        },
+      },
+      "3.2",
+    );
+    await expect(
+      coordinator.handle(crossWireCancel, { caller: CALLER_A }),
+    ).resolves.toMatchObject({
+      command: "bridge.cancel",
+      ok: false,
+      error: {
+        code: "bridge.session-invalid",
+        stage: "NEGOTIATION",
+      },
+    });
+    expect(inspectionSignal?.aborted).toBe(false);
+
+    releaseInspection?.();
+    await expect(pending).resolves.toMatchObject({
+      command: "publication.inspect",
+      contractVersion: "3.1",
+      ok: true,
+    });
+  });
+
+  it("honors cancel-before-start without platform I/O and reports terminal inspections", async () => {
+    const harness = createHarness();
+    const getAdapter = vi.fn(harness.dependencies.getAdapter);
+    harness.dependencies.getAdapter = getAdapter;
+    const sessionId = await negotiate(harness.coordinator, ["3.2"]);
+    const callsAfterNegotiation = getAdapter.mock.calls.length;
+    const inspect = commandRequest(
+      sessionId,
+      "publication.inspect",
+      {
+        requestId: "request-inspect-cancel-before-start",
+        operationId: "operation-inspect-cancel-before-start",
+        deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+        payload: {
+          platform: "zhihu",
+          requestedExternalAccountId: "zhihu-account",
+          locator: { platformPostId: "123456" },
+        },
+      },
+      "3.2",
+    );
+    const cancel = commandRequest(
+      sessionId,
+      "bridge.cancel",
+      {
+        requestId: "request-cancel-before-start",
+        operationId: inspect.operationId,
+        payload: {
+          targetRequestId: inspect.requestId,
+          targetCommand: "publication.inspect",
+          reason: "CALLER_ABORTED",
+        },
+      },
+      "3.2",
+    );
+
+    await expect(
+      harness.coordinator.handle(cancel, { caller: CALLER_A }),
+    ).resolves.toMatchObject({
+      ok: true,
+      result: { disposition: "CANCELLED" },
+    });
+    const callsAfterCancel = getAdapter.mock.calls.length;
+    expect(callsAfterCancel).toBeGreaterThan(callsAfterNegotiation);
+
+    await expect(
+      harness.coordinator.handle(inspect, { caller: CALLER_A }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: { code: "publication.inspection-cancelled" },
+    });
+    expect(getAdapter).toHaveBeenCalledTimes(callsAfterCancel);
+    expect(harness.adapters.zhihu.probeAccounts).not.toHaveBeenCalled();
+    expect(harness.adapters.zhihu.inspectPublication).not.toHaveBeenCalled();
+
+    const terminalInspect = commandRequest(
+      sessionId,
+      "publication.inspect",
+      {
+        requestId: "request-inspect-terminal",
+        operationId: "operation-inspect-terminal",
+        deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+        payload: {
+          platform: "zhihu",
+          requestedExternalAccountId: "zhihu-account",
+          locator: { platformPostId: "123456" },
+        },
+      },
+      "3.2",
+    );
+    await expect(
+      harness.coordinator.handle(terminalInspect, { caller: CALLER_A }),
+    ).resolves.toMatchObject({ ok: true });
+    const cancelTerminal = commandRequest(
+      sessionId,
+      "bridge.cancel",
+      {
+        requestId: "request-cancel-terminal",
+        operationId: terminalInspect.operationId,
+        payload: {
+          targetRequestId: terminalInspect.requestId,
+          targetCommand: "publication.inspect",
+          reason: "DEADLINE_EXCEEDED",
+        },
+      },
+      "3.2",
+    );
+    await expect(
+      harness.coordinator.handle(cancelTerminal, { caller: CALLER_A }),
+    ).resolves.toMatchObject({
+      ok: true,
+      result: { disposition: "ALREADY_TERMINAL" },
+    });
+  });
+
+  it("rejects an already-expired v3.2 deadline before runtime or adapter I/O", async () => {
+    const harness = createHarness();
+    const getAdapter = vi.fn(harness.dependencies.getAdapter);
+    harness.dependencies.getAdapter = getAdapter;
+    const sessionId = await negotiate(harness.coordinator, ["3.2"]);
+    const callsAfterNegotiation = getAdapter.mock.calls.length;
+    const inspect = commandRequest(
+      sessionId,
+      "publication.inspect",
+      {
+        requestId: "request-inspect-expired",
+        operationId: "operation-inspect-expired",
+        deadlineAt: new Date(Date.now() - 1).toISOString(),
+        payload: {
+          platform: "zhihu",
+          requestedExternalAccountId: "zhihu-account",
+          locator: { platformPostId: "123456" },
+        },
+      },
+      "3.2",
+    );
+
+    await expect(
+      harness.coordinator.handle(inspect, { caller: CALLER_A }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: "publication.inspection-timeout",
+        stage: "TIMEOUT",
+      },
+    });
+    expect(getAdapter).toHaveBeenCalledTimes(callsAfterNegotiation);
+    expect(harness.adapters.zhihu.probeAccounts).not.toHaveBeenCalled();
+    expect(harness.adapters.zhihu.inspectPublication).not.toHaveBeenCalled();
+  });
+
+  it.each(["3.1", "3.2"] as const)(
+    "maps and echoes the v%s publication window without weakening its timestamp",
+    async (contractVersion) => {
+      const publishedNotBefore = "2026-08-02T07:55:00.000Z";
+      const { adapters, coordinator } = createHarness();
+      const sessionId = await negotiate(coordinator, [contractVersion]);
+
+      const response = await exchange(
+        coordinator,
+        commandRequest(
+          sessionId,
+          "publication.inspect",
+          {
+            requestId: `request-inspect-v${contractVersion.replace(".", "")}-window`,
+            operationId: `operation-inspect-v${contractVersion.replace(".", "")}-window`,
+            payload: {
+              platform: "zhihu",
+              requestedExternalAccountId: "zhihu-account",
+              locator: { platformPostId: "123456" },
+              publicationWindow: {
+                publishedNotBefore,
+                basis: "DISPATCH_STARTED_AT",
+              },
+            },
+          },
+          contractVersion,
+        ),
+      );
+
+      expect(adapters.zhihu.inspectPublication).toHaveBeenCalledWith(
+        expect.objectContaining({
+          draft: expect.objectContaining({
+            platformPostId: "123456",
+            draftedAt: publishedNotBefore,
+          }),
+          articleHint: expect.objectContaining({
+            publishedAfter: publishedNotBefore,
+          }),
+        }),
+        expect.any(Object),
+      );
+      expect(response).toMatchObject({
+        contractVersion,
+        command: "publication.inspect",
+        ok: true,
+        result: {
+          publicationWindow: {
+            publishedNotBefore,
+            basis: "DISPATCH_STARTED_AT",
+          },
+        },
+      });
+      if (response.command !== "publication.inspect" || !response.ok) {
+        throw new Error(`Expected a successful v${contractVersion} inspection`);
+      }
+      if (contractVersion === "3.2") {
+        expect(response.result.runtime.bridgeCapabilities).toContain(
+          "bridge.request.cancel",
+        );
+      } else {
+        expect(response.result.runtime.bridgeCapabilities).not.toContain(
+          "bridge.request.cancel",
+        );
+      }
+    },
+  );
 
   it("keeps v3.0 inspection compatible when no publication window is sent", async () => {
     const { adapters, coordinator } = createHarness();
@@ -1551,6 +1981,22 @@ describe("PublicationBridgeV3Coordinator inspection and draft-open commands", ()
       code: "PUBLICATION_INSPECTION_TIMEOUT",
       phase: "COMMAND",
     });
+  });
+
+  it("does not start work after an inherited deadline has already expired", async () => {
+    const operation = vi.fn(async () => "unreachable");
+
+    await expect(
+      withPublicationInspectionDeadline(operation, {
+        timeoutMs: 22_000,
+        phase: "ADAPTER_INSPECTION",
+        deadlineAt: Date.now() - 1,
+      }),
+    ).rejects.toMatchObject({
+      code: "PUBLICATION_INSPECTION_TIMEOUT",
+      phase: "ADAPTER_INSPECTION",
+    });
+    expect(operation).not.toHaveBeenCalled();
   });
 
   it.each([

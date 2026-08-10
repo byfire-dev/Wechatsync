@@ -7,4 +7,4 @@ onlyBuiltDependencies:
   - esbuild
 
 minimumReleaseAgeExclude:
-  - '@byfire-dev/publication-bridge-contract@3.0.0 || 3.1.0'
+  - '@byfire-dev/publication-bridge-contract@3.0.0 || 3.1.0 || 3.2.0'

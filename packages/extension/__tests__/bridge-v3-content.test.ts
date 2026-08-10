@@ -2,6 +2,8 @@ import {
   publicationBridgeV3IdempotencyConflictResponseFixture,
   publicationBridgeV3PublishAcceptedResponseFixture,
   publicationBridgeV3PublishRequestFixture,
+  publicationBridgeV32CancelRequestFixture,
+  publicationBridgeV32CancelResponseFixture,
 } from "@byfire-dev/publication-bridge-contract/v3/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -58,6 +60,35 @@ afterEach(() => {
 });
 
 describe("content publication Bridge v3 relay", () => {
+  it("relays a v3.2 cancellation as a normal contract exchange", async () => {
+    const windowObject = installContentGlobals();
+    chromeMock.runtime.sendMessage.mockImplementation(
+      (_message: unknown, callback?: (response: unknown) => void) => {
+        callback?.(publicationBridgeV32CancelResponseFixture);
+      },
+    );
+    const handleRequest = await loadHandler();
+
+    await handleRequest({
+      source: windowObject,
+      origin: windowObject.location.origin,
+      data: publicationBridgeV32CancelRequestFixture,
+    } as unknown as MessageEvent);
+
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(
+      {
+        type: "BRIDGE_CALL_V3",
+        request: publicationBridgeV32CancelRequestFixture,
+      },
+      expect.any(Function),
+    );
+    expect(windowObject.postMessage).toHaveBeenCalledWith(
+      publicationBridgeV32CancelResponseFixture,
+      windowObject.location.origin,
+    );
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("posts acceptance first, then opens a long-lived operation runner message", async () => {
     const windowObject = installContentGlobals();
     const runnerCallbacks: unknown[] = [];

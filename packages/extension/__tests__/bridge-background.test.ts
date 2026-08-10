@@ -7,6 +7,7 @@ import {
   runOpenPublicationDraft,
   runPublicationInspection,
   validateBridgeMessageSender,
+  validateBridgeV3MessageSender,
   validateGetAccountsV2Payload,
   validateInspectPublicationPayload,
   validateOpenPublicationDraftPayload,
@@ -22,6 +23,7 @@ function sender(
     origin: 'http://localhost',
     url: 'http://localhost/workspaces/ws-001/articles/article-001',
     frameId: 0,
+    documentId: 'document-001',
     tab: {
       id: 42,
       url: 'http://localhost/workspaces/ws-001/articles/article-001',
@@ -60,6 +62,22 @@ describe('Bridge v2 background sender boundary', () => {
         tabId: 42,
         url: 'http://localhost/workspaces/ws-001/articles/article-001',
       },
+    })
+  })
+
+  it('binds Bridge v3 callers to the exact content document', () => {
+    expect(validateBridgeV3MessageSender(sender())).toEqual({
+      success: true,
+      data: {
+        origin: 'http://localhost',
+        tabId: 42,
+        documentId: 'document-001',
+        url: 'http://localhost/workspaces/ws-001/articles/article-001',
+      },
+    })
+    expect(validateBridgeV3MessageSender(sender({ documentId: undefined }))).toEqual({
+      success: false,
+      code: 'SENDER_NOT_ALLOWED',
     })
   })
 

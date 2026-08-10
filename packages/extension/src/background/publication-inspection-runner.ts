@@ -372,6 +372,14 @@ export function withPublicationInspectionDeadline<T>(
       abortFromParent()
       return
     }
+
+    if (deadlineAt <= Date.now()) {
+      const error = new PublicationInspectionTimeoutError(options.phase)
+      controller.abort(error)
+      finish(() => reject(error))
+      return
+    }
+
     options.parentSignal?.addEventListener('abort', abortFromParent, {
       once: true,
     })

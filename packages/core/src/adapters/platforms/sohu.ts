@@ -85,6 +85,45 @@ function normalizeAvatarUrl(value: unknown): string | undefined {
   }
 }
 
+function createInspectionAbortScope(context?: AdapterOperationContext): {
+  signal: AbortSignal | undefined
+  dispose(): void
+} {
+  const deadlineAt = context?.deadlineAt
+  if (typeof deadlineAt !== 'number' || !Number.isFinite(deadlineAt)) {
+    return { signal: context?.signal, dispose: () => {} }
+  }
+
+  const controller = new AbortController()
+  const abortFromParent = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(context?.signal?.reason ?? new Error('ABORTED'))
+    }
+  }
+  if (context?.signal?.aborted) {
+    abortFromParent()
+  } else {
+    context?.signal?.addEventListener('abort', abortFromParent, { once: true })
+  }
+
+  const deadlineError = new Error('SOHU_INSPECTION_DEADLINE_EXCEEDED')
+  deadlineError.name = 'TimeoutError'
+  let timer: ReturnType<typeof setTimeout> | undefined
+  if (deadlineAt <= Date.now()) {
+    controller.abort(deadlineError)
+  } else {
+    timer = setTimeout(() => controller.abort(deadlineError), deadlineAt - Date.now())
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      if (timer !== undefined) clearTimeout(timer)
+      context?.signal?.removeEventListener('abort', abortFromParent)
+    },
+  }
+}
+
 export class SohuAdapter extends CodeAdapter {
   readonly meta: PlatformMeta = {
     id: 'sohu',
@@ -272,24 +311,51 @@ export class SohuAdapter extends CodeAdapter {
 
   async inspectPublication(
     request: PublicationInspectRequest,
+    context?: AdapterOperationContext,
   ): Promise<PublicationObservation[]> {
-    return this.withHeaderRules(this.HEADER_RULES, async () => {
-      const probe = await this.probeAccounts()
-      return inspectSohuPublication(request, {
-        checkAuth: async () => this.authResultFromProbe(probe),
-        hasAuthenticatedAccount: (externalAccountId) =>
-          probe.status === 'AUTHENTICATED' &&
-          probe.accounts.some(
-            (account) => account.externalAccountId === externalAccountId,
-          ),
-        fetch: (url, options) => this.runtime.fetch(url, options),
-        detailHeaders: () => ({
-          'x-requested-with': 'XMLHttpRequest',
-          'dv-id': this.deviceId,
-          'sp-cm': this.spCm,
-        }),
+    const scope = createInspectionAbortScope(context)
+    const signal = scope.signal
+    try {
+      signal?.throwIfAborted()
+      const observations = await this.withHeaderRules(this.HEADER_RULES, async () => {
+        signal?.throwIfAborted()
+        // Every authenticated mp.sohu.com request in this invocation must run
+        // under the same invocation-owned Origin/Referer rule. A coordinator
+        // probe can be reused, but the direct/v2 path still probes here and
+        // therefore needs the rule before its first account-list request.
+        const verifiedProbe = context?.verifiedAccountProbe
+        const probe =
+          verifiedProbe?.status === 'AUTHENTICATED'
+            ? verifiedProbe
+            : await this.probeAccounts({ ...context, signal })
+        signal?.throwIfAborted()
+
+        const result = await inspectSohuPublication(request, {
+          checkAuth: async () => this.authResultFromProbe(probe),
+          hasAuthenticatedAccount: (externalAccountId) =>
+            probe.status === 'AUTHENTICATED' &&
+            probe.accounts.some(
+              (account) => account.externalAccountId === externalAccountId,
+            ),
+          fetch: (url, options) =>
+            this.runtime.fetch(url, {
+              ...options,
+              signal,
+            }),
+          detailHeaders: () => ({
+            'x-requested-with': 'XMLHttpRequest',
+            'dv-id': this.deviceId,
+            'sp-cm': this.spCm,
+          }),
+        })
+        signal?.throwIfAborted()
+        return result
       })
-    })
+      signal?.throwIfAborted()
+      return observations
+    } finally {
+      scope.dispose()
+    }
   }
 
   provePublishedObservation(

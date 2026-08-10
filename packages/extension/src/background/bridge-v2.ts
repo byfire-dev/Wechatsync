@@ -99,6 +99,11 @@ export interface VerifiedBridgeMessageSender {
   url: string
 }
 
+export interface VerifiedBridgeV3MessageSender
+  extends VerifiedBridgeMessageSender {
+  documentId: string
+}
+
 export interface VerifiedLegacyMutationMessageSender {
   channel: 'bridge' | 'extension'
   origin: string
@@ -188,6 +193,29 @@ export function validateBridgeMessageSender(
       origin: BRIDGE_ORIGIN,
       tabId: tabId as number,
       url: sender.url,
+    },
+  }
+}
+
+/**
+ * Bridge v3 cancellation is correlated to the exact caller document. A tab id
+ * alone is not sufficient because a navigation can replace the page while
+ * retaining the same tab.
+ */
+export function validateBridgeV3MessageSender(
+  sender: chrome.runtime.MessageSender,
+): BackgroundBridgeValidationResult<VerifiedBridgeV3MessageSender> {
+  const verified = validateBridgeMessageSender(sender)
+  const documentId = sender.documentId?.trim()
+  if (!verified.success || !documentId) {
+    return { success: false, code: 'SENDER_NOT_ALLOWED' }
+  }
+
+  return {
+    success: true,
+    data: {
+      ...verified.data,
+      documentId,
     },
   }
 }
