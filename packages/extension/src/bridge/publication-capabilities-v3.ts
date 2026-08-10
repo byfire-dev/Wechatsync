@@ -3,6 +3,7 @@ import {
   PublicationBridgeV3RuntimeSnapshotSchema,
   type PublicationAdapterV3Capability,
   type PublicationAdapterV3Snapshot,
+  type PublicationBridgeV3NegotiationResult,
   type PublicationBridgeV3RuntimeSnapshot,
 } from "@byfire-dev/publication-bridge-contract/v3";
 
@@ -28,7 +29,7 @@ interface PublicationAdapterV3Descriptor {
  */
 export const PUBLICATION_ADAPTER_V3_DESCRIPTORS = {
   zhihu: { adapterVersion: "1.1.0", locatorOnlyInspection: true },
-  sohu: { adapterVersion: "1.1.0", locatorOnlyInspection: true },
+  sohu: { adapterVersion: "1.2.0", locatorOnlyInspection: true },
   weixin: { adapterVersion: "1.0.0", locatorOnlyInspection: true },
   // Toutiao's current inspector still requires a title hint that v3 does not
   // carry. Publishing remains available; inspection is deliberately not
@@ -77,6 +78,7 @@ export function derivePublicationAdapterSnapshotV3(
 export function buildPublicationBridgeRuntimeSnapshotV3(
   extensionVersion: string,
   adapters: readonly PublicationAdapterV3Snapshot[],
+  contractVersion: PublicationBridgeV3NegotiationResult["selectedContractVersion"],
 ): PublicationBridgeV3RuntimeSnapshot {
   const hasCapability = (capability: PublicationAdapterV3Capability) =>
     adapters.some((adapter) => adapter.capabilities.includes(capability));
@@ -92,6 +94,9 @@ export function buildPublicationBridgeRuntimeSnapshotV3(
             "bridge.publication.publish-draft" as const,
             "bridge.publication.operation-query" as const,
           ]
+        : []),
+      ...(contractVersion === "3.2"
+        ? ["bridge.request.cancel" as const]
         : []),
       ...(hasCapability("adapter.publication.inspect")
         ? ["bridge.publication.inspect" as const]

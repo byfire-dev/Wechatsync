@@ -36,6 +36,8 @@ import {
   publicationBridgeV3RuntimeSnapshotsEqual,
   selectPublicationBridgeContractVersion,
   type PublicationBridgeV3AccountProbe,
+  type PublicationBridgeV3CancellationReason,
+  type PublicationBridgeV3CancelDisposition,
   type PublicationBridgeV3CommandRequest,
   type PublicationBridgeV3Error,
   type PublicationBridgeV3EvidenceSource,
@@ -75,6 +77,7 @@ const INSPECTION_COMMAND_TIMEOUT_MS =
   ACCOUNT_PROBE_TIMEOUT_MS +
   DISCOVERY_INSPECTION_TIMEOUT_MS +
   INSPECTION_COMMAND_RESERVE_MS;
+const INSPECTION_TOMBSTONE_TTL_MS = 2 * 60_000;
 
 interface StoredSession {
   createdAt: string;
@@ -113,6 +116,32 @@ export interface PublicationBridgeV3CoordinatorDependencies {
   now?: () => Date;
   createId?: (prefix: string) => string;
   sha256?: (value: string) => Promise<string>;
+}
+
+export interface PublicationBridgeV3Caller {
+  tabId: number;
+  documentId: string;
+}
+
+export interface PublicationBridgeV3HandleContext {
+  caller: PublicationBridgeV3Caller;
+  signal?: AbortSignal;
+}
+
+interface ActiveInspection {
+  controller: AbortController;
+}
+
+interface InspectionTombstone {
+  state: "CANCELLED" | "TERMINAL";
+  expiresAt: number;
+}
+
+class PublicationInspectionCancelledError extends Error {
+  constructor(readonly cancellationReason: PublicationBridgeV3CancellationReason) {
+    super(`Publication inspection cancelled: ${cancellationReason}`);
+    this.name = "PublicationInspectionCancelledError";
+  }
 }
 
 function emptyState(): StoredBridgeState {
@@ -355,6 +384,11 @@ export class PublicationBridgeV3Coordinator {
   private state: StoredBridgeState | null = null;
   private mutationQueue: Promise<void> = Promise.resolve();
   private readonly activeOperations = new Set<string>();
+  private readonly activeInspections = new Map<string, ActiveInspection>();
+  private readonly inspectionTombstones = new Map<
+    string,
+    InspectionTombstone
+  >();
 
   constructor(
     private readonly dependencies: PublicationBridgeV3CoordinatorDependencies,
@@ -366,6 +400,68 @@ export class PublicationBridgeV3Coordinator {
 
   private createId(prefix: string): string {
     return this.dependencies.createId?.(prefix) ?? genericId(prefix);
+  }
+
+  private inspectionKey(
+    caller: PublicationBridgeV3Caller,
+    sessionId: string,
+    operationId: string,
+    requestId: string,
+  ): string {
+    return JSON.stringify([
+      caller.tabId,
+      caller.documentId,
+      sessionId,
+      operationId,
+      requestId,
+    ]);
+  }
+
+  private caller(context?: PublicationBridgeV3HandleContext): PublicationBridgeV3Caller {
+    return context?.caller ?? { tabId: -1, documentId: "direct-coordinator-call" };
+  }
+
+  private pruneInspectionTombstones(now = Date.now()): void {
+    for (const [key, tombstone] of this.inspectionTombstones) {
+      if (tombstone.expiresAt <= now) this.inspectionTombstones.delete(key);
+    }
+  }
+
+  private writeInspectionTombstone(
+    key: string,
+    state: InspectionTombstone["state"],
+  ): void {
+    this.inspectionTombstones.set(key, {
+      state,
+      expiresAt: Date.now() + INSPECTION_TOMBSTONE_TTL_MS,
+    });
+  }
+
+  private runtimeWithoutIo(
+    sessionId: string,
+    contractVersion: StoredSession["contractVersion"],
+  ): PublicationBridgeV3RuntimeSnapshot {
+    const session = this.state?.sessions[sessionId];
+    return (
+      (session?.contractVersion === contractVersion
+        ? session.runtime
+        : undefined) ??
+      buildPublicationBridgeRuntimeSnapshotV3(
+        this.dependencies.extensionVersion(),
+        [],
+        contractVersion,
+      )
+    );
+  }
+
+  private contractVersionForRuntime(
+    runtime: PublicationBridgeV3RuntimeSnapshot,
+  ): StoredSession["contractVersion"] {
+    // 3.0 and 3.1 share the same producer capability set. Cancellation is
+    // the first runtime capability gated specifically to wire 3.2.
+    return runtime.bridgeCapabilities.includes("bridge.request.cancel")
+      ? "3.2"
+      : "3.1";
   }
 
   private async exclusive<T>(operation: () => Promise<T> | T): Promise<T> {
@@ -469,16 +565,22 @@ export class PublicationBridgeV3Coordinator {
     await this.dependencies.store.save(this.state);
   }
 
-  private async runtime(): Promise<PublicationBridgeV3RuntimeSnapshot> {
+  private async runtime(
+    contractVersion: StoredSession["contractVersion"],
+    signal?: AbortSignal,
+  ): Promise<PublicationBridgeV3RuntimeSnapshot> {
     const adapters = [];
     for (const platform of PUBLICATION_BRIDGE_V3_PLATFORM_IDS) {
+      signal?.throwIfAborted();
       const adapter = await this.dependencies.getAdapter(platform);
+      signal?.throwIfAborted();
       const snapshot = derivePublicationAdapterSnapshotV3(platform, adapter);
       if (snapshot) adapters.push(snapshot);
     }
     return buildPublicationBridgeRuntimeSnapshotV3(
       this.dependencies.extensionVersion(),
       adapters,
+      contractVersion,
     );
   }
 
@@ -528,12 +630,16 @@ export class PublicationBridgeV3Coordinator {
 
   private async validateSession(
     request: PublicationBridgeV3CommandRequest,
+    signal?: AbortSignal,
   ): Promise<
     | { ok: true; runtime: PublicationBridgeV3RuntimeSnapshot }
     | { ok: false; response: PublicationBridgeV3Response }
   > {
-    const currentRuntime = await this.runtime();
+    signal?.throwIfAborted();
+    const currentRuntime = await this.runtime(request.contractVersion, signal);
+    signal?.throwIfAborted();
     const state = await this.exclusive(() => this.ensureState());
+    signal?.throwIfAborted();
     const session = state.sessions[request.sessionId];
     if (!session || request.contractVersion !== session.contractVersion) {
       return {
@@ -596,11 +702,18 @@ export class PublicationBridgeV3Coordinator {
 
   async handle(
     untrustedRequest: unknown,
+    context?: PublicationBridgeV3HandleContext,
   ): Promise<PublicationBridgeV3Response> {
     const request = PublicationBridgeV3RequestSchema.parse(untrustedRequest);
     if (request.command === "bridge.negotiate") return this.negotiate(request);
+    if (request.command === "bridge.cancel") {
+      return this.cancelInspection(request, context);
+    }
+    if (request.command === "publication.inspect") {
+      return this.handleInspection(request, context);
+    }
 
-    const session = await this.validateSession(request);
+    const session = await this.validateSession(request, context?.signal);
     if (!session.ok) return session.response;
 
     switch (request.command) {
@@ -610,11 +723,72 @@ export class PublicationBridgeV3Coordinator {
         return this.acceptPublication(request, session.runtime);
       case "publication.getOperation":
         return this.getOperation(request, session.runtime);
-      case "publication.inspect":
-        return this.inspectPublication(request, session.runtime);
       case "publication.openDraft":
         return this.openDraft(request, session.runtime);
     }
+  }
+
+  private async cancelInspection(
+    request: Extract<
+      PublicationBridgeV3CommandRequest,
+      { command: "bridge.cancel" }
+    >,
+    context?: PublicationBridgeV3HandleContext,
+  ): Promise<PublicationBridgeV3Response> {
+    // A cancellation request is allowed to mutate inspection state only after
+    // it has proven that it belongs to the exact negotiated session and wire.
+    // In particular, a syntactically valid 3.2 cancel must not be able to use
+    // a 3.1/3.0 session id to abort an older-wire inspection.
+    const session = await this.validateSession(request, context?.signal);
+    if (!session.ok) return session.response;
+
+    this.pruneInspectionTombstones();
+    const key = this.inspectionKey(
+      this.caller(context),
+      request.sessionId,
+      request.operationId,
+      request.payload.targetRequestId,
+    );
+    const active = this.activeInspections.get(key);
+    const prior = this.inspectionTombstones.get(key);
+    let disposition: PublicationBridgeV3CancelDisposition;
+
+    if (active && !active.controller.signal.aborted) {
+      active.controller.abort(
+        new PublicationInspectionCancelledError(request.payload.reason),
+      );
+      this.writeInspectionTombstone(key, "CANCELLED");
+      disposition = "CANCELLED";
+    } else if (prior?.state === "CANCELLED" || active?.controller.signal.aborted) {
+      disposition = "ALREADY_CANCELLED";
+    } else if (prior?.state === "TERMINAL") {
+      disposition = "ALREADY_TERMINAL";
+    } else {
+      // A cancel message can overtake the original request between the page
+      // and the service worker. Keep a short tombstone so the later inspect
+      // request is rejected before any platform I/O starts.
+      this.writeInspectionTombstone(key, "CANCELLED");
+      disposition = "CANCELLED";
+    }
+
+    return this.finalize(request, {
+      namespace: PUBLICATION_BRIDGE_NAMESPACE,
+      direction: "RESPONSE",
+      protocolMajor: PUBLICATION_BRIDGE_PROTOCOL_MAJOR,
+      contractVersion: request.contractVersion,
+      sessionId: request.sessionId,
+      requestId: request.requestId,
+      operationId: request.operationId,
+      command: request.command,
+      ok: true,
+      result: {
+        runtime: session.runtime,
+        targetRequestId: request.payload.targetRequestId,
+        targetCommand: request.payload.targetCommand,
+        reason: request.payload.reason,
+        disposition,
+      },
+    });
   }
 
   private async negotiate(
@@ -647,7 +821,7 @@ export class PublicationBridgeV3Coordinator {
       });
     }
 
-    const runtime = await this.runtime();
+    const runtime = await this.runtime(selected.data);
     const sessionId = this.createId("session");
     await this.exclusive(async () => {
       const state = await this.ensureState();
@@ -1011,7 +1185,14 @@ export class PublicationBridgeV3Coordinator {
     this.activeOperations.add(operationId);
 
     try {
-      const currentRuntime = await this.runtime();
+      const acceptedRuntime = await this.exclusive(async () => {
+        const state = await this.ensureState();
+        return state.operations[operationId]?.runtime ?? null;
+      });
+      if (!acceptedRuntime) return null;
+      const currentRuntime = await this.runtime(
+        this.contractVersionForRuntime(acceptedRuntime),
+      );
       const start = await this.exclusive(
         async (): Promise<
           | { kind: "MISSING" }
@@ -1346,7 +1527,7 @@ export class PublicationBridgeV3Coordinator {
     if (!platformPostId) return null;
 
     const publishedNotBefore =
-      request.contractVersion === "3.1"
+      request.contractVersion !== "3.0"
         ? request.payload.publicationWindow?.publishedNotBefore
         : undefined;
     const candidate = PublicationInspectionRequestSchema.safeParse({
@@ -1582,44 +1763,137 @@ export class PublicationBridgeV3Coordinator {
     }
   }
 
-  private async inspectPublication(
+  private async handleInspection(
     request: Extract<
       PublicationBridgeV3CommandRequest,
       { command: "publication.inspect" }
     >,
-    runtime: PublicationBridgeV3RuntimeSnapshot,
+    context?: PublicationBridgeV3HandleContext,
   ): Promise<PublicationBridgeV3Response> {
+    this.pruneInspectionTombstones();
+    const caller = this.caller(context);
+    const key = this.inspectionKey(
+      caller,
+      request.sessionId,
+      request.operationId,
+      request.requestId,
+    );
+    const prior = this.inspectionTombstones.get(key);
+    if (prior?.state === "CANCELLED") {
+      return this.commandFailure(
+        request,
+        this.runtimeWithoutIo(request.sessionId, request.contractVersion),
+        bridgeError(
+          "publication.inspection-cancelled",
+          "TRANSPORT",
+          "The caller cancelled the platform inspection before it started.",
+          "SAFE_TO_RETRY",
+          "RETRY",
+        ),
+      );
+    }
+    if (prior?.state === "TERMINAL") {
+      this.inspectionTombstones.delete(key);
+    }
+
+    // This check and the registration below are intentionally synchronous.
+    // JavaScript cannot interleave a second handler between them, so an exact
+    // duplicate can never replace the controller that bridge.cancel targets.
+    // Rejecting the duplicate also guarantees that only the registered
+    // executor is allowed to write the inspection's terminal tombstone.
+    if (this.activeInspections.has(key)) {
+      return this.commandFailure(
+        request,
+        this.runtimeWithoutIo(request.sessionId, request.contractVersion),
+        bridgeError(
+          "bridge.request-already-active",
+          "PROTOCOL",
+          "An inspection with the same request identity is already running.",
+          "DO_NOT_RETRY",
+          "REVIEW_MANUALLY",
+        ),
+      );
+    }
+
+    const requestedDeadlineAt =
+      request.contractVersion === "3.2"
+        ? Date.parse(request.deadlineAt as string)
+        : Date.now() + INSPECTION_COMMAND_TIMEOUT_MS;
+    const controller = new AbortController();
+    const abortFromParent = () => {
+      if (!controller.signal.aborted) {
+        controller.abort(
+          context?.signal?.reason ??
+            new PublicationInspectionCancelledError("CALLER_ABORTED"),
+        );
+      }
+    };
+    if (context?.signal?.aborted) {
+      abortFromParent();
+    } else {
+      context?.signal?.addEventListener("abort", abortFromParent, {
+        once: true,
+      });
+    }
+
+    const active: ActiveInspection = { controller };
+    this.activeInspections.set(key, active);
+    let runtime = this.runtimeWithoutIo(
+      request.sessionId,
+      request.contractVersion,
+    );
     try {
       return await withPublicationInspectionDeadline(
-        (signal, deadlineAt) =>
-          this.inspectPublicationWithinDeadline(
+        async (signal, deadlineAt) => {
+          const session = await this.validateSession(request, signal);
+          if (!session.ok) return session.response;
+          runtime = session.runtime;
+          return this.inspectPublicationWithinDeadline(
             request,
             runtime,
             signal,
             deadlineAt,
-          ),
+          );
+        },
         {
-          timeoutMs: INSPECTION_COMMAND_TIMEOUT_MS,
+          timeoutMs: Math.max(0, requestedDeadlineAt - Date.now()),
           phase: "COMMAND",
+          parentSignal: controller.signal,
+          deadlineAt: requestedDeadlineAt,
         },
       );
     } catch (error) {
       const timedOut = isPublicationInspectionTimeoutError(error);
+      const cancelled =
+        error instanceof PublicationInspectionCancelledError ||
+        (!timedOut && controller.signal.aborted);
       return this.commandFailure(
         request,
         runtime,
         bridgeError(
-          timedOut
+          cancelled
+            ? "publication.inspection-cancelled"
+            : timedOut
             ? "publication.inspection-timeout"
             : "publication.inspection-failed",
-          timedOut ? "TIMEOUT" : "ADAPTER",
-          timedOut
+          cancelled ? "TRANSPORT" : timedOut ? "TIMEOUT" : "ADAPTER",
+          cancelled
+            ? "The caller cancelled the platform inspection."
+            : timedOut
             ? "The platform inspection exceeded its end-to-end deadline."
             : "The platform inspection failed unexpectedly.",
-          timedOut ? "SAFE_TO_RETRY" : "REVIEW_BEFORE_RETRY",
-          timedOut ? "RETRY" : "REVIEW_MANUALLY",
+          cancelled || timedOut ? "SAFE_TO_RETRY" : "REVIEW_BEFORE_RETRY",
+          cancelled || timedOut ? "RETRY" : "REVIEW_MANUALLY",
         ),
       );
+    } finally {
+      context?.signal?.removeEventListener("abort", abortFromParent);
+      if (this.activeInspections.get(key) === active) {
+        this.activeInspections.delete(key);
+      }
+      if (this.inspectionTombstones.get(key)?.state !== "CANCELLED") {
+        this.writeInspectionTombstone(key, "TERMINAL");
+      }
     }
   }
 
@@ -1632,6 +1906,7 @@ export class PublicationBridgeV3Coordinator {
     signal: AbortSignal,
     commandDeadlineAt: number,
   ): Promise<PublicationBridgeV3Response> {
+    signal.throwIfAborted();
     const adapterSnapshot = runtime.adapters.find(
       (candidate) => candidate.platform === request.payload.platform,
     );
@@ -1663,6 +1938,7 @@ export class PublicationBridgeV3Coordinator {
         verifiedAccountProbe = probe;
       },
     );
+    signal.throwIfAborted();
     if (account.status !== "AVAILABLE") {
       const accountTimedOut =
         account.status === "UNAVAILABLE" &&
@@ -1697,9 +1973,11 @@ export class PublicationBridgeV3Coordinator {
     }
 
     const internalRequest = this.toInternalInspectionRequest(request);
+    signal.throwIfAborted();
     const adapter = await this.dependencies.getAdapter(
       request.payload.platform,
     );
+    signal.throwIfAborted();
     if (!internalRequest || !adapter) {
       return this.commandFailure(
         request,
@@ -1728,6 +2006,7 @@ export class PublicationBridgeV3Coordinator {
         },
       },
     );
+    signal.throwIfAborted();
     if (!inspection.ok) {
       const timedOut = inspection.code === "PUBLICATION_INSPECTION_TIMEOUT";
       return this.commandFailure(

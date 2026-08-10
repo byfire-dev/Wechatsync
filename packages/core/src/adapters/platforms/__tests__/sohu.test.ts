@@ -789,4 +789,117 @@ describe('SohuAdapter', () => {
     })
     expect(fetch).toHaveBeenCalledTimes(1)
   })
+
+  it('aborts an in-flight inspection and removes its invocation-owned header rules', async () => {
+    const controller = new AbortController()
+    let receivedSignal: AbortSignal | null = null
+    const fetch = vi.fn(
+      async (_url: string, options?: RequestInit): Promise<Response> => {
+        const signal = options?.signal
+        receivedSignal = signal ?? null
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () => reject(signal.reason),
+            { once: true },
+          )
+        })
+      },
+    )
+    const add = vi.fn(async () => 'sohu-inspection-rule')
+    const remove = vi.fn(async () => {})
+    const adapter = new SohuAdapter()
+    await adapter.init(
+      createRuntime({
+        fetch,
+        getCookie: vi.fn().mockResolvedValue('test-sp-cm'),
+        headerRules: {
+          add,
+          remove,
+          clear: vi.fn(async () => {}),
+        },
+      }),
+    )
+
+    const inspection = adapter.inspectPublication(
+      {
+        requestId: 'inspect-sohu-cancelled',
+        platform: 'sohu',
+        externalAccountId: ACCOUNT_ID,
+        draft: {
+          platformPostId: POST_ID,
+          draftUrl:
+            `https://mp.sohu.com/mpfe/v4/contentManagement/news/addarticle` +
+            `?id=${POST_ID}&accountId=${ACCOUNT_ID}`,
+          draftedAt: '2026-07-30T10:00:00+08:00',
+        },
+      },
+      {
+        signal: controller.signal,
+        deadlineAt: Date.now() + 10_000,
+        verifiedAccountProbe: {
+          status: 'AUTHENTICATED',
+          accounts: [
+            {
+              externalAccountId: ACCOUNT_ID,
+              displayName: 'Bound account',
+            },
+          ],
+        },
+      },
+    )
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
+
+    controller.abort()
+
+    await expect(inspection).rejects.toMatchObject({ name: 'AbortError' })
+    expect(receivedSignal).not.toBe(controller.signal)
+    expect(receivedSignal?.aborted).toBe(true)
+    expect(receivedSignal?.reason).toBe(controller.signal.reason)
+    expect(add).toHaveBeenCalledTimes(1)
+    expect(remove).toHaveBeenCalledWith('sohu-inspection-rule')
+  })
+
+  it('rejects an expired inspection deadline before fetch or header-rule I/O', async () => {
+    const fetch = vi.fn()
+    const add = vi.fn(async () => 'unused-rule')
+    const adapter = new SohuAdapter()
+    await adapter.init(
+      createRuntime({
+        fetch,
+        getCookie: vi.fn().mockResolvedValue('test-sp-cm'),
+        headerRules: {
+          add,
+          remove: vi.fn(async () => {}),
+          clear: vi.fn(async () => {}),
+        },
+      }),
+    )
+
+    await expect(
+      adapter.inspectPublication(
+        {
+          requestId: 'inspect-sohu-expired',
+          platform: 'sohu',
+          externalAccountId: ACCOUNT_ID,
+          draft: {
+            platformPostId: POST_ID,
+            draftedAt: '2026-07-30T10:00:00+08:00',
+          },
+        },
+        {
+          deadlineAt: Date.now() - 1,
+          verifiedAccountProbe: {
+            status: 'AUTHENTICATED',
+            accounts: [{ externalAccountId: ACCOUNT_ID }],
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      name: 'TimeoutError',
+      message: 'SOHU_INSPECTION_DEADLINE_EXCEEDED',
+    })
+    expect(fetch).not.toHaveBeenCalled()
+    expect(add).not.toHaveBeenCalled()
+  })
 })

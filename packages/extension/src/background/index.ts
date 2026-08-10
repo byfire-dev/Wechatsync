@@ -39,6 +39,7 @@ import {
   runOpenPublicationDraft,
   runPublicationInspection,
   validateBridgeMessageSender,
+  validateBridgeV3MessageSender,
   validateGetAccountsV2Payload,
   validateInspectPublicationPayload,
   validateOpenPublicationDraftPayload,
@@ -351,11 +352,16 @@ async function handleMessage(message: MessageAction, sender?: chrome.runtime.Mes
     }
 
     case 'BRIDGE_CALL_V3': {
-      const verifiedSender = validateBridgeMessageSender(sender || {})
+      const verifiedSender = validateBridgeV3MessageSender(sender || {})
       if (!verifiedSender.success) {
         return { error: verifiedSender.code }
       }
-      return publicationBridgeV3.handle(message.request)
+      return publicationBridgeV3.handle(message.request, {
+        caller: {
+          tabId: verifiedSender.data.tabId,
+          documentId: verifiedSender.data.documentId,
+        },
+      })
     }
 
     case 'BRIDGE_RUN_PUBLICATION_OPERATION_V3': {

@@ -6,8 +6,8 @@
   var PUBLICATION_BRIDGE_NAMESPACE_V3 = 'byfire.publication-bridge';
   var PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3 = 3;
   var PUBLICATION_BRIDGE_REQUEST_ID_MAX_LENGTH_V3 = 128;
-  // Keep the page transport deadline above the coordinator's end-to-end
-  // command deadline so structured failures can cross the page boundary.
+  // Pre-3.2 calls retain their fixed transport fallbacks. Wire 3.2 inspection
+  // instead shares the caller's absolute deadline across every hop.
   var PUBLICATION_BRIDGE_TIMEOUT_MS_V3 = 30000;
   var PUBLICATION_INSPECT_TIMEOUT_MS_V3 = 40000;
   var BRIDGE_REQUEST_DIRECTION = 'PAGE_TO_EXTENSION';
@@ -24,6 +24,7 @@
   var eventCb = {};
   var bridgeEventCb = {};
   var publicationBridgeEventCbV3 = Object.create(null);
+  var publicationBridgeCancelSequenceV3 = 0;
   var _statueandler = null;
   var _consolehandler = null;
 
@@ -88,14 +89,91 @@
       : PUBLICATION_BRIDGE_TIMEOUT_MS_V3;
   }
 
-  function callPublicationBridgeV3(request, cb) {
+  function noopPublicationBridgeCancelHandle() {
+    return {
+      cancel: function() {
+        return false;
+      },
+    };
+  }
+
+  function isPublicationInspectRequestV32(request) {
+    return (
+      request.command === 'publication.inspect' &&
+      request.contractVersion === '3.2' &&
+      typeof request.sessionId === 'string' &&
+      typeof request.operationId === 'string' &&
+      typeof request.deadlineAt === 'string' &&
+      Number.isFinite(Date.parse(request.deadlineAt))
+    );
+  }
+
+  function postPublicationBridgeCancelV3(request, reason) {
+    var cancelRequestId;
+    do {
+      publicationBridgeCancelSequenceV3 += 1;
+      cancelRequestId =
+        'bridge_cancel_' + Date.now() + '_' + publicationBridgeCancelSequenceV3;
+    } while (cancelRequestId === request.requestId);
+    window.postMessage(
+      {
+        namespace: PUBLICATION_BRIDGE_NAMESPACE_V3,
+        direction: PUBLICATION_BRIDGE_REQUEST_DIRECTION_V3,
+        protocolMajor: PUBLICATION_BRIDGE_PROTOCOL_MAJOR_V3,
+        contractVersion: '3.2',
+        sessionId: request.sessionId,
+        requestId: cancelRequestId,
+        operationId: request.operationId,
+        command: 'bridge.cancel',
+        payload: {
+          targetRequestId: request.requestId,
+          targetCommand: 'publication.inspect',
+          reason: reason,
+        },
+      },
+      location.origin
+    );
+  }
+
+  function settlePublicationBridgeV3(
+    id,
+    pending,
+    error,
+    response,
+    cancellationReason
+  ) {
+    if (publicationBridgeEventCbV3[id] !== pending) return false;
+    delete publicationBridgeEventCbV3[id];
+    if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
+    if (pending.signal && pending.abortListener) {
+      pending.signal.removeEventListener('abort', pending.abortListener);
+    }
+    if (cancellationReason && pending.cancellable) {
+      postPublicationBridgeCancelV3(pending.request, cancellationReason);
+    }
+    if (response === undefined) {
+      pending.callback(error);
+    } else {
+      pending.callback(error, response);
+    }
+    return true;
+  }
+
+  function callPublicationBridgeV3(request, cb, options) {
     var callback = typeof cb === 'function' ? cb : function() {};
-    if (!isPublicationBridgeRequestV3(request)) {
+    var cancellable = isPublicationInspectRequestV32(request || {});
+    if (
+      !isPublicationBridgeRequestV3(request) ||
+      (request &&
+        request.command === 'publication.inspect' &&
+        request.contractVersion === '3.2' &&
+        !cancellable)
+    ) {
       callback({
         code: 'INVALID_BRIDGE_REQUEST',
         message: 'Publication Bridge request is invalid.',
       });
-      return;
+      return noopPublicationBridgeCancelHandle();
     }
 
     var id = request.requestId;
@@ -104,25 +182,88 @@
         code: 'DUPLICATE_REQUEST_ID',
         message: 'A Publication Bridge request with this requestId is pending.',
       });
-      return;
+      return noopPublicationBridgeCancelHandle();
     }
 
     var pending = {
       command: request.command,
       callback: callback,
+      request: request,
+      cancellable: cancellable,
+      signal: undefined,
+      abortListener: undefined,
       timeoutId: undefined,
     };
     publicationBridgeEventCbV3[id] = pending;
-    pending.timeoutId = setTimeout(function() {
-      if (publicationBridgeEventCbV3[id] !== pending) return;
-      delete publicationBridgeEventCbV3[id];
-      pending.callback({
-        code: 'BRIDGE_REQUEST_TIMEOUT',
-        message: 'The Publication Bridge request timed out.',
+    var cancelHandle = {
+      cancel: function(reason) {
+        if (!pending.cancellable) return false;
+        var cancellationReason =
+          reason === 'DEADLINE_EXCEEDED'
+            ? 'DEADLINE_EXCEEDED'
+            : 'CALLER_ABORTED';
+        return settlePublicationBridgeV3(
+          id,
+          pending,
+          cancellationReason === 'DEADLINE_EXCEEDED'
+            ? {
+                code: 'BRIDGE_REQUEST_TIMEOUT',
+                message: 'The Publication Bridge request timed out.',
+              }
+            : {
+                code: 'BRIDGE_REQUEST_ABORTED',
+                message: 'The Publication Bridge request was cancelled.',
+              },
+          undefined,
+          cancellationReason
+        );
+      },
+    };
+
+    if (
+      cancellable &&
+      options &&
+      options.signal &&
+      typeof options.signal.addEventListener === 'function'
+    ) {
+      pending.signal = options.signal;
+      pending.abortListener = function() {
+        cancelHandle.cancel('CALLER_ABORTED');
+      };
+      if (pending.signal.aborted) {
+        settlePublicationBridgeV3(
+          id,
+          pending,
+          {
+            code: 'BRIDGE_REQUEST_ABORTED',
+            message: 'The Publication Bridge request was cancelled.',
+          }
+        );
+        return cancelHandle;
+      }
+      pending.signal.addEventListener('abort', pending.abortListener, {
+        once: true,
       });
-    }, publicationBridgeTimeoutMsV3(request.command));
+    }
+
+    var timeoutMs = cancellable
+      ? Math.max(0, Date.parse(request.deadlineAt) - Date.now())
+      : publicationBridgeTimeoutMsV3(request.command);
+    pending.timeoutId = setTimeout(function() {
+      settlePublicationBridgeV3(
+        id,
+        pending,
+        {
+          code: 'BRIDGE_REQUEST_TIMEOUT',
+          message: 'The Publication Bridge request timed out.',
+        },
+        undefined,
+        cancellable ? 'DEADLINE_EXCEEDED' : undefined
+      );
+    }, timeoutMs);
 
     window.postMessage(request, location.origin);
+    return cancelHandle;
   }
 
   poster.getAccounts = function(cb) {
@@ -163,8 +304,8 @@
     );
   };
 
-  poster.callPublicationBridgeV3 = function(request, cb) {
-    callPublicationBridgeV3(request, cb);
+  poster.callPublicationBridgeV3 = function(request, cb, options) {
+    return callPublicationBridgeV3(request, cb, options);
   };
 
   poster.openPublicationDraft = function(request, cb) {
@@ -251,11 +392,11 @@
           typeof evt.data.error.message !== 'string'
         ) return;
 
-        if (publicationBridgeTransportCallback.timeoutId !== undefined) {
-          clearTimeout(publicationBridgeTransportCallback.timeoutId);
-        }
-        delete publicationBridgeEventCbV3[evt.data.requestId];
-        publicationBridgeTransportCallback.callback(evt.data.error);
+        settlePublicationBridgeV3(
+          evt.data.requestId,
+          publicationBridgeTransportCallback,
+          evt.data.error
+        );
         return;
       }
 
@@ -276,13 +417,13 @@
           typeof evt.data.ok !== 'boolean'
         ) return;
 
-        if (publicationBridgeCallback.timeoutId !== undefined) {
-          clearTimeout(publicationBridgeCallback.timeoutId);
-        }
-        delete publicationBridgeEventCbV3[evt.data.requestId];
-
         // Contract-level ok:false is still a successful transport exchange.
-        publicationBridgeCallback.callback(null, evt.data);
+        settlePublicationBridgeV3(
+          evt.data.requestId,
+          publicationBridgeCallback,
+          null,
+          evt.data
+        );
         return;
       }
 
