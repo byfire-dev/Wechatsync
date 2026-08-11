@@ -871,8 +871,37 @@ describe('Zhihu exact-ID publication inspector', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 
-  it('reports when Zhihu also denies the authenticated fallback', async () => {
-    const fetch = vi.fn().mockResolvedValue(htmlResponse(403, PUBLIC_URL))
+  it('uses exact draft evidence after both public probes are forbidden', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+      .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+      .mockResolvedValueOnce(jsonResponse(200, DRAFT_API_URL, draftPayload))
+    const result = await inspectZhihuPublication(
+      createRequest(),
+      createDependencies(fetch),
+    )
+
+    expect(result[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      platformPostId: POST_ID,
+      title: draftPayload.title,
+    })
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      DRAFT_API_URL,
+      expect.objectContaining({ credentials: 'include' }),
+    )
+  })
+
+  it('reports the authenticated public denial when the exact draft is absent', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+      .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+      .mockResolvedValueOnce(jsonResponse(404, DRAFT_API_URL, {}))
     const result = await inspectZhihuPublication(
       createRequest(),
       createDependencies(fetch),
@@ -884,8 +913,34 @@ describe('Zhihu exact-ID publication inspector', () => {
       errorCode: 'ZHIHU_AUTHENTICATED_HTTP_403',
       platformPostId: POST_ID,
     })
-    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(fetch).toHaveBeenCalledTimes(3)
   })
+
+  it.each([
+    [401, 'LOGIN_REQUIRED', 'ZHIHU_LOGIN_REQUIRED'],
+    [403, 'FETCH_ERROR', 'ZHIHU_DRAFT_HTTP_403'],
+  ])(
+    'prefers draft HTTP %s after both public probes are forbidden',
+    async (status, outcome, errorCode) => {
+      const fetch = vi
+        .fn()
+        .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+        .mockResolvedValueOnce(htmlResponse(403, PUBLIC_URL))
+        .mockResolvedValueOnce(jsonResponse(status, DRAFT_API_URL, {}))
+      const result = await inspectZhihuPublication(
+        createRequest(),
+        createDependencies(fetch),
+      )
+
+      expect(result[0]).toMatchObject({
+        outcome,
+        source: 'DRAFT_DETAIL',
+        errorCode,
+        platformPostId: POST_ID,
+      })
+      expect(fetch).toHaveBeenCalledTimes(3)
+    },
+  )
 
   it('maps a login redirect explicitly', async () => {
     const fetch = vi

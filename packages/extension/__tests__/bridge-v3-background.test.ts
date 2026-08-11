@@ -1599,6 +1599,77 @@ describe("PublicationBridgeV3Coordinator inspection and draft-open commands", ()
 
   it.each([
     {
+      outcome: "FETCH_ERROR" as const,
+      errorCode: "ZHIHU_AUTHENTICATED_HTTP_403",
+      errorMessage: "Zhihu authenticated page returned HTTP 403.",
+      expectedCode: "adapter.zhihu-authenticated-http-403",
+      retryPolicy: "SAFE_TO_RETRY",
+      requiredUserAction: "RETRY",
+    },
+    {
+      outcome: "PARSE_ERROR" as const,
+      errorCode: "ZHIHU_PUBLIC_PAGE_PARSE_ERROR",
+      errorMessage: "Zhihu public page response could not be parsed.",
+      expectedCode: "adapter.zhihu-public-page-parse-error",
+      retryPolicy: "REVIEW_BEFORE_RETRY",
+      requiredUserAction: "REVIEW_MANUALLY",
+    },
+  ])(
+    "returns a command failure when the adapter reports $outcome",
+    async ({
+      outcome,
+      errorCode,
+      errorMessage,
+      expectedCode,
+      retryPolicy,
+      requiredUserAction,
+    }) => {
+      const adapters = createAdapters();
+      adapters.zhihu.inspectPublication = vi.fn().mockResolvedValue([
+        {
+          observationKey: `inspection-error:${outcome}`,
+          platform: "zhihu",
+          externalAccountId: "zhihu-account",
+          outcome,
+          source: "PUBLIC_PAGE",
+          observedAt: OBSERVED_AT,
+          errorCode,
+          errorMessage,
+        },
+      ]);
+      const { coordinator } = createHarness({ adapters });
+      const sessionId = await negotiate(coordinator);
+
+      const response = await exchange(
+        coordinator,
+        commandRequest(sessionId, "publication.inspect", {
+          requestId: `request-inspect-${outcome.toLowerCase()}`,
+          operationId: `operation-inspect-${outcome.toLowerCase()}`,
+          payload: {
+            platform: "zhihu",
+            requestedExternalAccountId: "zhihu-account",
+            locator: { platformPostId: "123456" },
+          },
+        }),
+      );
+
+      expect(response).toMatchObject({
+        command: "publication.inspect",
+        ok: false,
+        error: {
+          code: expectedCode,
+          stage: "ADAPTER",
+          message: errorMessage,
+          retryPolicy,
+          requiredUserAction,
+        },
+      });
+      expect(response).not.toHaveProperty("result");
+    },
+  );
+
+  it.each([
+    {
       name: "a public URL and identity key for different articles",
       platform: "zhihu" as const,
       requestedExternalAccountId: "zhihu-account",

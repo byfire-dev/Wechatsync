@@ -2026,6 +2026,34 @@ export class PublicationBridgeV3Coordinator {
       );
     }
 
+    const adapterFailure = inspection.observations.find(
+      (observation) =>
+        observation.outcome === "FETCH_ERROR" ||
+        observation.outcome === "PARSE_ERROR",
+    );
+    if (adapterFailure) {
+      const fetchFailed = adapterFailure.outcome === "FETCH_ERROR";
+      return this.commandFailure(
+        request,
+        runtime,
+        bridgeError(
+          adapterCode(
+            adapterFailure.errorCode,
+            fetchFailed ? "inspection-fetch-error" : "inspection-parse-error",
+          ),
+          "ADAPTER",
+          safeMessage(
+            adapterFailure.errorMessage,
+            fetchFailed
+              ? "The platform adapter could not fetch inspection evidence."
+              : "The platform adapter could not parse inspection evidence.",
+          ),
+          fetchFailed ? "SAFE_TO_RETRY" : "REVIEW_BEFORE_RETRY",
+          fetchFailed ? "RETRY" : "REVIEW_MANUALLY",
+        ),
+      );
+    }
+
     const observations = inspection.observations.map((observation) =>
       this.projectObservation(request, internalRequest, observation, adapter),
     );
