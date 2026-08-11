@@ -55,6 +55,12 @@ const publishedHtml = `
   </html>
 `
 
+const draftPayload = {
+  id: POST_ID,
+  title: 'A trusted Zhihu draft',
+  content: '<p>Draft body</p>',
+}
+
 function jsonResponse(url: string, payload: unknown, status = 200): Response {
   return {
     status,
@@ -188,6 +194,36 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     ).toEqual(['omit', 'include'])
   })
 
+  it('uses the exact draft API after both public probes are forbidden', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === 'https://www.zhihu.com/api/v4/me') {
+        return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
+      }
+      if (url === PUBLIC_URL) return htmlResponse(url, '', 403)
+      if (url === DRAFT_API_URL) return jsonResponse(url, draftPayload)
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    const observations = await inspectWith(fetchMock)
+
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({
+      outcome: 'DRAFT_PRESENT',
+      source: 'DRAFT_DETAIL',
+      platformPostId: POST_ID,
+      title: draftPayload.title,
+    })
+    expect(
+      fetchMock.mock.calls
+        .filter(([url]) => url === PUBLIC_URL)
+        .map(([, options]) => options?.credentials),
+    ).toEqual(['omit', 'include'])
+    expect(fetchMock).toHaveBeenCalledWith(
+      DRAFT_API_URL,
+      expect.objectContaining({ credentials: 'include' }),
+    )
+  })
+
   it('does not classify an owner-only page as publicly published', async () => {
     const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
       if (url === 'https://www.zhihu.com/api/v4/me') {
@@ -216,12 +252,13 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
     )
   })
 
-  it('returns an authenticated-public-page error when both probes are forbidden', async () => {
+  it('returns the authenticated public denial when the exact draft is absent', async () => {
     const fetchMock = vi.fn(async (url: string) => {
       if (url === 'https://www.zhihu.com/api/v4/me') {
         return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
       }
       if (url === PUBLIC_URL) return htmlResponse(url, '', 403)
+      if (url === DRAFT_API_URL) return jsonResponse(url, {}, 404)
       throw new Error(`Unexpected request: ${url}`)
     })
 
@@ -239,5 +276,30 @@ describe('ZhihuAdapter with ExtensionRuntime', () => {
         .filter(([url]) => url === PUBLIC_URL)
         .map(([, options]) => options?.credentials),
     ).toEqual(['omit', 'include'])
+    expect(fetchMock).toHaveBeenCalledWith(
+      DRAFT_API_URL,
+      expect.objectContaining({ credentials: 'include' }),
+    )
+  })
+
+  it('prefers an exact draft denial over the deferred public denial', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === 'https://www.zhihu.com/api/v4/me') {
+        return jsonResponse(url, { id: ACCOUNT_ID, name: 'Zhihu Creator' })
+      }
+      if (url === PUBLIC_URL) return htmlResponse(url, '', 403)
+      if (url === DRAFT_API_URL) return jsonResponse(url, {}, 403)
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    const observations = await inspectWith(fetchMock)
+
+    expect(observations).toHaveLength(1)
+    expect(observations[0]).toMatchObject({
+      outcome: 'FETCH_ERROR',
+      source: 'DRAFT_DETAIL',
+      platformPostId: POST_ID,
+      errorCode: 'ZHIHU_DRAFT_HTTP_403',
+    })
   })
 })

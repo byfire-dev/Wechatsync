@@ -1029,6 +1029,7 @@ export async function inspectZhihuPublication(
   let blockedPublicAccess:
     | Extract<PublicationPublicAccess, { status: 'BLOCKED_BY_PLATFORM' }>
     | undefined
+  let deferredPublicAccessDenied: PublicationObservation | undefined
   let publicProbe = await fetchPage(
     request,
     postId,
@@ -1053,11 +1054,16 @@ export async function inspectZhihuPublication(
     )
   }
 
-  if (
-    publicProbe.kind === 'ACCESS_DENIED' ||
-    publicProbe.kind === 'OBSERVATION'
-  ) {
+  if (publicProbe.kind === 'OBSERVATION') {
     return [publicProbe.observation]
+  }
+
+  // A newly created draft can have no readable public surface yet while
+  // Zhihu rejects both anonymous and credentialed requests to /p/<id>. That
+  // denial is not positive draft evidence, so keep it as a deferred failure
+  // and let the exact authenticated draft endpoint decide first.
+  if (publicProbe.kind === 'ACCESS_DENIED') {
+    deferredPublicAccessDenied = publicProbe.observation
   }
 
   if (publicProbe.kind === 'FOUND') {
@@ -1080,6 +1086,9 @@ export async function inspectZhihuPublication(
   }
 
   if (draftProbe.kind === 'NOT_FOUND') {
+    if (deferredPublicAccessDenied) {
+      return [deferredPublicAccessDenied]
+    }
     return [
       createObservation(request, observedAt, {
         outcome: 'NOT_FOUND',
